@@ -98,6 +98,16 @@ export function rateLimit(key, limit, windowMs) {
 // Fastify decorators: request.actor populated by the auth hook.
 export function authPlugin(app) {
   app.decorateRequest('actor', null);
+  app.decorateRequest('rawBody', null);
+
+  // Keep the raw JSON bytes: HMAC callers (the PHP exporter) sign the exact
+  // bytes they send, and PHP's json_encode escaping (unicode, slashes) differs
+  // from JSON.stringify, so verification MUST run over the raw body.
+  app.addContentTypeParser('application/json', { parseAs: 'buffer' }, (req, body, done) => {
+    req.rawBody = body;
+    try { done(null, body.length ? JSON.parse(body) : {}); }
+    catch (e) { e.statusCode = 400; done(e); }
+  });
 
   // Security headers on every response.
   app.addHook('onSend', async (req, reply) => {

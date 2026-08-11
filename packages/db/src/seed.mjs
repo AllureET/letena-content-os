@@ -26,7 +26,9 @@ const USERS = [
   ['producer@letena.local', 'Demo Producer', 'producer'],
   ['dev@letena.local', 'Demo Developer', 'developer'],
 ];
-const DEFAULT_PASSWORD = 'letena-dev-2026';
+// Production bootstrap sets LCOS_SEED_PASSWORD to a random value so a public
+// server never carries the known dev password.
+const DEFAULT_PASSWORD = process.env.LCOS_SEED_PASSWORD || 'letena-dev-2026';
 
 const PILOT_CARDS = [
   ['EC-001', 'EC', 'What is emergency contraception?', 'TIER_3'],

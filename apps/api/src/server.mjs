@@ -1,0 +1,236 @@
+// LCOS API server. Fastify, one process, modules registered under /api/v1.
+// Also serves the admin UI (apps/web) as static files.
+import Fastify from 'fastify';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { authPlugin, login, err, q, one, totpSecret, totpVerify } from './core.mjs';
+import knowledge from './modules/knowledge.mjs';
+import demand from './modules/demand.mjs';
+import content from './modules/content.mjs';
+import production from './modules/production.mjs';
+import distribution from './modules/distribution.mjs';
+import language from './modules/language.mjs';
+import assets from './modules/assets.mjs';
+import experiments from './modules/experiments.mjs';
+
+export async function buildServer() {
+  const app = Fastify({ logger: process.env.NODE_ENV !== 'test',
+    bodyLimit: 2 * 1024 * 1024 });
+
+  app.get('/healthz', async () => {
+    await q('SELECT 1');
+    return { ok: true, service: 'lcos-api' };
+  });
+
+  // Admin UI (no build step; EMR design language)
+  const webDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
+  app.get('/', async (req, reply) =>
+    reply.type('text/html').send(readFileSync(join(webDir, 'index.html'), 'utf8')));
+  app.get('/app.js', async (req, reply) =>
+    reply.type('text/javascript').send(readFileSync(join(webDir, 'app.js'), 'utf8')));
+
+  app.post('/api/v1/auth/login', async (req, reply) => {
+    const { email, password, totp } = req.body ?? {};
+    if (!email || !password) return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'email and password required'));
+    const result = await login(email, password, totp);
+    if (!result) return reply.code(401).send(err(401, 'UNAUTHENTICATED', 'bad credentials'));
+    if (result.totp_required) return reply.code(401).send(err(401, 'TOTP_REQUIRED', 'TOTP code required'));
+    return result;
+  });
+
+  authPlugin(app);
+
+  await app.register(async (v1) => {
+    await v1.register(knowledge);
+    await v1.register(demand);
+    await v1.register(content);
+    await v1.register(production);
+    await v1.register(distribution);
+    await v1.register(language);
+    await v1.register(assets);
+    await v1.register(experiments);
+
+    // TOTP enrolment (any authenticated user, own account only)
+    v1.post('/auth/totp/enroll', async (req) => {
+      const secret = totpSecret();
+      await q('UPDATE lcos.users SET totp_secret=$2, totp_enabled=false WHERE id=$1',
+        [req.actor.id, secret]);
+      return { secret,
+        otpauth_url: `otpauth://totp/Letena%20OS:${encodeURIComponent(req.actor.label)}?secret=${secret}&issuer=Letena%20OS` };
+    });
+    v1.post('/auth/totp/verify', async (req, reply) => {
+      const u = await one('SELECT totp_secret FROM lcos.users WHERE id=$1', [req.actor.id]);
+      if (!u?.totp_secret || !totpVerify(u.totp_secret, req.body?.code)) {
+        return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'code does not match'));
+      }
+      await q('UPDATE lcos.users SET totp_enabled=true WHERE id=$1', [req.actor.id]);
+      return { ok: true, totp_enabled: true };
+    });
+
+    // ----- retention sweep (quarantine 14d purge, sanitized text 24m purge) -----
+    v1.post('/platform/retention-sweep', async (req, reply) => {
+      const allowed = req.actor.permissions.includes('settings.manage')
+        || req.actor.roles?.includes('automation') || req.actor.roles?.includes('admin');
+      if (!allowed) return reply.code(403).send(err(403, 'FORBIDDEN', 'settings.manage or automation'));
+      const quarantinePurged = (await q(
+        `UPDATE lcos.audience_questions
+         SET status='PURGED', sanitized_text='[purged: quarantine expired]', embedding=NULL,
+             deid_redactions='[]'
+         WHERE status='QUARANTINED' AND ingested_at < now() - interval '14 days'
+         RETURNING id`)).rows.length;
+      const retentionPurged = (await q(
+        `UPDATE lcos.audience_questions
+         SET sanitized_text='[purged: retention window passed]', embedding=NULL, status='ARCHIVED'
+         WHERE purge_after < CURRENT_DATE AND status NOT IN ('PURGED','ARCHIVED')
+         RETURNING id`)).rows.length;
+      const { audit } = await import('./core.mjs');
+      await audit(null, { actor: req.actor, action: 'retention.sweep', objectType: 'QUESTION',
+        reason: `quarantine_purged=${quarantinePurged} retention_purged=${retentionPurged}` });
+      return { quarantine_purged: quarantinePurged, retention_purged: retentionPurged };
+    });
+
+    // ----- costs -----
+    v1.get('/analytics/costs', async (req, reply) => {
+      if (!req.actor.permissions.includes('analytics.read')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'analytics.read'));
+      }
+      const [byMonth, byAgent, renders, perPiece] = await Promise.all([
+        q(`SELECT to_char(date_trunc('month', occurred_at), 'YYYY-MM') AS month,
+                  count(*)::int AS calls, COALESCE(sum(input_tokens),0)::bigint AS input_tokens,
+                  COALESCE(sum(output_tokens),0)::bigint AS output_tokens,
+                  COALESCE(sum(cost_usd),0)::numeric(12,4) AS ai_cost_usd
+           FROM lcos.ai_invocations GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
+        q(`SELECT agent_name, count(*)::int AS calls,
+                  COALESCE(sum(cost_usd),0)::numeric(12,4) AS cost_usd,
+                  count(*) FILTER (WHERE outcome <> 'SUCCESS')::int AS failures
+           FROM lcos.ai_invocations GROUP BY agent_name ORDER BY cost_usd DESC`),
+        q(`SELECT to_char(date_trunc('month', created_at), 'YYYY-MM') AS month,
+                  count(*)::int AS renders, COALESCE(sum(cost_usd),0)::numeric(12,4) AS render_cost_usd
+           FROM lcos.renders GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
+        q(`SELECT * FROM lcos.v_cost_per_piece ORDER BY published_pieces DESC NULLS LAST LIMIT 50`),
+      ]);
+      return { by_month: byMonth.rows, by_agent: byAgent.rows,
+        renders_by_month: renders.rows, per_piece: perPiece.rows };
+    });
+
+    // ----- users & roles (admin) -----
+    v1.get('/platform/users', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const r = await q(
+        `SELECT u.id, u.email, u.full_name, u.is_active, u.totp_enabled, u.last_login_at,
+                array_agg(ro.slug ORDER BY ro.slug) FILTER (WHERE ro.slug IS NOT NULL) AS roles
+         FROM lcos.users u
+         LEFT JOIN lcos.user_roles ur ON ur.user_id=u.id
+         LEFT JOIN lcos.roles ro ON ro.id=ur.role_id
+         WHERE NOT u.is_service_account
+         GROUP BY u.id ORDER BY u.full_name`);
+      return { items: r.rows };
+    });
+    v1.post('/platform/users', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const { email, full_name, password, role_slug } = req.body ?? {};
+      if (!email || !full_name || !password || !role_slug) {
+        return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'email, full_name, password, role_slug required'));
+      }
+      if (password.length < 12) {
+        return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'password must be at least 12 characters'));
+      }
+      const bcrypt = (await import('bcryptjs')).default;
+      const u = await one(
+        `INSERT INTO lcos.users (email, full_name, password_hash) VALUES ($1,$2,$3)
+         ON CONFLICT ((lower(email))) DO NOTHING RETURNING id, email, full_name`,
+        [email, full_name, bcrypt.hashSync(password, 10)]);
+      if (!u) return reply.code(409).send(err(409, 'CONFLICT', 'email already exists'));
+      const granted = await one(
+        `INSERT INTO lcos.user_roles (user_id, role_id)
+         SELECT $1, id FROM lcos.roles WHERE slug=$2 RETURNING user_id`, [u.id, role_slug]);
+      if (!granted) return reply.code(422).send(err(422, 'VALIDATION_ERROR', `unknown role ${role_slug}`));
+      const { audit } = await import('./core.mjs');
+      await audit(null, { actor: req.actor, action: 'user.create', objectType: 'USER',
+        objectId: u.id, reason: `role ${role_slug}` });
+      return reply.code(201).send({ ...u, role: role_slug });
+    });
+    v1.post('/platform/users/:id/roles', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const granted = await one(
+        `INSERT INTO lcos.user_roles (user_id, role_id)
+         SELECT $1, id FROM lcos.roles WHERE slug=$2
+         ON CONFLICT DO NOTHING RETURNING user_id`, [req.params.id, req.body?.role_slug]);
+      const { audit } = await import('./core.mjs');
+      await audit(null, { actor: req.actor, action: 'user.role_granted', objectType: 'USER',
+        objectId: req.params.id, reason: req.body?.role_slug });
+      return { ok: true, granted: !!granted };
+    });
+    v1.post('/platform/users/:id/deactivate', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      if (req.params.id === req.actor.id) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED', 'You cannot deactivate yourself.',
+          { guard: 'notSelf' }));
+      }
+      await q(`UPDATE lcos.users SET is_active=false WHERE id=$1`, [req.params.id]);
+      const { audit } = await import('./core.mjs');
+      await audit(null, { actor: req.actor, action: 'user.deactivated', objectType: 'USER',
+        objectId: req.params.id });
+      return { ok: true };
+    });
+
+    // platform: audit read, settings, dashboard
+    v1.get('/platform/audit', async (req, reply) => {
+      if (!req.actor.permissions.includes('audit.read')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'audit.read'));
+      }
+      const r = await q(`SELECT * FROM lcos.audit_log ORDER BY occurred_at DESC LIMIT 200`);
+      return { items: r.rows };
+    });
+    v1.get('/platform/settings', async (req, reply) => {
+      if (!req.actor.permissions.includes('settings.read')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'settings.read'));
+      }
+      const r = await q(`SELECT key, value, description FROM lcos.settings WHERE NOT is_secret ORDER BY key`);
+      return { items: r.rows };
+    });
+    v1.get('/platform/dashboard', async () => {
+      const [qToday, quarantine, scriptsReview, rendering, awaitingApproval, scheduled, cardsDue, deadLetters] =
+        await Promise.all([
+          q(`SELECT count(*)::int n FROM lcos.audience_questions WHERE ingested_at > now() - interval '24 hours'`),
+          q(`SELECT count(*)::int n FROM lcos.audience_questions WHERE status='QUARANTINED'`),
+          q(`SELECT count(*)::int n FROM lcos.scripts WHERE status IN ('CLINICAL_REVIEW','LANGUAGE_REVIEW')`),
+          q(`SELECT count(*)::int n FROM lcos.production_jobs WHERE status IN ('QUEUED','RENDERING')`),
+          q(`SELECT count(*)::int n FROM lcos.review_tasks WHERE status IN ('OPEN','IN_PROGRESS')`),
+          q(`SELECT count(*)::int n FROM lcos.publishing_jobs WHERE status='SCHEDULED'`),
+          q(`SELECT count(*)::int n FROM lcos.knowledge_cards WHERE status='APPROVED' AND review_due_at < CURRENT_DATE + 30`),
+          q(`SELECT count(*)::int n FROM lcos.workflow_events WHERE status='DEAD_LETTER' AND NOT resolved`),
+        ]);
+      return {
+        questions_24h: qToday.rows[0].n, quarantine: quarantine.rows[0].n,
+        scripts_awaiting_review: scriptsReview.rows[0].n, videos_rendering: rendering.rows[0].n,
+        reviews_open: awaitingApproval.rows[0].n, scheduled_posts: scheduled.rows[0].n,
+        cards_due_review: cardsDue.rows[0].n, dead_letters: deadLetters.rows[0].n,
+      };
+    });
+  }, { prefix: '/api/v1' });
+
+  app.setErrorHandler((e, req, reply) => {
+    req.log?.error?.(e);
+    reply.code(e.statusCode ?? 500).send(err(e.statusCode ?? 500, 'INTERNAL', e.message));
+  });
+
+  return app;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const app = await buildServer();
+  const port = Number(process.env.PORT || 8080);
+  app.listen({ port, host: '0.0.0.0' })
+    .then(() => console.log(`lcos-api listening on :${port} (AI=${process.env.LCOS_AI_PROVIDER || 'MOCK'}, adapters=${process.env.LCOS_ADAPTER_MODE || 'MOCK'})`))
+    .catch((e) => { console.error(e); process.exit(1); });
+}

@@ -1,0 +1,58 @@
+{
+  "name": "WF02-03 Process Questions (de-id sweep + classify)",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "minutes", "minutesInterval": 5 }] } },
+      "name": "Every 5 minutes", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.LCOS_BASE_URL}}/api/v1/questions?status=DEIDENTIFIED&limit=100",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 20000 }
+      },
+      "name": "Fetch deidentified", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [220, 0], "credentials": { "httpHeaderAuth": { "name": "LCOS service token" } }
+    },
+    {
+      "parameters": { "fieldToSplitOut": "items", "options": {} },
+      "name": "Split items", "type": "n8n-nodes-base.splitOut", "typeVersion": 1, "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.LCOS_BASE_URL}}/api/v1/questions/{{$json.id}}/classify",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 60000 }
+      },
+      "name": "Classify + embed + cluster", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [660, 0], "credentials": { "httpHeaderAuth": { "name": "LCOS service token" } },
+      "onError": "continueErrorOutput", "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.LCOS_BASE_URL}}/api/v1/platform/workflow-events",
+        "sendBody": true,
+        "bodyParameters": { "parameters": [
+          { "name": "workflow_code", "value": "WF03" },
+          { "name": "status", "value": "DEAD_LETTER" },
+          { "name": "object_type", "value": "QUESTION" },
+          { "name": "object_id", "value": "={{$json.id}}" },
+          { "name": "error_detail", "value": "={{$json.error?.message ?? 'classification failed'}}" },
+          { "name": "owner_role", "value": "developer" } ] },
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth"
+      },
+      "name": "Dead letter", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [880, 160],
+      "credentials": { "httpHeaderAuth": { "name": "LCOS service token" } }
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": { "main": [[{ "node": "Fetch deidentified", "type": "main", "index": 0 }]] },
+    "Fetch deidentified": { "main": [[{ "node": "Split items", "type": "main", "index": 0 }]] },
+    "Split items": { "main": [[{ "node": "Classify + embed + cluster", "type": "main", "index": 0 }]] },
+    "Classify + embed + cluster": { "main": [[], [{ "node": "Dead letter", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}

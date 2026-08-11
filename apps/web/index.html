@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Letena Content OS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Crimson+Pro:wght@600&display=swap" rel="stylesheet">
+<style>
+/* Letena EMR design system (letena_emr_aligned tokens) */
+:root{
+  --cetacean:#16103F; --fuzzy-wuzzy:#CD6962; --marigold:#EBAB20;
+  --jelly-bean:#477287; --plump-purple:#5D489C; --teal:#5BBFB5;
+  --canvas:#F5F3EF; --surface:#FFFFFF; --surface-2:#FAF8F4;
+  --line:#E6E2DA; --line-soft:#EFEBE3;
+  --ink:#16103F; --ink-2:#4A5160; --ink-mute:#8A8578;
+  --risk-high:#B91C1C; --risk-high-bg:#FBEAEA;
+  --risk-mod:#B6810F; --risk-mod-bg:#FCF2DC;
+  --risk-routine:#2C6F68; --risk-routine-bg:#E2F0EE;
+  --st-new:#477287; --st-new-bg:#E6EEF1;
+  --st-review:#5D489C; --st-review-bg:#ECE7F4;
+  --st-wait:#B6810F; --st-wait-bg:#FCF2DC;
+  --st-referred:#2C6F68; --st-referred-bg:#E2F0EE;
+  --st-closed:#6B7280; --st-closed-bg:#EFEFEF;
+  --telegram:#229ED9; --whatsapp:#25D366; --facebook:#3b5998; --instagram:#c13584;
+  --font-ui:'Poppins',system-ui,sans-serif;
+  --font-data:-apple-system,'Segoe UI',Roboto,system-ui,sans-serif;
+  --font-mark:'Crimson Pro',Georgia,serif;
+  --r-xs:6px; --r-sm:8px; --r-md:10px; --r-lg:14px;
+}
+*{box-sizing:border-box;margin:0}
+body{font-family:var(--font-ui);background:var(--canvas);color:var(--ink);font-size:14px}
+a{color:var(--jelly-bean);text-decoration:none}
+/* shell */
+#shell{display:grid;grid-template-columns:232px 1fr;min-height:100vh}
+#side{background:var(--cetacean);color:#fff;padding:18px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+#side .mark{font-family:var(--font-mark);font-size:21px;padding:0 20px 14px;color:#fff}
+#side .mark b{color:var(--fuzzy-wuzzy)}
+#side .grp{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#9a94c2;padding:14px 20px 4px}
+#side a{display:block;padding:7px 20px;color:#D8D5EA;font-size:13px;border-left:3px solid transparent}
+#side a:hover{background:rgba(255,255,255,.06);color:#fff}
+#side a.on{background:rgba(255,255,255,.09);color:#fff;border-left-color:var(--fuzzy-wuzzy)}
+#main{padding:22px 26px;max-width:1200px}
+h1{font-size:19px;font-weight:600;margin-bottom:4px}
+.sub{color:var(--ink-mute);font-size:12.5px;margin-bottom:18px}
+.eyebrow{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--plump-purple);font-weight:600;margin-bottom:6px}
+/* cards + tiles */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:16px 18px;margin-bottom:14px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:12px 14px;cursor:pointer}
+.tile:hover{border-color:var(--jelly-bean)}
+.tile .n{font-size:24px;font-weight:600;font-family:var(--font-data)}
+.tile .l{font-size:11.5px;color:var(--ink-mute)}
+.tile.warn .n{color:var(--risk-mod)} .tile.bad .n{color:var(--risk-high)}
+/* tables */
+table{width:100%;border-collapse:collapse;font-family:var(--font-data);font-size:13px}
+th{font-family:var(--font-ui);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-mute);text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+td{padding:9px 10px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+tr.rowlink{cursor:pointer} tr.rowlink:hover td{background:var(--surface-2)}
+/* pills */
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:500;font-family:var(--font-ui)}
+.pill .d{width:6px;height:6px;border-radius:50%;background:currentColor}
+.risk-high,.p-TIER_4,.p-EMERGENCY,.p-HIGH,.p-FAIL,.p-REJECTED,.p-FAILED,.p-VALIDATION_FAILED,.p-QUARANTINED,.p-RETIRED{color:var(--risk-high);background:var(--risk-high-bg)}
+.risk-mod,.p-TIER_3,.p-MODERATE,.p-CLINICAL_REVIEW,.p-LANGUAGE_REVIEW,.p-IN_REVIEW,.p-NEEDS_UPDATE,.p-NEEDS_KNOWLEDGE,.p-SCHEDULED,.p-PENDING_DEID{color:var(--risk-mod);background:var(--risk-mod-bg)}
+.risk-routine,.p-TIER_1,.p-TIER_2,.p-APPROVED,.p-PASS,.p-PUBLISHED,.p-SUCCEEDED,.p-RENDERED,.p-LIVE,.p-CLUSTERED,.p-ACTIVE{color:var(--risk-routine);background:var(--risk-routine-bg)}
+.p-DRAFT,.p-PROPOSED,.p-QUEUED,.p-DEIDENTIFIED,.p-PENDING{color:var(--st-new);background:var(--st-new-bg)}
+.p-VALIDATED,.p-SELECTED,.p-VALIDATING,.p-LOCALIZING{color:var(--st-review);background:var(--st-review-bg)}
+.p-CLOSED,.p-SUPERSEDED,.p-CANCELLED,.p-ARCHIVED{color:var(--st-closed);background:var(--st-closed-bg)}
+.ch{display:inline-block;padding:1px 7px;border-radius:4px;font-size:10.5px;color:#fff}
+.ch-TELEGRAM{background:var(--telegram)}.ch-WHATSAPP{background:var(--whatsapp)}
+.ch-FACEBOOK{background:var(--facebook)}.ch-INSTAGRAM{background:var(--instagram)}
+.ch-TIKTOK_COMMENT,.ch-TIKTOK{background:#000}.ch-YOUTUBE{background:#c00}
+.ch-WEBSITE,.ch-OTHER,.ch-MANUAL_ENTRY{background:var(--ink-mute)}
+/* buttons + forms */
+button,.btn{font-family:var(--font-ui);font-size:12.5px;font-weight:500;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);padding:7px 14px;cursor:pointer}
+button:hover{border-color:var(--jelly-bean)}
+button.primary{background:var(--fuzzy-wuzzy);border-color:var(--fuzzy-wuzzy);color:#fff}
+button.primary:hover{filter:brightness(.95)}
+button.approve{background:var(--risk-routine);border-color:var(--risk-routine);color:#fff}
+button.danger{background:var(--risk-high);border-color:var(--risk-high);color:#fff}
+button:disabled{opacity:.5;cursor:default}
+input,select,textarea{font-family:var(--font-data);font-size:13px;border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;background:var(--surface);width:100%}
+textarea{min-height:80px}
+label{font-size:11.5px;color:var(--ink-2);font-weight:500;display:block;margin:10px 0 4px}
+/* login */
+#login{max-width:360px;margin:12vh auto}
+#login .mark{font-family:var(--font-mark);font-size:30px;text-align:center;margin-bottom:6px}
+#login .mark b{color:var(--fuzzy-wuzzy)}
+/* toast */
+#toast{position:fixed;bottom:20px;right:20px;background:var(--cetacean);color:#fff;padding:11px 16px;border-radius:var(--r-md);font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;max-width:420px;z-index:50}
+#toast.show{opacity:1}
+#toast.err{background:var(--risk-high)}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.kv{font-size:12.5px;line-height:1.7}.kv b{font-weight:600}
+.claimrow{border-left:3px solid var(--teal);padding:8px 12px;margin:8px 0;background:var(--surface-2);border-radius:0 var(--r-sm) var(--r-sm) 0}
+.claimrow.bad{border-left-color:var(--risk-high)}
+.amharic{font-size:15px;line-height:1.9}
+.muted{color:var(--ink-mute)}
+.flex{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.spacer{flex:1}
+@media(max-width:860px){#shell{grid-template-columns:1fr}#side{position:static;height:auto}}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

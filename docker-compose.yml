@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: lcos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lcos_dev}
+      POSTGRES_DB: lcos
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U lcos"], interval: 5s, retries: 10 }
+
+  api:
+    image: node:22-alpine
+    working_dir: /app
+    volumes: [".:/app"]
+    command: sh -c "npm install --no-audit --no-fund && node packages/db/src/migrate.mjs && LCOS_DEMO=1 node packages/db/src/seed.mjs && node apps/api/src/server.mjs"
+    environment:
+      DATABASE_URL: postgresql://lcos:${POSTGRES_PASSWORD:-lcos_dev}@postgres:5432/lcos
+      PORT: 8080
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
+      LCOS_AI_PROVIDER: ${LCOS_AI_PROVIDER:-MOCK}
+      LCOS_ADAPTER_MODE: ${LCOS_ADAPTER_MODE:-MOCK}
+      LCOS_STORAGE_DIR: /app/.storage
+      LETENA_INGEST_SHARED_SECRET: ${LETENA_INGEST_SHARED_SECRET:-dev-ingest-secret}
+      LCOS_SERVICE_TOKEN: ${LCOS_SERVICE_TOKEN:-svc_dev_automation}
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  n8n:
+    image: n8nio/n8n:latest
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: lcos
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-lcos_dev}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-change_me_in_production}
+      LCOS_BASE_URL: http://api:8080
+    ports: ["5678:5678"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  pgdata:

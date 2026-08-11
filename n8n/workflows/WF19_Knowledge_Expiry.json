@@ -1,0 +1,23 @@
+{
+  "name": "WF19 Knowledge expiry sweep (daily 03:00 UTC = 06:00 EAT)",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 3 * * *" }] } },
+      "name": "Daily 03:00 UTC", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST", "url": "={{$env.LCOS_BASE_URL}}/api/v1/knowledge/sweep-expiry",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 60000 }
+      },
+      "name": "Sweep expiring knowledge", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [220, 0], "credentials": { "httpHeaderAuth": { "name": "LCOS service token" } },
+      "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 30000
+    }
+  ],
+  "connections": {
+    "Daily 03:00 UTC": { "main": [[{ "node": "Sweep expiring knowledge", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}

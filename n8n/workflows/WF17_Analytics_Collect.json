@@ -1,0 +1,49 @@
+{
+  "name": "WF17 Analytics collection (daily 00:00 UTC = 03:00 EAT)",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 0 * * *" }] } },
+      "name": "Daily 00:00 UTC", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.LCOS_BASE_URL}}/api/v1/distribution/published",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth"
+      },
+      "name": "List live content", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [200, 0], "credentials": { "httpHeaderAuth": { "name": "LCOS service token" } }
+    },
+    {
+      "parameters": { "fieldToSplitOut": "items", "options": {} },
+      "name": "Split", "type": "n8n-nodes-base.splitOut", "typeVersion": 1, "position": [400, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.LCOS_BASE_URL}}/api/v1/analytics/collect/{{$json.id}}",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 60000 }
+      },
+      "name": "Collect metrics", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [600, 0], "credentials": { "httpHeaderAuth": { "name": "LCOS service token" } },
+      "onError": "continueRegularOutput", "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 10000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.LCOS_BASE_URL}}/api/v1/analytics/scores/{{$json.published_content_id ?? $json.id}}",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth"
+      },
+      "name": "Compute scores", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [800, 0], "credentials": { "httpHeaderAuth": { "name": "LCOS service token" } },
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Daily 00:00 UTC": { "main": [[{ "node": "List live content", "type": "main", "index": 0 }]] },
+    "List live content": { "main": [[{ "node": "Split", "type": "main", "index": 0 }]] },
+    "Split": { "main": [[{ "node": "Collect metrics", "type": "main", "index": 0 }]] },
+    "Collect metrics": { "main": [[{ "node": "Compute scores", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}

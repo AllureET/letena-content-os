@@ -1,0 +1,23 @@
+{
+  "name": "WF05 Demand recompute (daily 04:00 EAT = 01:00 UTC)",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 1 * * *" }] } },
+      "name": "Daily 01:00 UTC", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST", "url": "={{$env.LCOS_BASE_URL}}/api/v1/demand/recompute",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 120000 }
+      },
+      "name": "Recompute priority + coverage", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [220, 0], "credentials": { "httpHeaderAuth": { "name": "LCOS admin token" } },
+      "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 30000
+    }
+  ],
+  "connections": {
+    "Daily 01:00 UTC": { "main": [[{ "node": "Recompute priority + coverage", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}

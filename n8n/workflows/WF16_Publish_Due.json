@@ -1,0 +1,23 @@
+{
+  "name": "WF16 Publish due jobs (every 5 minutes)",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "minutes", "minutesInterval": 5 }] } },
+      "name": "Every 5 minutes", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST", "url": "={{$env.LCOS_BASE_URL}}/api/v1/distribution/publish-due",
+        "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
+        "options": { "timeout": 120000 }
+      },
+      "name": "Publish due (guarded server-side)", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2,
+      "position": [220, 0], "credentials": { "httpHeaderAuth": { "name": "LCOS service token" } },
+      "retryOnFail": true, "maxTries": 2, "waitBetweenTries": 15000
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": { "main": [[{ "node": "Publish due (guarded server-side)", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}

@@ -24,8 +24,11 @@ export default async function routes(app) {
       if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) {
         return reply.code(401).send(err(401, 'UNAUTHENTICATED', 'timestamp outside tolerance'));
       }
+      // Sign over the RAW bytes the caller sent (PHP json_encode escaping
+      // differs from JSON.stringify; re-serialization breaks the signature).
+      const raw = req.rawBody ?? Buffer.from(JSON.stringify(req.body));
       const expect = 'sha256=' + crypto.createHmac('sha256', secret)
-        .update(`${ts}.${JSON.stringify(req.body)}`).digest('hex');
+        .update(Buffer.concat([Buffer.from(`${ts}.`), raw])).digest('hex');
       if (!crypto.timingSafeEqual(Buffer.from(expect), Buffer.from(String(sig).padEnd(expect.length).slice(0, expect.length)))) {
         return reply.code(401).send(err(401, 'UNAUTHENTICATED', 'bad signature'));
       }

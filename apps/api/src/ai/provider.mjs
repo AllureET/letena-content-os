@@ -94,6 +94,12 @@ export class MockAIProvider extends BaseProvider {
 
   agent_deid_sweep() { return { spans: [], residual_risk: 'NONE', notes: '' }; }
 
+  // Deterministic translation stand-in so translation flows are testable
+  // offline: prefix + first 120 chars of the source, verbatim.
+  agent_question_translator(ctx) {
+    return { translation_en: 'EN: ' + String(ctx.text ?? '').slice(0, 120) };
+  }
+
   agent_cluster_labeller(ctx) {
     const first = ctx.questions?.[0] ?? 'Questions';
     return { label_en: (ctx.topic_name ? `${ctx.topic_name}: ` : '') + first.slice(0, 60),

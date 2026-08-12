@@ -195,6 +195,12 @@ export async function setting(key, fallback = null) {
   settingsCache.set(key, { v, t: Date.now() });
   return v;
 }
+// A write through PUT /platform/settings must take effect immediately, not
+// after the cache's 30s window (a stale approval.override or publishing.mode
+// read is a safety-gate bug, not a performance nuisance).
+export function invalidateSetting(key) {
+  settingsCache.delete(key);
+}
 
 // ---------- state machine ----------
 // Guards receive ({object, ctx, client}) and throw GuardError on refusal.

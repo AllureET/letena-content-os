@@ -4,7 +4,7 @@ import Fastify from 'fastify';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { authPlugin, login, err, q, one, totpSecret, totpVerify, audit } from './core.mjs';
+import { authPlugin, login, err, q, one, totpSecret, totpVerify, audit, invalidateSetting } from './core.mjs';
 import { CRED_REGISTRY, loadCreds, credStatus, setCred } from './creds.mjs';
 import knowledge from './modules/knowledge.mjs';
 import demand from './modules/demand.mjs';
@@ -15,6 +15,7 @@ import language from './modules/language.mjs';
 import assets from './modules/assets.mjs';
 import experiments from './modules/experiments.mjs';
 import voice from './modules/voice.mjs';
+import platformSpecs from './modules/platform_specs.mjs';
 
 export async function buildServer() {
   const app = Fastify({ logger: process.env.NODE_ENV !== 'test',
@@ -105,6 +106,7 @@ export async function buildServer() {
     await v1.register(assets);
     await v1.register(experiments);
     await v1.register(voice);
+    await v1.register(platformSpecs);
 
     // TOTP enrolment (any authenticated user, own account only)
     v1.post('/auth/totp/enroll', async (req) => {
@@ -254,8 +256,11 @@ export async function buildServer() {
       return { items: r.rows };
     });
     // Editable operational settings. Non-secret keys only; cred.* goes through
-    // the credentials route. publishing.mode gets its values validated so a
-    // typo cannot silently turn review off.
+    // the credentials route. publishing.mode and approval.override get their
+    // values validated so a typo cannot silently turn a safety gate off.
+    // approval.override is additionally admin-role-gated (Nate: "place
+    // override options in settings for me as admin"): settings.manage alone
+    // (also held by the developer role) is not enough to flip this one.
     v1.put('/platform/settings', async (req, reply) => {
       if (!req.actor.permissions.includes('settings.manage')) {
         return reply.code(403).send(err(403, 'FORBIDDEN', 'settings.manage'));
@@ -269,12 +274,35 @@ export async function buildServer() {
         return reply.code(422).send(err(422, 'VALIDATION_ERROR',
           'publishing.mode must be DRAFT_BATCH, AUTO_EXCEPT_SENSITIVE or FULL_AUTO'));
       }
+      if (key === 'approval.override') {
+        if (!['OFF', 'ADMIN_TEST_MODE'].includes(value)) {
+          return reply.code(422).send(err(422, 'VALIDATION_ERROR',
+            'approval.override must be OFF or ADMIN_TEST_MODE'));
+        }
+        if (!req.actor.roles?.includes('admin')) {
+          return reply.code(403).send(err(403, 'FORBIDDEN',
+            'approval.override may only be changed by the admin role', { guard: 'adminOnlySetting' }));
+        }
+      }
+      // content.tone_preset selects the default tone/voice for AI-generated
+      // copy (apps/api/src/ai/gateway.mjs); only a known, active preset key
+      // is accepted so a typo cannot silently fall through to no guidance.
+      if (key === 'content.tone_preset') {
+        const preset = await one(
+          `SELECT key FROM lcos.tone_presets WHERE key=$1 AND is_active`, [value]);
+        if (!preset) {
+          return reply.code(422).send(err(422, 'VALIDATION_ERROR',
+            `content.tone_preset must be an active tone preset key (e.g. LETENA_DEFAULT)`));
+        }
+      }
       const row = await q(
         `UPDATE lcos.settings SET value=$2::jsonb, updated_by=$3, updated_at=now()
          WHERE key=$1 AND NOT is_secret RETURNING key`,
         [key, JSON.stringify(value), req.actor.id ?? null]);
       if (!row.rows.length) return reply.code(404).send(err(404, 'NOT_FOUND', 'unknown setting'));
-      await audit(null, { actor: req.actor, action: 'setting.updated', objectType: 'SETTING', objectCode: key });
+      invalidateSetting(key);
+      await audit(null, { actor: req.actor, action: 'setting.updated', objectType: 'SETTING', objectCode: key,
+        toState: key === 'approval.override' || key === 'publishing.mode' ? String(value) : null });
       return { ok: true, key, value };
     });
     // Provider credentials: statuses only, never values. settings.manage gated.

@@ -40,7 +40,7 @@ const NAV = [
     ['gaps', 'Knowledge gaps']]],
   ['Content factory', [
     ['families', 'Content families'], ['concepts', 'Creative concepts'],
-    ['scripts', 'Scripts'], ['reviews', 'Review queue']]],
+    ['scripts', 'Scripts'], ['reviews', 'Queue']]],
   ['Production', [
     ['production', 'Production queue'], ['assets', 'Asset library']]],
   ['Distribution', [
@@ -325,15 +325,52 @@ const screens = {
   },
 
   async reviews() {
-    const r = await api('GET', '/reviews/queue');
-    return `<h1>Review queue</h1><div class="sub">Everything waiting on a human, oldest and most urgent first</div>
-      <div class="card"><table><tr><th>Type</th><th>Object</th><th>Tier</th><th>Due</th><th>Status</th><th></th></tr>
-      ${r.items.map(t => `<tr>
-        <td>${esc(t.review_type)}</td>
-        <td class="mono">${t.object_type === 'SCRIPT' ? `<a href="#/script/${t.object_id}">${esc(t.object_type)} →</a>` : esc(t.object_type)}</td>
-        <td>${pill(t.risk_tier)}</td><td class="muted">${dt(t.due_at)}</td><td>${pill(t.status)}</td>
-        <td class="muted" style="font-size:11px">${esc(t.required_role ?? '')}</td></tr>`).join('')
-      || '<tr><td colspan=6 class="muted">Queue is clear.</td></tr>'}</table></div>`;
+    const qd = await api('GET', '/distribution/queue');
+    const A = qd.awaiting_approval, P = qd.to_produce, R = qd.to_publish;
+    const canApprove = can('script.approve_editorial') || can('script.approve_clinical');
+    return `<h1>Queue</h1><div class="sub">Draft to published in one place: approve the batch, produce, then publish or copy for manual posting</div>
+
+      <div class="card"><div class="flex"><div class="eyebrow" style="margin:0">1 · Awaiting approval (${A.length})</div>
+        <div class="spacer"></div>
+        ${A.length && canApprove ? `<button class="approve" data-batchapprove="1">Approve all ${A.length}</button>` : ''}</div>
+      <table><tr><th>Script</th><th>Lang</th><th>Tier</th><th>Hook</th><th>Status</th></tr>
+      ${A.map(s => `<tr class="rowlink" data-nav="script/${s.id}">
+        <td class="mono">${esc(s.code)}</td><td>${esc(s.language)}</td><td>${pill(s.risk_tier)}</td>
+        <td class="muted" style="max-width:340px">${esc(s.hook ?? '')}</td><td>${pill(s.status)}</td></tr>`).join('')
+      || '<tr><td colspan=5 class="muted">Nothing waiting. Generate content from the Questions or Demand screens.</td></tr>'}</table></div>
+
+      <div class="card"><div class="flex"><div class="eyebrow" style="margin:0">2 · Approved, ready to produce (${P.length})</div>
+        <div class="spacer"></div>
+        ${P.length && can('production.request') ? `<button class="primary" data-produceall="1">Produce all ${P.length}</button>` : ''}</div>
+      <table><tr><th>Script</th><th>Lang</th><th>Tier</th><th>Family</th><th></th></tr>
+      ${P.map(s => `<tr><td class="mono">${esc(s.code)}</td><td>${esc(s.language)}</td>
+        <td>${pill(s.risk_tier)}</td><td class="mono muted">${esc(s.family_code)}</td>
+        <td>${can('production.request') ? `<button data-produce="${s.id}">Produce</button>` : ''}</td></tr>`).join('')
+      || '<tr><td colspan=5 class="muted">Nothing to produce.</td></tr>'}</table></div>
+
+      <div class="card"><div class="eyebrow">3 · Ready to publish (${R.length})</div>
+      <table><tr><th>Script</th><th>Caption</th><th>Video</th><th>Publish</th></tr>
+      ${R.map(r => {
+        const cap = (r.caption ?? '') + (r.hashtags?.length ? '\n' + r.hashtags.join(' ') : '');
+        return `<tr><td class="mono">${esc(r.script_code)}<div class="muted">${esc(r.language)} · ${pill(r.risk_tier)}</div></td>
+        <td style="max-width:320px"><div class="muted" style="font-size:12px;white-space:pre-wrap">${esc(cap.slice(0, 180))}${cap.length > 180 ? '…' : ''}</div>
+          <button data-copycap="${esc(r.render_id)}" data-cap="${esc(cap)}">Copy caption</button></td>
+        <td>${r.download_url ? `<a class="btn" href="${esc(r.download_url)}" download>Download</a>` : '<span class="muted">no file</span>'}</td>
+        <td>${can('publish.execute') ? `<div class="flex">
+            <select id="plat-${esc(r.render_id)}" style="width:130px">
+              <option value="TELEGRAM">Telegram</option><option value="FACEBOOK">Facebook</option>
+              <option value="INSTAGRAM">Instagram</option><option value="TIKTOK">TikTok</option>
+              <option value="YOUTUBE">YouTube</option></select>
+            <button class="primary" data-pubnow="${esc(r.render_id)}" ${r.final_approved ? '' : 'disabled title="Approve the batch first"'}>Publish</button>
+          </div>` : ''}</td></tr>`; }).join('')
+      || '<tr><td colspan=4 class="muted">Nothing rendered yet.</td></tr>'}</table></div>
+
+      <div class="card"><div class="eyebrow">Recently published</div>
+      <table>${qd.recent.map(p => `<tr><td class="mono">${esc(p.family_code)}</td>
+        <td><span class="ch ch-${esc(p.platform)}">${esc(p.platform)}</span></td>
+        <td class="muted">${dt(p.published_at)}</td>
+        <td>${p.permalink ? `<a href="${esc(p.permalink)}" target="_blank">open ↗</a>` : ''}</td></tr>`).join('')
+      || '<tr><td class="muted">Nothing published yet.</td></tr>'}</table></div>`;
   },
 
   async production() {
@@ -532,7 +569,19 @@ const screens = {
             <td style="width:90px"><button class="primary" data-credsave="${esc(i.key)}">Save</button></td>
           </tr>`).join('')}</table></div>`).join('')}`;
     } catch { /* not settings.manage; hide the credentials section */ }
+    const pm = String(r.items.find(s => s.key === 'publishing.mode')?.value ?? 'DRAFT_BATCH');
+    const pmHtml = can('settings.manage') ? `<div class="card"><div class="eyebrow">Publishing mode</div>
+      <div class="sub" style="margin-bottom:10px">How content moves once it is generated and claim-checked against an approved knowledge card.</div>
+      <div class="flex">
+        <select id="pubmode" style="max-width:320px">
+          <option value="DRAFT_BATCH" ${pm === 'DRAFT_BATCH' ? 'selected' : ''}>Draft + one-click batch approve (current start mode)</option>
+          <option value="AUTO_EXCEPT_SENSITIVE" ${pm === 'AUTO_EXCEPT_SENSITIVE' ? 'selected' : ''}>Automatic, except sensitive topics (Tier 4)</option>
+          <option value="FULL_AUTO" ${pm === 'FULL_AUTO' ? 'selected' : ''}>Fully automatic</option>
+        </select>
+        <button class="primary" id="pm-save">Save</button>
+      </div></div>` : '';
     return `<h1>Settings</h1><div class="sub">Thresholds and weights the team can argue with, without a deploy</div>
+      ${pmHtml}
       <div class="card"><table><tr><th>Key</th><th>Value</th><th>Description</th></tr>
       ${r.items.map(s => `<tr><td class="mono">${esc(s.key)}</td>
         <td class="mono" style="max-width:260px">${esc(JSON.stringify(s.value))}</td>
@@ -562,7 +611,7 @@ document.addEventListener('click', (e) => {
   }
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave]');
+  const b = e.target.closest('[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save');
   if (!b) {
     const row = e.target.closest('tr[data-nav]');
     if (row) location.hash = '#/' + row.dataset.nav;
@@ -580,6 +629,44 @@ document.addEventListener('click', async (e) => {
       return render();
     }
     if (b.id === 'recompute') { await api('POST', '/demand/recompute'); toast('Demand board recomputed'); return render(); }
+    if (b.id === 'pm-save') {
+      const value = $('#pubmode').value;
+      await api('PUT', '/platform/settings', { key: 'publishing.mode', value });
+      toast('Publishing mode saved: ' + value); return render();
+    }
+    if (b.dataset.batchapprove) {
+      b.disabled = true; b.textContent = 'Approving…';
+      const r = await api('POST', '/reviews/batch-approve', {});
+      toast(`Approved ${r.approved} scripts and ${r.renders_approved} renders` +
+        (r.skipped.length ? `; ${r.skipped.length} need another role` : ''));
+      return render();
+    }
+    if (b.dataset.produceall) {
+      b.disabled = true;
+      const qd = await api('GET', '/distribution/queue');
+      let done = 0, failed = 0;
+      for (const s of qd.to_produce) {
+        b.textContent = `Producing ${done + failed + 1}/${qd.to_produce.length}…`;
+        try {
+          const job = await api('POST', '/production/jobs', { script_id: s.id });
+          await api('POST', `/production/jobs/${job.id}/run`);
+          done++;
+        } catch { failed++; }
+      }
+      toast(`Produced ${done}` + (failed ? `, ${failed} failed` : ''));
+      return render();
+    }
+    if (b.dataset.copycap) {
+      await navigator.clipboard.writeText(b.dataset.cap ?? '');
+      toast('Caption copied'); return;
+    }
+    if (b.dataset.pubnow) {
+      b.disabled = true; b.textContent = 'Publishing…';
+      const platform = $(`#plat-${b.dataset.pubnow}`).value;
+      const job = await api('POST', '/distribution/jobs', { render_id: b.dataset.pubnow, platform });
+      await api('POST', `/distribution/jobs/${job.id}/publish-now`);
+      toast('Published to ' + platform); return render();
+    }
     if (b.dataset.tic) {
       b.disabled = true; b.textContent = 'Working…';
       const r = await api('POST', '/content/turn-into-content', { question_id: b.dataset.tic });

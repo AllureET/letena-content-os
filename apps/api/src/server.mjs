@@ -14,6 +14,7 @@ import distribution from './modules/distribution.mjs';
 import language from './modules/language.mjs';
 import assets from './modules/assets.mjs';
 import experiments from './modules/experiments.mjs';
+import voice from './modules/voice.mjs';
 
 export async function buildServer() {
   const app = Fastify({ logger: process.env.NODE_ENV !== 'test',
@@ -33,6 +34,55 @@ export async function buildServer() {
     reply.type('text/html').send(readFileSync(join(webDir, 'index.html'), 'utf8')));
   app.get('/app.js', async (req, reply) =>
     reply.type('text/javascript').send(readFileSync(join(webDir, 'app.js'), 'utf8')));
+
+  // SSO from the Letena EMR. The EMR's api/lcos_sso.php sends a short-lived
+  // token: base64url(payload json).hex_hmac_sha256(b64, shared ingest secret),
+  // payload {email, full_name, role, exp}. Verify, upsert the user with that
+  // role, issue a normal LCOS JWT, and land the browser on /#sso=<jwt> where
+  // the web app stores it. Same shared secret as ingest, deliberately: one
+  // secret to rotate, one trust relationship with the EMR.
+  app.get('/api/v1/auth/sso', async (req, reply) => {
+    const crypto = await import('node:crypto');
+    const jwt = (await import('jsonwebtoken')).default;
+    const token = String(req.query?.token ?? '');
+    const [b64, sig] = token.split('.');
+    if (!b64 || !sig) return reply.code(401).send(err(401, 'UNAUTHENTICATED', 'bad sso token'));
+    const secret = process.env.LETENA_INGEST_SHARED_SECRET || 'dev-ingest-secret';
+    const expect = crypto.createHmac('sha256', secret).update(b64).digest('hex');
+    if (!crypto.timingSafeEqual(Buffer.from(expect), Buffer.from(String(sig).padEnd(expect.length).slice(0, expect.length)))) {
+      return reply.code(401).send(err(401, 'UNAUTHENTICATED', 'bad sso signature'));
+    }
+    let payload;
+    try { payload = JSON.parse(Buffer.from(b64.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')); }
+    catch { return reply.code(401).send(err(401, 'UNAUTHENTICATED', 'bad sso payload')); }
+    if (!payload?.email || !payload?.exp || payload.exp < Date.now() / 1000) {
+      return reply.code(401).send(err(401, 'UNAUTHENTICATED', 'sso token expired'));
+    }
+    const roleSlug = ['admin', 'medical_director', 'consulting_doctor', 'intake_coordinator',
+      'content_lead', 'language_editor', 'social_lead', 'producer'].includes(payload.role)
+      ? payload.role : 'content_lead';
+    const bcrypt = (await import('bcryptjs')).default;
+    const u = await one(
+      `INSERT INTO lcos.users (email, full_name, password_hash)
+       VALUES ($1, $2, $3)
+       ON CONFLICT ((lower(email))) DO UPDATE SET full_name = EXCLUDED.full_name, last_login_at = now()
+       RETURNING id, email`,
+      [String(payload.email).toLowerCase(), payload.full_name ?? payload.email,
+       bcrypt.hashSync(crypto.randomUUID(), 10)]);
+    const role = await one(`SELECT id FROM lcos.roles WHERE slug=$1`, [roleSlug]);
+    if (role) {
+      await q(`INSERT INTO lcos.user_roles (user_id, role_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [u.id, role.id]);
+    }
+    const roles = (await q(
+      `SELECT ro.slug FROM lcos.user_roles ur JOIN lcos.roles ro ON ro.id=ur.role_id WHERE ur.user_id=$1`,
+      [u.id])).rows.map(r => r.slug);
+    const { JWT_SECRET } = await import('./core.mjs');
+    const lcosJwt = jwt.sign({ sub: u.id, email: u.email, roles }, JWT_SECRET, { expiresIn: '12h' });
+    await audit(null, { actor: { type: 'SYSTEM', label: 'emr-sso' }, action: 'auth.sso_login',
+      objectType: 'SETTING', reason: `emr sso for ${u.email} as ${roleSlug}` });
+    return reply.redirect('/#sso=' + lcosJwt);
+  });
 
   app.post('/api/v1/auth/login', async (req, reply) => {
     const { email, password, totp } = req.body ?? {};
@@ -54,6 +104,7 @@ export async function buildServer() {
     await v1.register(language);
     await v1.register(assets);
     await v1.register(experiments);
+    await v1.register(voice);
 
     // TOTP enrolment (any authenticated user, own account only)
     v1.post('/auth/totp/enroll', async (req) => {

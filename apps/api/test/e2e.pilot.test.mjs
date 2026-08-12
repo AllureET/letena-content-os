@@ -71,6 +71,73 @@ test('ingest rejects a batch carrying a forbidden key, loudly', async () => {
   assert.match(res.json().detail, /forbidden key/);
 });
 
+test('v2: a full inquiry stores de-identified answer, thread and consult mode', async () => {
+  const res = await call('POST', '/api/v1/ingest/questions', tokens.intake, {
+    batch_id: 'test-batch-v2',
+    questions: [{
+      channel: 'TELEGRAM', source_hash: 'test-inquiry-1', consult_mode: 'PHONE',
+      text: 'Hello doctor, can I ask a question about my period being late?',
+      thread: [
+        { role: 'doctor', text: 'Of course. When was your last period, and are you on any contraception?' },
+        { role: 'patient', text: 'My name is Meron, call me on 0922334455. Last period was six weeks ago, I use Postpill sometimes.' },
+        { role: 'note', text: 'Patient reports repeated EC use, LMP 6 weeks. Advised urine hCG test. No red flags.' },
+      ],
+      answer_text: 'A late period after emergency contraception is common. Please take a pregnancy test now, and repeat in one week if negative. Reach us on 0922334455 if positive.',
+      answered_at: new Date().toISOString(),
+      captured_at: new Date().toISOString(),
+    }],
+  });
+  assert.equal(res.statusCode, 202, res.body);
+  assert.equal(res.json().accepted, 1);
+  const row = await one(`SELECT * FROM lcos.audience_questions WHERE source_hash='test-inquiry-1'`);
+  assert.equal(row.consult_mode, 'PHONE');
+  assert.ok(!row.answer_text.includes('0922334455'), 'answer phone redacted');
+  const patientSeg = row.thread.find(s => s.role === 'patient');
+  assert.ok(!patientSeg.text.includes('Meron'), 'thread name redacted');
+  assert.ok(!patientSeg.text.includes('0922334455'), 'thread phone redacted');
+  assert.equal(row.thread.length, 3);
+  assert.ok(row.thread.some(s => s.role === 'note'), 'clinical note kept');
+});
+
+test('v2: re-sending a known hash with an answer attaches instead of dropping', async () => {
+  const bare = await call('POST', '/api/v1/ingest/questions', tokens.intake, {
+    questions: [{ channel: 'WEBSITE', source_hash: 'test-attach-1',
+      text: 'Is it safe to use Postpill twice in one month?' }],
+  });
+  assert.equal(bare.json().accepted, 1);
+  const again = await call('POST', '/api/v1/ingest/questions', tokens.intake, {
+    questions: [{ channel: 'WEBSITE', source_hash: 'test-attach-1',
+      text: 'Is it safe to use Postpill twice in one month?' }],
+  });
+  assert.equal(again.json().duplicates, 1, 'bare resend is still a duplicate');
+  const withAnswer = await call('POST', '/api/v1/ingest/questions', tokens.intake, {
+    questions: [{ channel: 'WEBSITE', source_hash: 'test-attach-1',
+      text: 'Is it safe to use Postpill twice in one month?',
+      answer_text: 'It is not dangerous, but it is less reliable than regular contraception. Consider a regular method.' }],
+  });
+  assert.equal(withAnswer.json().updated, 1, withAnswer.body);
+  const row = await one(`SELECT answer_text FROM lcos.audience_questions WHERE source_hash='test-attach-1'`);
+  assert.match(row.answer_text, /less reliable/);
+});
+
+test('v2: a thread segment with an unexpected key rejects the whole batch', async () => {
+  const res = await call('POST', '/api/v1/ingest/questions', tokens.intake, {
+    questions: [{ channel: 'TELEGRAM', source_hash: 'test-badseg-1', text: 'ok question here',
+      thread: [{ role: 'patient', text: 'hello', phone: '0911000000' }] }],
+  });
+  assert.equal(res.statusCode, 422);
+  assert.match(res.json().detail, /unexpected key/);
+});
+
+test('v2: a thread segment with an unknown role rejects the whole batch', async () => {
+  const res = await call('POST', '/api/v1/ingest/questions', tokens.intake, {
+    questions: [{ channel: 'TELEGRAM', source_hash: 'test-badrole-1', text: 'ok question here',
+      thread: [{ role: 'admin', text: 'hello' }] }],
+  });
+  assert.equal(res.statusCode, 422);
+  assert.match(res.json().detail, /role must be one of/);
+});
+
 test('STEP 2b: classification maps to EC topic and the approved EC-004 card', async () => {
   const res = await call('POST', `/api/v1/questions/${questionId}/classify`, tokens.intake);
   assert.equal(res.statusCode, 200, res.body);

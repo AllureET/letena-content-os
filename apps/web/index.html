@@ -62,7 +62,7 @@ tr.rowlink{cursor:pointer} tr.rowlink:hover td{background:var(--surface-2)}
 .pill .d{width:6px;height:6px;border-radius:50%;background:currentColor}
 .risk-high,.p-TIER_4,.p-EMERGENCY,.p-HIGH,.p-FAIL,.p-REJECTED,.p-FAILED,.p-VALIDATION_FAILED,.p-QUARANTINED,.p-RETIRED{color:var(--risk-high);background:var(--risk-high-bg)}
 .risk-mod,.p-TIER_3,.p-MODERATE,.p-CLINICAL_REVIEW,.p-LANGUAGE_REVIEW,.p-IN_REVIEW,.p-NEEDS_UPDATE,.p-NEEDS_KNOWLEDGE,.p-SCHEDULED,.p-PENDING_DEID{color:var(--risk-mod);background:var(--risk-mod-bg)}
-.risk-routine,.p-TIER_1,.p-TIER_2,.p-APPROVED,.p-PASS,.p-PUBLISHED,.p-SUCCEEDED,.p-RENDERED,.p-LIVE,.p-CLUSTERED,.p-ACTIVE{color:var(--risk-routine);background:var(--risk-routine-bg)}
+.risk-routine,.p-TIER_1,.p-TIER_2,.p-ROUTINE,.p-LOW,.p-APPROVED,.p-PASS,.p-PUBLISHED,.p-SUCCEEDED,.p-RENDERED,.p-LIVE,.p-CLUSTERED,.p-ACTIVE{color:var(--risk-routine);background:var(--risk-routine-bg)}
 .p-DRAFT,.p-PROPOSED,.p-QUEUED,.p-DEIDENTIFIED,.p-PENDING{color:var(--st-new);background:var(--st-new-bg)}
 .p-VALIDATED,.p-SELECTED,.p-VALIDATING,.p-LOCALIZING{color:var(--st-review);background:var(--st-review-bg)}
 .p-CLOSED,.p-SUPERSEDED,.p-CANCELLED,.p-ARCHIVED{color:var(--st-closed);background:var(--st-closed-bg)}
@@ -99,6 +99,34 @@ label{font-size:11.5px;color:var(--ink-2);font-weight:500;display:block;margin:1
 .muted{color:var(--ink-mute)}
 .flex{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .spacer{flex:1}
+/* keyboard focus visibility */
+:focus-visible{outline:2px solid var(--jelly-bean);outline-offset:2px}
+#side a:focus-visible{outline-offset:-2px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--jelly-bean);box-shadow:0 0 0 3px rgba(71,114,135,.14)}
+/* hover + motion polish */
+button,.btn,.tile,.amchip{transition:background-color .15s ease,border-color .15s ease,box-shadow .15s ease,color .15s ease}
+tr.rowlink td{transition:background-color .12s ease}
+.tile:hover{box-shadow:0 1px 6px rgba(22,16,63,.08)}
+@media(prefers-reduced-motion:reduce){*{transition:none !important}}
+/* empty states */
+td.empty{color:var(--ink-mute);text-align:center;padding:26px 12px}
+.card.empty{color:var(--ink-mute);text-align:center;padding:26px 18px}
+/* back link on detail screens */
+.backlink{display:inline-block;font-size:12px;margin-bottom:10px}
+.backlink:hover{text-decoration:underline}
+/* English-first bilingual toggle chip */
+.amchip{display:inline-flex;align-items:center;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-2);border-radius:999px;font-size:10px;font-weight:500;padding:1px 7px;margin-left:6px;cursor:pointer;line-height:1.6;vertical-align:middle}
+.amchip:hover{border-color:var(--jelly-bean);color:var(--jelly-bean)}
+.amchip[aria-pressed="true"]{background:var(--st-new-bg);border-color:var(--st-new);color:var(--st-new)}
+/* conversation thread (question drill-down) */
+.thread{display:flex;flex-direction:column;gap:10px}
+.bubble{max-width:78%;padding:10px 14px;border-radius:var(--r-lg);font-size:13.5px;line-height:1.65}
+.bubble.patient{align-self:flex-start;background:var(--surface-2);border:1px solid var(--line-soft);border-bottom-left-radius:var(--r-xs)}
+.bubble.doctor{align-self:flex-end;background:var(--st-new-bg);border:1px solid #CFDEE5;border-bottom-right-radius:var(--r-xs)}
+.bubble.note{align-self:stretch;max-width:none;background:var(--canvas);border:1px dashed var(--line);border-radius:var(--r-sm);color:var(--ink-2);font-size:12.5px}
+.bubble .who{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-mute);font-weight:600;margin-bottom:3px}
+.bubble.doctor .who{color:var(--jelly-bean)}
+.card.answer{border-color:var(--jelly-bean);border-left:4px solid var(--jelly-bean)}
 /* mobile topbar + drawer veil (hidden on desktop) */
 #mtop{display:none}
 #navveil{display:none}
@@ -122,12 +150,13 @@ label{font-size:11.5px;color:var(--ink-2);font-weight:500;display:block;margin:1
   .grid2{grid-template-columns:1fr}
   #login{margin:10vh 16px}
   input,select,textarea{font-size:16px}
+  .bubble{max-width:92%}
 }
 </style>
 </head>
 <body>
 <div id="app"></div>
 <div id="toast"></div>
-<script type="module" src="/app.js?v=4"></script>
+<script type="module" src="/app.js?v=5"></script>
 </body>
 </html>

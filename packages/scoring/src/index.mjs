@@ -145,7 +145,11 @@ export function validatorOverlay({ scriptText, claims, card, riskTier, cta, pres
     }
   }
   // Prohibited claims: trigram match against the card's prohibited list.
-  for (const p of card?.prohibited_claims ?? []) {
+  // Entries are plain strings from the demo/manual seed, or
+  // {reason, statement} objects from the basics-library seed; normalize.
+  for (const entry of card?.prohibited_claims ?? []) {
+    const p = typeof entry === 'string' ? entry : entry?.statement;
+    if (!p) continue;
     for (const sentence of scriptText.split(/(?<=[.!?።])\s+/)) {
       if (sentence.length > 15 && trigramContainment(p, sentence) >= 0.6) {
         findings.push({ code: 'PROHIBITED_CLAIM', severity: 'BLOCKER',

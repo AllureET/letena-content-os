@@ -32,6 +32,26 @@ stacks, 16px inputs against iOS zoom); app.js shell() renders #mtop/#navveil
 and a delegated click handler toggles body.nav-open. Deployed via deploy-key
 pull + service restart; index.html references /app.js?v=2 for cache busting.
 
+PLATFORM EXPORT SPECS SHIPPED 2026-08-12: 2026-sourced per-platform video
+sizing (Instagram Reels, TikTok, Facebook, Telegram, plus generic
+placeholders for YouTube/LinkedIn/X/Website) now lives in
+lcos.platform_specs (migration 0008), admin-editable via
+GET/PUT /api/v1/platform/specs (apps/api/src/modules/platform_specs.mjs),
+matching the voice_lexicon table pattern. Wired into
+POST /distribution/jobs: scheduling a render to a platform looks up that
+platform's spec and runs evaluateContent() (pure, unit-tested), which flags
+-- never blocks -- a render whose duration exceeds the platform's
+recommended or max length, or whose aspect ratio does not match. The spec
+and any warnings ride along on the publishing job's response and its
+payload jsonb column, so nothing new to migrate on publishing_jobs itself.
+11 new tests (evaluateContent unit tests + GET/PUT specs + the schedule-time
+warning, both compliant and flagged cases); 102/102 green after the change.
+Not yet wired: apps/web (a separate pass), and render-time dimension
+selection in production.mjs/adapters (renders stay platform-agnostic today,
+one render can serve several platforms via separate publishing_jobs rows,
+so the spec lookup happens at schedule time where the platform is actually
+known).
+
 CREDENTIALS PAGE SHIPPED 2026-08-12 (Nate approved all three streams below):
 the LCOS Settings screen now has an "API keys and providers" section, the
 EMR-integration-credentials pattern: apps/api/src/creds.mjs (CRED_REGISTRY of
@@ -333,7 +353,7 @@ records in public.schema_migrations. Forward-only.
 
 ## Test status
 
-`npm test` -> 74/74 green (last run this session).
+`npm test` -> 102/102 green (last run this session, platform-specs increment).
 `npm run demo` -> 14/14 steps complete (includes the language-review gate).
 
 ## Run instructions

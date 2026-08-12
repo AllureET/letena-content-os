@@ -3,12 +3,23 @@
 import crypto from 'node:crypto';
 import { q, one, tx, audit, requirePerm, err, transition, setting } from '../core.mjs';
 import { invokeAgent, embed } from '../ai/gateway.mjs';
+import { lintStyle } from '../ai/style_lint.mjs';
 import { validatorOverlay, overallResult, computeRiskTier } from '../../../../packages/scoring/src/index.mjs';
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
 export default async function routes(app) {
+  // Named tone/voice presets (lcos.tone_presets, migration 0009). The default
+  // is the content.tone_preset setting (Settings screen); this list is what a
+  // per-request tone_preset override on /content/turn-into-content picks from.
+  app.get('/content/tone-presets', { preHandler: requirePerm('concept.read') }, async () => {
+    const r = await q(
+      `SELECT key, label, description FROM lcos.tone_presets WHERE is_active ORDER BY key`);
+    const current = String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
+    return { items: r.rows, default: current };
+  });
+
   app.get('/content/families', { preHandler: requirePerm('concept.read') }, async () => {
     const r = await q(
       `SELECT cf.*, kc.code AS card_code, seg.slug AS segment_slug
@@ -75,7 +86,7 @@ export default async function routes(app) {
     return result;
   });
   app.post('/content/scripts/:id/localize', { preHandler: requirePerm('script.write') }, async (req, reply) => {
-    const result = await localizeScript(req.params.id, { actor: req.actor });
+    const result = await localizeScript(req.params.id, { actor: req.actor, tonePreset: req.body?.tone_preset ?? null });
     if (!result) return reply.code(404).send(err(404, 'NOT_FOUND', 'script'));
     return result;
   });
@@ -203,25 +214,121 @@ export default async function routes(app) {
     return { approved, renders_approved: rendersApproved, skipped };
   });
 
+  // tone_preset is optional: a per-request override of the content.tone_preset
+  // setting (see GET /content/tone-presets for the selectable list). Both
+  // generation entry points accept it and pass it straight through to
+  // invokeAgent() -- turn-into-content here, and the output_types-based
+  // POST /content/generate below.
   app.post('/content/turn-into-content', { preHandler: requirePerm('question.turn_into_content') }, async (req, reply) => {
-    const { question_id, languages = ['EN', 'AM'], concept_count = 2 } = req.body ?? {};
+    const { question_id, languages = ['EN', 'AM'], concept_count = 2, tone_preset = null } = req.body ?? {};
     if (!question_id) return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'question_id required'));
     try {
       const result = await turnIntoContent({ questionId: question_id, languages, conceptCount: concept_count,
-        actor: req.actor });
+        actor: req.actor, tonePreset: tone_preset });
       return reply.code(202).send(result);
     } catch (e) {
-      req.log.error(e);
-      return reply.code(500).send(err(500, 'PIPELINE_ERROR', e.message));
+      const status = e.status ?? 500;
+      if (status >= 500) req.log.error(e);
+      return reply.code(status).send(err(status, e.code ?? 'PIPELINE_ERROR', e.message, e.guard ? { guard: e.guard } : {}));
+    }
+  });
+
+  // ----- flexible generation scope -----
+  // Owner ask (Nate, Aug 2026): "it's currently set to 4 diff outputs. How
+  // about if I just want to output 1 kind in 1 specific topic." This is the
+  // scoped alternative to turn-into-content: pick a knowledge card (the
+  // topic) and exactly which output_types to generate (a data-driven list,
+  // see content_output_types), or point at one existing concept to
+  // (re)generate just its script. Same claim-validation and card-approval
+  // rules as turn-into-content, including the admin test-mode override.
+  app.get('/content/output-types', { preHandler: requirePerm('concept.read') }, async () => {
+    const r = await q(
+      `SELECT code, label, platform, video_family, description, sort_order
+       FROM lcos.content_output_types WHERE is_active ORDER BY sort_order`);
+    return { items: r.rows };
+  });
+  app.post('/content/generate', { preHandler: requirePerm('question.turn_into_content') }, async (req, reply) => {
+    const { card_id, concept_id, output_types, question_id, languages = ['EN', 'AM'], tone_preset = null } = req.body ?? {};
+    if (!card_id && !concept_id) {
+      return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'card_id (topic) or concept_id is required'));
+    }
+    try {
+      const result = await generateContent({ cardId: card_id, conceptId: concept_id,
+        outputTypes: output_types, questionId: question_id, languages, actor: req.actor, tonePreset: tone_preset });
+      return reply.code(202).send(result);
+    } catch (e) {
+      const status = e.status ?? 500;
+      if (status >= 500) req.log.error(e);
+      return reply.code(status).send(err(status, e.code ?? 'PIPELINE_ERROR', e.message, e.guard ? { guard: e.guard } : {}));
     }
   });
 }
 
+// ============ card resolution (approval gate + admin test-mode override) ============
+
+// Owner ask (Nate, Aug 2026): "I want to be able to test the system out and
+// build some test content without waiting for dr approval... place override
+// options in settings for me as admin." The normal rule is unchanged: only
+// an APPROVED card's APPROVED claims feed generation. approval.override=
+// ADMIN_TEST_MODE (settings, admin-role-only to flip, see PUT
+// /platform/settings) opens a second door, ADMIN-role-only to walk through:
+// generate from a card that is still DRAFT/IN_REVIEW, using its latest
+// (unapproved) version and whatever claims are attached regardless of their
+// own status. Every row produced this way carries is_test_content=true and
+// every use of the override is audit-logged with the card and claim ids.
+// This never touches the publish-time re-check in distribution.mjs
+// (executePublish requires card.status='APPROVED'), so test content can be
+// generated and even rendered, but can never actually go out to the public
+// while its card is unapproved.
+export async function resolveCardForGeneration(cardIdOrCode, actor) {
+  const card = await one(
+    `SELECT kc.*, t.code AS topic_code FROM lcos.knowledge_cards kc
+     JOIN lcos.topics t ON t.id=kc.topic_id
+     WHERE kc.id::text=$1 OR kc.code=$1`, [String(cardIdOrCode)]);
+  if (!card) {
+    const e = new Error('knowledge card not found'); e.status = 404; e.code = 'NOT_FOUND'; throw e;
+  }
+  if (card.status === 'APPROVED') {
+    const cardVersion = await one(`SELECT * FROM lcos.knowledge_card_versions WHERE id=$1`, [card.approved_version_id]);
+    const claims = (await q(
+      `SELECT mc.id, mc.code, mc.claim_text_en, mc.claim_type, mc.certainty, kcc.is_core
+       FROM lcos.knowledge_card_claims kcc JOIN lcos.medical_claims mc ON mc.id=kcc.claim_id
+       WHERE kcc.card_id=$1 AND mc.status='APPROVED'`, [card.id])).rows;
+    return { card, cardVersion, claims, isTestContent: false, overrideUsed: false };
+  }
+
+  // Not approved: the only door in is the admin test-mode override.
+  const override = String(await setting('approval.override', 'OFF'));
+  if (override !== 'ADMIN_TEST_MODE') {
+    const e = new Error(`knowledge card ${card.code} is not APPROVED`);
+    e.status = 422; e.code = 'GUARD_FAILED'; e.guard = 'cardIsApproved'; throw e;
+  }
+  if (!actor?.roles?.includes('admin')) {
+    const e = new Error('approval.override is ADMIN_TEST_MODE, which only an admin may use to generate from a not-yet-approved card.');
+    e.status = 403; e.code = 'FORBIDDEN'; e.guard = 'adminOnlyOverride'; throw e;
+  }
+  const versionId = card.current_version_id ?? card.approved_version_id;
+  if (!versionId) {
+    const e = new Error(`knowledge card ${card.code} has no card body yet; write a version first`);
+    e.status = 422; e.code = 'GUARD_FAILED'; e.guard = 'hasVersion'; throw e;
+  }
+  const cardVersion = await one(`SELECT * FROM lcos.knowledge_card_versions WHERE id=$1`, [versionId]);
+  const claims = (await q(
+    `SELECT mc.id, mc.code, mc.claim_text_en, mc.claim_type, mc.certainty, kcc.is_core
+     FROM lcos.knowledge_card_claims kcc JOIN lcos.medical_claims mc ON mc.id=kcc.claim_id
+     WHERE kcc.card_id=$1 AND mc.status <> 'RETIRED'`, [card.id])).rows;
+  await audit(null, { actor, action: 'content.admin_test_override_used', objectType: 'KNOWLEDGE_CARD',
+    objectId: card.id, objectCode: card.code,
+    reason: `ADMIN_TEST_MODE generation from ${card.status} card; claims=[${claims.map(c => c.code).join(', ')}]` });
+  return { card, cardVersion, claims, isTestContent: true, overrideUsed: true };
+}
+
 // ============ pipeline ============
 
-export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], actor }) {
+export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], actor, tonePreset = null }) {
   const steps = [];
   const step = (name, status, extra = {}) => { steps.push({ step: name, status, ...extra }); };
+  const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
 
   // 1. classification (run or reuse)
   let cls = await one(`SELECT * FROM lcos.question_classifications WHERE question_id=$1`, [questionId]);
@@ -244,15 +351,7 @@ export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], ac
         message: 'No approved medical knowledge answers this yet. The clinical team has been asked.' } };
   }
 
-  const card = await one(
-    `SELECT kc.*, t.code AS topic_code FROM lcos.knowledge_cards kc
-     JOIN lcos.topics t ON t.id=kc.topic_id WHERE kc.id=$1`, [cls.knowledge_card_id]);
-  if (card.status !== 'APPROVED') throw new Error(`knowledge card ${card.code} is not APPROVED`);
-  const cardVersion = await one(`SELECT * FROM lcos.knowledge_card_versions WHERE id=$1`, [card.approved_version_id]);
-  const claims = (await q(
-    `SELECT mc.id, mc.code, mc.claim_text_en, mc.claim_type, mc.certainty, kcc.is_core
-     FROM lcos.knowledge_card_claims kcc JOIN lcos.medical_claims mc ON mc.id=kcc.claim_id
-     WHERE kcc.card_id=$1 AND mc.status='APPROVED'`, [card.id])).rows;
+  const { card, cardVersion, claims, isTestContent } = await resolveCardForGeneration(cls.knowledge_card_id, actor);
   const segment = await one(
     `SELECT * FROM lcos.audience_segments WHERE id=COALESCE($1, (SELECT id FROM lcos.audience_segments WHERE slug='general_public'))`,
     [cls.audience_segment_id]);
@@ -263,11 +362,11 @@ export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], ac
     topicCodes: [card.topic_code] });
   const family = await one(
     `INSERT INTO lcos.content_families (code, title, knowledge_card_id, knowledge_card_version_id,
-       primary_segment_id, risk_tier, origin, origin_question_id, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,'TURN_INTO_CONTENT',$7,$8) RETURNING *`,
-    [code('CF'), `TIC: ${card.canonical_question_en.slice(0, 80)}`, card.id, card.approved_version_id,
-     segment.id, riskTier, questionId, actor?.id ?? null]);
-  step('create_family', 'SUCCEEDED', { family_code: family.code, risk_tier: riskTier });
+       primary_segment_id, risk_tier, origin, origin_question_id, created_by, is_test_content)
+     VALUES ($1,$2,$3,$4,$5,$6,'TURN_INTO_CONTENT',$7,$8,$9) RETURNING *`,
+    [code('CF'), `TIC: ${card.canonical_question_en.slice(0, 80)}`, card.id, cardVersion.id,
+     segment.id, riskTier, questionId, actor?.id ?? null, isTestContent]);
+  step('create_family', 'SUCCEEDED', { family_code: family.code, risk_tier: riskTier, is_test_content: isTestContent });
 
   // 3. concepts
   const question = await one(`SELECT sanitized_text FROM lcos.audience_questions WHERE id=$1`, [questionId]);
@@ -278,7 +377,7 @@ export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], ac
     claims: claims.map(c => ({ id: c.id, code: c.code, claim_text_en: c.claim_text_en, certainty: c.certainty })),
     audience: { slug: segment.slug, tone_guidance: segment.tone_guidance, terms_to_avoid: segment.terms_to_avoid },
     representative_question: question.sanitized_text,
-  }, { objectType: 'CONTENT_FAMILY', objectId: family.id, workflowCode: 'WF06' });
+  }, { objectType: 'CONTENT_FAMILY', objectId: family.id, workflowCode: 'WF06', tone_preset: effectiveTone });
 
   const validClaimIds = new Set(claims.map(c => c.id));
   const conceptRows = [];
@@ -306,29 +405,145 @@ export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], ac
   // 4-7. per concept: script -> validate -> localize -> reviews
   const scripts = [];
   for (const concept of conceptRows.slice(0, 2)) {
-    const s = await generateScript({ concept, family, card, cardVersion, claims, actor });
-    if (s.status === 'NEEDS_KNOWLEDGE') { step('generate_script', 'NEEDS_KNOWLEDGE', { script: s.code }); continue; }
-    const v = await validateScript(s.id, { actor });
-    step('validate_claims', v.overall_result, { script: s.code, findings: v.findings.length });
-    if (v.overall_result !== 'PASS') { scripts.push({ script_id: s.id, code: s.code, status: 'VALIDATION_FAILED' }); continue; }
-    if (languages.includes('AM')) {
-      const loc = await localizeScript(s.id, { actor });
-      step('localize_amharic', loc.result, { script: s.code, drift: loc.drift_score });
-    }
-    await routeReviews(s.id, family.risk_tier);
-    const fresh = await one(`SELECT id, code, status, risk_tier FROM lcos.scripts WHERE id=$1`, [s.id]);
-    scripts.push(fresh);
+    const s = await generateScript({ concept, family, card, cardVersion, claims, actor,
+      isTestContent, tonePreset: effectiveTone });
+    scripts.push(await processGeneratedScript(s, family, languages, actor, step, effectiveTone));
   }
   step('queue_review', 'SUCCEEDED');
 
   return { pipeline_id: family.id, family_id: family.id, family_code: family.code,
     knowledge_card: { id: card.id, code: card.code, status: card.status,
       match_confidence: Number(cls.match_confidence) },
+    is_test_content: isTestContent, tone_preset: effectiveTone,
     risk_tier: family.risk_tier, concepts: conceptRows.map(c => ({ id: c.id, code: c.code, title: c.title })),
     scripts, steps };
 }
 
-export async function generateScript({ concept, family, card, cardVersion, claims, actor, seedUnsupported = false }) {
+// Shared per-script tail of both generation pipelines: validate -> localize
+// (if Amharic requested, carrying the same tone preset used for generation)
+// -> route to auto-approval or the review queue.
+async function processGeneratedScript(s, family, languages, actor, step, tonePreset = null) {
+  if (s.status === 'NEEDS_KNOWLEDGE') {
+    step('generate_script', 'NEEDS_KNOWLEDGE', { script: s.code });
+    return { script_id: s.id, code: s.code, status: 'NEEDS_KNOWLEDGE' };
+  }
+  const v = await validateScript(s.id, { actor });
+  step('validate_claims', v.overall_result, { script: s.code, findings: v.findings.length });
+  if (v.overall_result !== 'PASS') return { script_id: s.id, code: s.code, status: 'VALIDATION_FAILED' };
+  if (languages.includes('AM')) {
+    const loc = await localizeScript(s.id, { actor, tonePreset });
+    step('localize_amharic', loc.result, { script: s.code, drift: loc.drift_score });
+  }
+  await routeReviews(s.id, family.risk_tier);
+  return one(
+    `SELECT s.id, s.code, s.status, s.risk_tier, sv.tone_preset, sv.style_warnings
+     FROM lcos.scripts s
+     JOIN lcos.script_versions sv ON sv.script_id=s.id AND sv.version=s.current_version
+     WHERE s.id=$1`, [s.id]);
+}
+
+// ============ flexible generation scope (POST /content/generate) ============
+
+// Owner ask (Nate, Aug 2026): "How about if I just want to output 1 kind in
+// 1 specific topic. And how about if I want a diff output." Two entry
+// points: concept_id re-runs script generation for exactly that one
+// existing concept; card_id + output_types builds exactly the requested
+// output kinds (from content_output_types, a data table, not a hardcoded
+// array) for that one knowledge card, skipping the free-form creative
+// director step entirely so the caller gets exactly what they asked for.
+// tonePreset is optional on both paths, the same per-request override as
+// turn-into-content: falls back to the content.tone_preset setting.
+export async function generateContent({ cardId, conceptId, outputTypes, questionId, languages = ['EN', 'AM'],
+    actor, tonePreset = null }) {
+  const steps = [];
+  const step = (name, status, extra = {}) => { steps.push({ step: name, status, ...extra }); };
+  const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
+
+  if (conceptId) {
+    const concept = await one(`SELECT * FROM lcos.content_concepts WHERE id=$1`, [conceptId]);
+    if (!concept) { const e = new Error('concept not found'); e.status = 404; e.code = 'NOT_FOUND'; throw e; }
+    const family = await one(`SELECT * FROM lcos.content_families WHERE id=$1`, [concept.family_id]);
+    const { card, cardVersion, claims, isTestContent } = await resolveCardForGeneration(family.knowledge_card_id, actor);
+    step('resolve_card', 'SUCCEEDED', { card_code: card.code, is_test_content: isTestContent });
+
+    const s = await generateScript({ concept, family, card, cardVersion, claims, actor,
+      isTestContent, tonePreset: effectiveTone });
+    const scriptResult = await processGeneratedScript(s, family, languages, actor, step, effectiveTone);
+    return { pipeline_id: family.id, family_id: family.id, family_code: family.code,
+      knowledge_card: { id: card.id, code: card.code, status: card.status },
+      is_test_content: isTestContent, tone_preset: effectiveTone, risk_tier: family.risk_tier,
+      concepts: [{ id: concept.id, code: concept.code, title: concept.title, video_family: concept.video_family }],
+      scripts: [scriptResult], steps };
+  }
+
+  if (!Array.isArray(outputTypes) || !outputTypes.length) {
+    const e = new Error('output_types must be a non-empty array of content_output_types codes');
+    e.status = 422; e.code = 'VALIDATION_ERROR'; throw e;
+  }
+  if (questionId) {
+    const question = await one(`SELECT id FROM lcos.audience_questions WHERE id=$1`, [questionId]);
+    if (!question) { const e = new Error('question_id not found'); e.status = 404; e.code = 'NOT_FOUND'; throw e; }
+  }
+  const { card, cardVersion, claims, isTestContent } = await resolveCardForGeneration(cardId, actor);
+  step('resolve_card', 'SUCCEEDED', { card_code: card.code, is_test_content: isTestContent });
+
+  const types = (await q(
+    `SELECT * FROM lcos.content_output_types WHERE code = ANY($1::text[]) AND is_active ORDER BY sort_order`,
+    [outputTypes])).rows;
+  const foundCodes = new Set(types.map(t => t.code));
+  const missing = outputTypes.filter(c => !foundCodes.has(c));
+  if (missing.length) {
+    const e = new Error(`unknown or inactive output_types: ${missing.join(', ')}`);
+    e.status = 422; e.code = 'VALIDATION_ERROR'; throw e;
+  }
+
+  const segment = await one(`SELECT * FROM lcos.audience_segments WHERE slug='general_public'`);
+  const riskTier = computeRiskTier({ cardTiers: [card.risk_tier],
+    claimTypes: claims.map(c => c.claim_type), topicCodes: [card.topic_code] });
+
+  const family = await one(
+    `INSERT INTO lcos.content_families (code, title, knowledge_card_id, knowledge_card_version_id,
+       primary_segment_id, risk_tier, origin, origin_question_id, created_by, is_test_content)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+    [code('CF'), `Targeted: ${card.canonical_question_en.slice(0, 70)}`, card.id, cardVersion.id,
+     segment.id, riskTier, questionId ? 'TURN_INTO_CONTENT' : 'PLANNED', questionId ?? null,
+     actor?.id ?? null, isTestContent]);
+  step('create_family', 'SUCCEEDED',
+    { family_code: family.code, risk_tier: riskTier, output_types: types.map(t => t.code), is_test_content: isTestContent });
+
+  const conceptRows = [];
+  for (const t of types) {
+    const row = await one(
+      `INSERT INTO lcos.content_concepts (code, family_id, video_family, title, hook_line, premise,
+         treatment, claim_ids_referenced, target_duration_s, cta_intent, why_this_works, status)
+       VALUES ($1,$2,$3::lcos.video_family,$4,$5,$6,$7,$8::uuid[],$9,$10,$11,'SELECTED') RETURNING *`,
+      [code('CC'), family.id, t.video_family, `${t.label}: ${card.canonical_question_en.slice(0, 70)}`,
+       card.canonical_question_en, t.description ?? `Direct answer using ${card.code}.`,
+       `Format: ${t.label}${t.platform ? ` (${t.platform})` : ''}. ${t.description ?? ''}`.trim(),
+       claims.map(c => c.id), 30, 'private telegram consult',
+       `Targeted generation request for output type ${t.code}.`]);
+    conceptRows.push(row);
+  }
+  step('create_concepts', 'SUCCEEDED', { count: conceptRows.length, output_types: types.map(t => t.code) });
+
+  const scripts = [];
+  for (const concept of conceptRows) {
+    const s = await generateScript({ concept, family, card, cardVersion, claims, actor,
+      isTestContent, tonePreset: effectiveTone });
+    scripts.push(await processGeneratedScript(s, family, languages, actor, step, effectiveTone));
+  }
+  step('queue_review', 'SUCCEEDED');
+
+  return { pipeline_id: family.id, family_id: family.id, family_code: family.code,
+    knowledge_card: { id: card.id, code: card.code, status: card.status },
+    is_test_content: isTestContent, tone_preset: effectiveTone, risk_tier: family.risk_tier,
+    concepts: conceptRows.map(c => ({ id: c.id, code: c.code, title: c.title, video_family: c.video_family })),
+    scripts, steps };
+}
+
+export async function generateScript({ concept, family, card, cardVersion, claims, actor, seedUnsupported = false,
+    isTestContent = false, tonePreset = null }) {
+  const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
   const out = await invokeAgent('script_writer', {
     hook_line: concept.hook_line, video_family: concept.video_family,
     treatment: concept.treatment,
@@ -336,32 +551,37 @@ export async function generateScript({ concept, family, card, cardVersion, claim
       prohibited_claims: cardVersion.prohibited_claims },
     claims: claims.map(c => ({ id: c.id, code: c.code, claim_text_en: c.claim_text_en, certainty: c.certainty })),
     __seed_unsupported: seedUnsupported || undefined,
-  }, { objectType: 'CONCEPT', objectId: concept.id, workflowCode: 'WF07' });
+  }, { objectType: 'CONCEPT', objectId: concept.id, workflowCode: 'WF07', tone_preset: effectiveTone });
 
   if (out.result === 'NEEDS_KNOWLEDGE') {
     const s = await one(
       `INSERT INTO lcos.scripts (code, concept_id, family_id, knowledge_card_version_id, language,
-         status, risk_tier, needs_knowledge_note, created_by)
-       VALUES ($1,$2,$3,$4,'EN','NEEDS_KNOWLEDGE',$5,$6,$7) RETURNING *`,
+         status, risk_tier, needs_knowledge_note, created_by, is_test_content)
+       VALUES ($1,$2,$3,$4,'EN','NEEDS_KNOWLEDGE',$5,$6,$7,$8) RETURNING *`,
       [code('SCR'), concept.id, family.id, family.knowledge_card_version_id, family.risk_tier,
-       JSON.stringify(out.needs_knowledge), actor?.id ?? null]);
+       JSON.stringify(out.needs_knowledge), actor?.id ?? null, isTestContent]);
     return s;
   }
   const sc = out.script;
   const bodyHash = sha(sc.spoken_script + sc.hook + sc.cta);
+  // Mechanical house-style lint over every generated English surface. Not
+  // exhaustive (see ai/style_lint.mjs); catches em dashes, hedge phrases and
+  // AI sign-offs so a human reviewer sees them rather than them slipping by.
+  const styleWarnings = lintStyle([sc.hook, sc.spoken_script, sc.cta, sc.caption].filter(Boolean).join('\n'));
   const s = await one(
     `INSERT INTO lcos.scripts (code, concept_id, family_id, knowledge_card_version_id, language,
-       status, risk_tier, current_version, validation_result, content_sha256, created_by)
-     VALUES ($1,$2,$3,$4,'EN','DRAFT',$5,1,'NOT_RUN',$6,$7) RETURNING *`,
+       status, risk_tier, current_version, validation_result, content_sha256, created_by, is_test_content)
+     VALUES ($1,$2,$3,$4,'EN','DRAFT',$5,1,'NOT_RUN',$6,$7,$8) RETURNING *`,
     [code('SCR'), concept.id, family.id, family.knowledge_card_version_id, family.risk_tier,
-     bodyHash, actor?.id ?? null]);
+     bodyHash, actor?.id ?? null, isTestContent]);
   await q(
     `INSERT INTO lcos.script_versions (script_id, version, hook, spoken_script, onscreen_text,
-       scene_plan, cta, caption, hashtags, platform_variants, estimated_duration_s, content_sha256, created_by)
-     VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+       scene_plan, cta, caption, hashtags, platform_variants, estimated_duration_s, content_sha256,
+       created_by, tone_preset, style_warnings)
+     VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
     [s.id, sc.hook, sc.spoken_script, JSON.stringify(sc.onscreen_text), JSON.stringify(sc.scene_plan),
      sc.cta, sc.caption ?? null, sc.hashtags ?? [], JSON.stringify(sc.platform_variants ?? {}),
-     sc.estimated_duration_s, bodyHash, actor?.id ?? null]);
+     sc.estimated_duration_s, bodyHash, actor?.id ?? null, effectiveTone, JSON.stringify(styleWarnings)]);
   for (const m of sc.claim_map) {
     await q(`INSERT INTO lcos.script_claims (script_id, script_version, claim_id, statement, location)
              VALUES ($1,1,$2,$3,$4)`, [s.id, m.claim_id, m.statement, m.location]);
@@ -380,10 +600,16 @@ export async function validateScript(scriptId, { actor }) {
   const family = await one(`SELECT * FROM lcos.content_families WHERE id=$1`, [s.family_id]);
   const cardVersion = await one(`SELECT * FROM lcos.knowledge_card_versions WHERE id=$1`,
     [family.knowledge_card_version_id]);
+  // Test-mode scripts (is_test_content) were written from whatever claims
+  // were attached, not only APPROVED ones (see resolveCardForGeneration);
+  // re-fetch on the same basis so validation can find what generation used
+  // instead of failing every statement on a filter mismatch.
   const claims = (await q(
     `SELECT mc.id, mc.code, mc.claim_text_en, mc.certainty FROM lcos.knowledge_card_claims kcc
      JOIN lcos.medical_claims mc ON mc.id=kcc.claim_id
-     WHERE kcc.card_id=$1 AND mc.status='APPROVED'`, [family.knowledge_card_id])).rows;
+     WHERE kcc.card_id=$1 AND (
+       ($2::boolean AND mc.status <> 'RETIRED') OR (NOT $2::boolean AND mc.status='APPROVED')
+     )`, [family.knowledge_card_id, s.is_test_content])).rows;
 
   await q(`UPDATE lcos.scripts SET status='VALIDATING' WHERE id=$1 AND status IN ('DRAFT','VALIDATION_FAILED')`, [s.id]);
 
@@ -431,7 +657,7 @@ export async function validateScript(scriptId, { actor }) {
   return { script_id: s.id, overall_result: result, statements: agentOut.statements, findings };
 }
 
-export async function localizeScript(scriptId, { actor }) {
+export async function localizeScript(scriptId, { actor, tonePreset = null }) {
   const s = await one(`SELECT * FROM lcos.scripts WHERE id=$1`, [scriptId]);
   if (!s) return null;
   const v = await one(`SELECT * FROM lcos.script_versions WHERE script_id=$1 AND version=$2`,
@@ -441,12 +667,13 @@ export async function localizeScript(scriptId, { actor }) {
     [family.knowledge_card_version_id]);
   const terminology = (await q(
     `SELECT term_en, preferred_am, avoid_am FROM lcos.terminology WHERE status='APPROVED' LIMIT 200`)).rows;
+  const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
 
   const loc = await invokeAgent('amharic_localizer', {
     english: { hook: v.hook, spoken_script: v.spoken_script, cta: v.cta, caption: v.caption },
     canonical_answer_am: cardVersion.canonical_answer_am,
     terminology, register: 'GENERAL',
-  }, { objectType: 'SCRIPT', objectId: s.id, workflowCode: 'WF09' });
+  }, { objectType: 'SCRIPT', objectId: s.id, workflowCode: 'WF09', tone_preset: effectiveTone });
 
   if (loc.result === 'HUMAN_LANGUAGE_REVIEW') {
     await routeLanguageReview(s.id, null);

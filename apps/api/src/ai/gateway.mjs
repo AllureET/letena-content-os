@@ -2,7 +2,7 @@
 // prompt from ai_prompts, PII assertion on the outbound payload, provider
 // dispatch, zod validation with one repair retry, ai_invocations recording.
 import { z } from 'zod';
-import { q, one } from '../core.mjs';
+import { q, one, setting } from '../core.mjs';
 import { getProvider } from './provider.mjs';
 import { cred } from '../creds.mjs';
 import { containsForbidden } from '../../../../packages/deid/src/index.mjs';
@@ -127,14 +127,52 @@ export class AgentError extends Error {
   constructor(msg, outcome) { super(msg); this.outcome = outcome; }
 }
 
+// ---------- house style + tone (Nate, 12 Aug 2026) ----------
+// "I should have options if I want to change the tone and voice" -> tone is
+// a selectable preset (lcos.tone_presets, migration 0009). These hard bans
+// are NOT part of any preset: they apply to every agent call regardless of
+// which tone is selected, so a tone change can never turn a house rule off.
+export const HOUSE_STYLE_RULES = `House writing rules. These apply to every piece of English or Amharic copy you write, regardless of the tone and voice instructions below. No exceptions.
+- Never use an em dash (—).
+- Never use a "not this, but that" contrastive construction.
+- Never hedge with filler like "might", "could potentially", "it's possible that" when you mean something plainly. State what is true.
+- Never use a parenthetical aside.
+- Never sign off like an assistant: no "I hope this helps!", no "Let me know if you have questions", nothing like it. This is not a chat reply, it is finished copy.
+- Never use antithesis ("it is not X, it is Y") as a rhetorical flourish. Only contrast two things when the contrast itself is the medically necessary clarification, and even then say it plainly rather than as a rhetorical pair.
+- Never use a rule-of-three phrase pattern ("safe, simple, and effective") as a stylistic flourish.
+- Write plain human prose that matches the audience and the document type. Amharic is the primary language for Amharic copy, not a translation exercise: write the way people actually speak, not a stiff word-for-word rendering.`;
+
+// Resolves the effective tone preset's prompt instructions: an explicit
+// per-call override key, else the content.tone_preset platform setting,
+// else (unknown/inactive key) the LETENA_DEFAULT preset as a safe fallback.
+export async function getTonePresetInstructions(toneKeyOverride) {
+  const key = toneKeyOverride || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
+  const preset = await one(
+    `SELECT prompt_instructions FROM lcos.tone_presets WHERE key=$1 AND is_active`, [key]);
+  if (preset) return preset.prompt_instructions;
+  const fallback = await one(
+    `SELECT prompt_instructions FROM lcos.tone_presets WHERE key='LETENA_DEFAULT' AND is_active`);
+  return fallback?.prompt_instructions ?? '';
+}
+
+// Pure composition: house rules first (persona-setting context that must
+// never be dropped), then the selected tone, then the agent's own task
+// instructions (which include its output-format requirements) last.
+export function buildAgentSystemPrompt(basePrompt, toneInstructions) {
+  const toneBlock = toneInstructions ? `Tone and voice for this piece:\n${toneInstructions}` : '';
+  return [HOUSE_STYLE_RULES, toneBlock, basePrompt].filter(Boolean).join('\n\n');
+}
+
 export async function invokeAgent(agentKey, context, { objectType = null, objectId = null,
-  workflowCode = null, provider: providerName } = {}) {
+  workflowCode = null, provider: providerName, tone_preset: tonePreset = null } = {}) {
   const schema = S[agentKey];
   if (!schema) throw new Error(`no schema for agent ${agentKey}`);
   const prompt = await one(
     `SELECT * FROM lcos.ai_prompts WHERE prompt_key=$1 AND is_active`, [agentKey]);
   const provider = getProvider(providerName);
   const started = Date.now();
+  const toneInstructions = await getTonePresetInstructions(tonePreset);
+  const system = buildAgentSystemPrompt(prompt?.system_prompt ?? '', toneInstructions);
 
   // PII assertion on the full outbound payload. BLOCKED_PII is terminal.
   const payloadText = JSON.stringify(context);
@@ -149,7 +187,7 @@ export async function invokeAgent(agentKey, context, { objectType = null, object
     try {
       const { output, usage } = await provider.generateStructured({
         agent: agentKey, context,
-        system: prompt?.system_prompt ?? '',
+        system,
         user: attempt === 0 ? payloadText
           : `${payloadText}\n\nYour previous response failed validation: ${lastErr}. Return corrected JSON only.`,
         schemaName: agentKey,

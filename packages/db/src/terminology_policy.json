@@ -1,0 +1,242 @@
+[
+  {
+    "term_en": "Postpill",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ፖስትፒል",
+    "note": "Brand name of the levonorgestrel emergency pill sold in Ethiopia. Always Latin script."
+  },
+  {
+    "term_en": "ellaOne",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "",
+    "note": "Brand name of the ulipristal acetate emergency pill. Always Latin script."
+  },
+  {
+    "term_en": "levonorgestrel",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ሌቮኖርጌስትሬል",
+    "note": "Drug name, lowercase Latin inside Amharic sentences."
+  },
+  {
+    "term_en": "ulipristal acetate",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ዩሊፕሪስታል አሴቴት",
+    "note": "Drug name, lowercase Latin inside Amharic sentences."
+  },
+  {
+    "term_en": "Condom",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ኮንዶም",
+    "note": "Owner rule 12 Aug 2026: speakers say it in English. Restructure rather than attach Amharic prefixes."
+  },
+  {
+    "term_en": "IUD",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "አይ.ዩ.ዲ / ሉፕ",
+    "note": "Device acronym. Amharic modifiers stay Amharic, e.g. የመዳብ IUD for copper IUD."
+  },
+  {
+    "term_en": "Implant",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ኢምፕላንት",
+    "note": "Contraceptive implant. A short Amharic gloss in parentheses is allowed on first mention."
+  },
+  {
+    "term_en": "HIV",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ኤች አይ ቪ",
+    "note": "Acronym stays Latin, never the Ge'ez letter-by-letter spelling."
+  },
+  {
+    "term_en": "PEP",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ፒኢፒ",
+    "note": "Post-exposure prophylaxis. Acronym stays Latin; describe its function in Amharic."
+  },
+  {
+    "term_en": "hCG",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ኤች.ሲ.ጂ",
+    "note": "Pregnancy hormone measured by tests. Keep the standard casing hCG."
+  },
+  {
+    "term_en": "PCOS",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ፒሲኦኤስ / ፖሊሲስቲክ ኦቫሪ ሲንድሮም",
+    "note": "Write Polycystic Ovary Syndrome (PCOS) on first mention, then PCOS."
+  },
+  {
+    "term_en": "HPV",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ኤች.ፒ.ቪ",
+    "note": "Acronym stays Latin."
+  },
+  {
+    "term_en": "Hepatitis B",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ሄፓታይተስ ቢ",
+    "note": "Disease name stays Latin inside Amharic sentences."
+  },
+  {
+    "term_en": "STI",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ኤስቲአይ",
+    "note": "Acronym stays Latin. The descriptive Amharic phrase የግብረ ሥጋ በሽታ remains correct in prose."
+  },
+  {
+    "term_en": "TB",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ቲቢ",
+    "note": "Acronym stays Latin. The native ሳንባ ነቀርሳ remains acceptable in descriptive prose."
+  },
+  {
+    "term_en": "CDC",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ሲዲሲ",
+    "note": "Institution acronym stays Latin."
+  },
+  {
+    "term_en": "latex",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ላቴክስ",
+    "note": "Material term speakers say in English, e.g. Latex Condom."
+  },
+  {
+    "term_en": "progestogen",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ፕሮጄስቶጅን",
+    "note": "Hormone class name, lowercase Latin. The naturalized loanword ሆርሞን stays Ge'ez."
+  },
+  {
+    "term_en": "positive (test result)",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ፖዘቲቭ",
+    "note": "Test-result term speakers say in English. A short Amharic gloss is allowed on first mention."
+  },
+  {
+    "term_en": "negative (test result)",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "ኔጋቲቭ",
+    "note": "Test-result term speakers say in English."
+  },
+  {
+    "term_en": "nucleic acid test",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "የኑክሊክ አሲድ ምርመራ",
+    "note": "Test name stays Latin; the word ምርመራ around it stays Amharic: Nucleic Acid ምርመራ."
+  },
+  {
+    "term_en": "antigen/antibody test",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "አንቲጅን/አንቲቦዲ ምርመራ",
+    "note": "Test name stays Latin: Antigen/Antibody ምርመራ. The native ፀረ እንግዳ አካላት stays Amharic in prose."
+  },
+  {
+    "term_en": "clitoris",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "",
+    "note": "Anatomy terms stay English in patient-facing copy per owner rule (Nate, 12 Aug 2026)."
+  },
+  {
+    "term_en": "vagina",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "",
+    "note": "Anatomy terms stay English in patient-facing copy per owner rule. The general native word ብልት remains in descriptive prose."
+  },
+  {
+    "term_en": "penis",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "",
+    "note": "Anatomy terms stay English in patient-facing copy per owner rule. The general native word ብልት remains in descriptive prose."
+  },
+  {
+    "term_en": "sperm",
+    "policy": "KEEP_ENGLISH",
+    "am_equivalent_avoid": "",
+    "note": "Anatomy terms stay English in patient-facing copy per owner rule. The native descriptive phrases የወንድ ዘር and የዘር ፈሳሽ remain in existing prose."
+  },
+  {
+    "term_en": "period",
+    "policy": "AMHARIC",
+    "am": "የወር አበባ",
+    "note": "Fully native everyday usage. Never transliterate the English word."
+  },
+  {
+    "term_en": "menstrual cycle",
+    "policy": "AMHARIC",
+    "am": "የወር አበባ ዑደት",
+    "note": "Native usage; ዑደት alone is fine once context is set."
+  },
+  {
+    "term_en": "pregnancy",
+    "policy": "AMHARIC",
+    "am": "እርግዝና",
+    "note": "Fully native everyday usage."
+  },
+  {
+    "term_en": "to get pregnant",
+    "policy": "AMHARIC",
+    "am": "ማርገዝ",
+    "note": "Fully native everyday usage."
+  },
+  {
+    "term_en": "contraception (descriptive)",
+    "policy": "AMHARIC",
+    "am": "መከላከያ",
+    "note": "Descriptive word stays Amharic; specific method and brand names stay Latin."
+  },
+  {
+    "term_en": "emergency contraception (descriptive)",
+    "policy": "AMHARIC",
+    "am": "ድንገተኛ መከላከያ",
+    "note": "The description stays Amharic; the pill-type names levonorgestrel and ulipristal stay Latin."
+  },
+  {
+    "term_en": "breastfeeding",
+    "policy": "AMHARIC",
+    "am": "ጡት ማጥባት",
+    "note": "Fully native everyday usage."
+  },
+  {
+    "term_en": "uterus",
+    "policy": "AMHARIC",
+    "am": "ማህፀን",
+    "note": "Exception to the anatomy rule: fully native everyday word, no code-switch."
+  },
+  {
+    "term_en": "fetus",
+    "policy": "AMHARIC",
+    "am": "ጽንስ",
+    "note": "Fully native everyday usage."
+  },
+  {
+    "term_en": "infertility",
+    "policy": "AMHARIC",
+    "am": "መካንነት",
+    "note": "Fully native everyday usage."
+  },
+  {
+    "term_en": "ovulation",
+    "policy": "AMHARIC",
+    "am": "እንቁላል መለቀቅ",
+    "note": "Native descriptive phrase; keep it rather than the English term."
+  },
+  {
+    "term_en": "pill (contraceptive)",
+    "policy": "AMHARIC",
+    "am": "ክኒን",
+    "note": "Everyday word stays Amharic; specific drug and brand names stay Latin."
+  },
+  {
+    "term_en": "injection (contraceptive)",
+    "policy": "AMHARIC",
+    "am": "መርፌ",
+    "note": "Fully native everyday usage."
+  },
+  {
+    "term_en": "vaccine",
+    "policy": "AMHARIC",
+    "am": "ክትባት",
+    "note": "Fully native everyday usage; disease names it protects against stay Latin."
+  }
+]

@@ -2,8 +2,9 @@
 // (deterministic, runs the whole system with no credentials), OPENAI,
 // ANTHROPIC. Selection: env LCOS_AI_PROVIDER or per-agent override.
 import { trigramContainment } from '../../../../packages/scoring/src/index.mjs';
+import { cred } from '../creds.mjs';
 
-export function getProvider(name = process.env.LCOS_AI_PROVIDER || 'MOCK') {
+export function getProvider(name = cred('LCOS_AI_PROVIDER') || 'MOCK') {
   const n = name.toUpperCase();
   if (n === 'OPENAI') return new OpenAIProvider();
   if (n === 'ANTHROPIC') return new AnthropicProvider();
@@ -248,9 +249,9 @@ export class MockAIProvider extends BaseProvider {
 // ---------- OpenAI ----------
 export class OpenAIProvider extends BaseProvider {
   name = 'OPENAI';
-  model = process.env.OPENAI_MODEL || 'gpt-4o';
+  model = cred('OPENAI_MODEL') || 'gpt-4o';
   async generateStructured({ agent, system, user, schemaName, jsonSchema, temperature = 0.2, maxTokens = 4000 }) {
-    const key = process.env.OPENAI_API_KEY;
+    const key = cred('OPENAI_API_KEY');
     if (!key) throw new Error('OPENAI_API_KEY not set (use LCOS_AI_PROVIDER=MOCK for demo mode)');
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -271,7 +272,7 @@ export class OpenAIProvider extends BaseProvider {
         cost_usd: ((u.prompt_tokens ?? 0) * 2.5 + (u.completion_tokens ?? 0) * 10) / 1e6 } };
   }
   async embed(text) {
-    const key = process.env.OPENAI_API_KEY;
+    const key = cred('OPENAI_API_KEY');
     if (!key) return mockEmbed(text);
     const res = await fetch('https://api.openai.com/v1/embeddings', {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
@@ -285,9 +286,9 @@ export class OpenAIProvider extends BaseProvider {
 // ---------- Anthropic ----------
 export class AnthropicProvider extends BaseProvider {
   name = 'ANTHROPIC';
-  model = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5';
+  model = cred('ANTHROPIC_MODEL') || 'claude-sonnet-4-5';
   async generateStructured({ agent, system, user, maxTokens = 4000, temperature = 0.2 }) {
-    const key = process.env.ANTHROPIC_API_KEY;
+    const key = cred('ANTHROPIC_API_KEY');
     if (!key) throw new Error('ANTHROPIC_API_KEY not set (use LCOS_AI_PROVIDER=MOCK for demo mode)');
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',

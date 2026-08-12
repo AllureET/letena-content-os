@@ -4,6 +4,7 @@
 import { z } from 'zod';
 import { q, one } from '../core.mjs';
 import { getProvider } from './provider.mjs';
+import { cred } from '../creds.mjs';
 import { containsForbidden } from '../../../../packages/deid/src/index.mjs';
 
 // ---------- output schemas (zod, mirrors LCOS_06 JSON Schemas) ----------
@@ -194,6 +195,6 @@ async function record({ agentKey, prompt, provider, objectType, objectId, workfl
 }
 
 export async function embed(text) {
-  return getProvider(process.env.LCOS_EMBED_PROVIDER || process.env.LCOS_AI_PROVIDER || 'MOCK').embed(text);
+  return getProvider(cred('LCOS_EMBED_PROVIDER') || cred('LCOS_AI_PROVIDER') || 'MOCK').embed(text);
 }
 export function toVectorLiteral(arr) { return `[${arr.join(',')}]`; }

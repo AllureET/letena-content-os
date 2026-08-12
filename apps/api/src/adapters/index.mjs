@@ -8,8 +8,9 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import crypto from 'node:crypto';
+import { cred } from '../creds.mjs';
 
-const MOCK = () => (process.env.LCOS_ADAPTER_MODE || 'MOCK').toUpperCase() === 'MOCK';
+const MOCK = () => (cred('LCOS_ADAPTER_MODE') || 'MOCK').toUpperCase() === 'MOCK';
 const STORE = process.env.LCOS_STORAGE_DIR || '/tmp/lcos-storage';
 
 // ---------- storage ----------
@@ -135,7 +136,7 @@ export const azureSpeech = {
 // (LCOS_TTS_PROVIDER overrides); English routes to ElevenLabs when a key
 // exists, else Azure.
 export async function tts({ text, language = 'AM', assetId }) {
-  const pref = (process.env.LCOS_TTS_PROVIDER || (language === 'AM' ? 'AZURE' : 'ELEVENLABS')).toUpperCase();
+  const pref = (cred('LCOS_TTS_PROVIDER') || (language === 'AM' ? 'AZURE' : 'ELEVENLABS')).toUpperCase();
   if (pref === 'AZURE') {
     return azureSpeech.tts({ text, language: language === 'AM' ? 'am-ET' : 'en-US', assetId });
   }
@@ -207,9 +208,9 @@ function mockPublish(platform, jobId) {
 }
 export const publishers = {
   async TELEGRAM({ job, videoUrl }) {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const token = cred('TELEGRAM_BOT_TOKEN');
     if (MOCK() || !token) return mockPublish('TELEGRAM', job.id);
-    const chat = process.env.TELEGRAM_CHANNEL || '@letena_ethiopia';
+    const chat = cred('TELEGRAM_CHANNEL') || '@letena_ethiopia';
     const res = await fetch(`https://api.telegram.org/bot${token}/sendVideo`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chat, video: videoUrl, caption: job.caption ?? '' }),
@@ -220,15 +221,15 @@ export const publishers = {
       platform_url: `https://t.me/${chat.replace('@', '')}/${d.result.message_id}` };
   },
   async INSTAGRAM({ job }) {
-    if (MOCK() || !process.env.META_IG_TOKEN) return mockPublish('INSTAGRAM', job.id);
+    if (MOCK() || !cred('META_IG_TOKEN')) return mockPublish('INSTAGRAM', job.id);
     throw new Error('Meta IG production adapter: media container + media_publish (skeleton)');
   },
   async FACEBOOK({ job }) {
-    if (MOCK() || !process.env.META_PAGE_TOKEN) return mockPublish('FACEBOOK', job.id);
+    if (MOCK() || !cred('META_PAGE_TOKEN')) return mockPublish('FACEBOOK', job.id);
     throw new Error('Meta FB production adapter (skeleton)');
   },
   async YOUTUBE({ job }) {
-    if (MOCK() || !process.env.YOUTUBE_OAUTH) return mockPublish('YOUTUBE', job.id);
+    if (MOCK() || !cred('YOUTUBE_OAUTH')) return mockPublish('YOUTUBE', job.id);
     throw new Error('YouTube resumable upload adapter (skeleton)');
   },
   async TIKTOK({ job }) {
@@ -261,7 +262,7 @@ export const collectors = {
 };
 
 function need(name) {
-  const v = process.env[name];
+  const v = cred(name);
   if (!v) throw new Error(`${name} is required (set LCOS_ADAPTER_MODE=MOCK for demo mode)`);
   return v;
 }

@@ -9,6 +9,19 @@ const app = $('#app');
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const pill = (v) => v ? `<span class="pill p-${esc(v)}"><span class="d"></span>${esc(String(v).replace(/_/g, ' '))}</span>` : '';
 const chan = (v) => v ? `<span class="ch ch-${esc(v)}">${esc(v.replace('_COMMENT',''))}</span>` : '';
+// English-first bilingual text: prefer translation_en, keep the Amharic original
+// one tap away behind a small chip. Never breaks when either field is missing.
+const biText = (original, en) => {
+  const o = String(original ?? '').trim();
+  const e = String(en ?? '').trim();
+  if (!o && !e) return '<span class="muted">No text captured</span>';
+  if (!e || e === o) return esc(o || e);
+  if (!o) return esc(e);
+  return `<span class="bi" data-bi><span class="bi-en">${esc(e)}</span>` +
+    `<span class="bi-am amharic" hidden>${esc(o)}</span>` +
+    `<button type="button" class="amchip" data-amtoggle="1" aria-pressed="false" title="Show the original Amharic">አማ</button></span>`;
+};
+const empty = (cols, msg) => `<tr><td colspan="${cols}" class="empty">${msg}</td></tr>`;
 const dt = (v) => v ? new Date(v).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
 const toast = (msg, err = false) => {
   const t = $('#toast'); t.textContent = msg; t.className = 'show' + (err ? ' err' : '');
@@ -96,35 +109,88 @@ const screens = {
     } catch {}
     return `<h1>Today</h1><div class="sub">Operational picture across the whole pipeline</div>
       <div class="tiles">${tiles.map(([k, l, href, cls]) =>
-        `<div class="tile ${cls ?? ''}" onclick="location.hash='${href.slice(1)}'">
+        `<div class="tile ${cls ?? ''}" role="link" tabindex="0" onclick="location.hash='${href.slice(1)}'">
           <div class="n">${d[k]}</div><div class="l">${l}</div></div>`).join('')}</div>
       ${gapsHtml}`;
   },
 
   async questions() {
     const r = await api('GET', '/questions?limit=50');
-    return `<h1>Questions</h1><div class="sub">De-identified audience questions from every channel</div>
+    return `<h1>Questions</h1><div class="sub">De-identified audience questions from every channel. English shown first; the chip swaps to the original Amharic. Click a row for the full conversation.</div>
       <div class="card"><table>
       <tr><th>Question</th><th>Channel</th><th>Topic</th><th>Matched card</th><th>Status</th><th>Received</th><th></th></tr>
-      ${r.items.map(i => `<tr>
-        <td style="max-width:380px">${esc(i.sanitized_text)}</td>
+      ${(r.items ?? []).map(i => `<tr class="rowlink" data-nav="question/${esc(i.id)}">
+        <td style="max-width:380px">${biText(i.sanitized_text, i.translation_en)}</td>
         <td>${chan(i.channel)}</td>
         <td>${esc(i.topic_code ?? '—')}</td>
         <td class="mono">${esc(i.card_code ?? '—')}${i.match_confidence ? ` <span class="muted">${Math.round(i.match_confidence * 100)}%</span>` : ''}</td>
         <td>${pill(i.status)}</td><td class="muted">${dt(i.captured_at)}</td>
         <td>${can('question.turn_into_content') && i.status !== 'PURGED'
-          ? `<button class="primary" data-tic="${i.id}">Turn into content</button>` : ''}</td>
-      </tr>`).join('')}</table></div>`;
+          ? `<button data-tic="${esc(i.id)}">Turn into content</button>` : ''}</td>
+      </tr>`).join('') || empty(7, 'No questions yet. They will appear here as soon as the channels start talking.')}</table></div>`;
+  },
+
+  async question(id) {
+    let d;
+    try { d = await api('GET', `/questions/${id}`); }
+    catch (ex) {
+      return `<a class="backlink" href="#/questions">&larr; All questions</a>
+        <h1>Question not found</h1>
+        <div class="sub">It may have been purged, or the link is stale.</div>
+        <div class="card empty">Nothing to show here. Head back to the questions list.</div>`;
+    }
+    const q = d?.question ?? {};
+    const cls = d?.classification ?? null;
+    const thread = Array.isArray(q.thread) ? q.thread : [];
+    const hints = Array.isArray(q.category_hints) ? q.category_hints : [];
+    const urgency = cls?.urgency ?? q.urgency_hint;
+    const roleLabel = { patient: 'Patient', doctor: 'Doctor', note: 'Clinical note' };
+    const bubbles = thread.map(m => {
+      const role = ['patient', 'doctor', 'note'].includes(m?.role) ? m.role : 'note';
+      return `<div class="bubble ${role}">
+        <div class="who">${roleLabel[role]}</div>
+        <div>${biText(m?.text, m?.translation_en)}</div></div>`;
+    }).join('');
+    const none = '<span class="muted">none</span>';
+    return `<a class="backlink" href="#/questions">&larr; All questions</a>
+      <div class="eyebrow">Question detail</div>
+      <h1>What they asked</h1>
+      <div class="sub flex">${chan(q.channel)} ${pill(q.status)} ${urgency ? pill(urgency) : ''}
+        ${q.consult_mode ? `<span class="muted">${esc(String(q.consult_mode).replace(/_/g, ' ').toLowerCase())} consult</span>` : ''}
+        ${q.captured_at ? `<span class="muted">${dt(q.captured_at)}</span>` : ''}</div>
+      <div class="card"><div class="eyebrow">Opening question</div>
+        <div style="font-size:14px;line-height:1.7">${biText(q.sanitized_text, q.translation_en)}</div>
+        ${hints.length ? `<div class="flex" style="margin-top:10px">${hints.map(h =>
+          `<span class="pill p-DRAFT"><span class="d"></span>${esc(h)}</span>`).join('')}</div>` : ''}
+        ${q.deid_confidence != null ? `<div class="muted" style="font-size:11.5px;margin-top:8px">De-identification confidence ${Number(q.deid_confidence).toFixed(2)}</div>` : ''}
+      </div>
+      ${thread.length ? `<div class="card"><div class="eyebrow">Conversation</div>
+        <div class="thread">${bubbles}</div></div>` : ''}
+      ${q.answer_text ? `<div class="card answer"><div class="eyebrow">Doctor's final answer</div>
+        <div style="line-height:1.7">${biText(q.answer_text, q.answer_translation_en)}</div></div>` : ''}
+      <div class="card"><div class="eyebrow">Classification</div>
+        ${cls ? `<div class="kv">
+          <b>Topic</b> ${esc(cls.topic_code ?? '') || none}<br>
+          <b>Intent</b> ${esc(String(cls.intent ?? '').replace(/_/g, ' ').toLowerCase()) || none}<br>
+          <b>Urgency</b> ${cls.urgency ? pill(cls.urgency) : none}<br>
+          <b>Matched card</b> <span class="mono">${esc(cls.knowledge_card_code ?? '') || none}</span>
+          ${cls.match_confidence != null ? `<span class="muted">${Math.round(Number(cls.match_confidence) * 100)}% match</span>` : ''}
+        </div>` : '<div class="muted">Not classified yet. Classification runs shortly after intake.</div>'}
+      </div>
+      ${can('question.turn_into_content') && q.id && q.status !== 'PURGED'
+        ? `<div class="flex"><button class="primary" data-tic="${esc(q.id)}">Turn into content</button></div>` : ''}`;
   },
 
   async quarantine() {
     const r = await api('GET', '/questions/quarantine');
     return `<h1>Quarantine</h1><div class="sub">De-identification was not confident. Redact what remains, then release. Reject purges the text.</div>
-      ${r.items.length === 0 ? '<div class="card muted">Quarantine is empty. That is the expected state.</div>' : ''}
+      ${r.items.length === 0 ? '<div class="card empty">Quarantine is empty. That is the expected state.</div>' : ''}
       ${r.items.map(i => `<div class="card">
         <div class="flex"><span class="muted mono">${dt(i.captured_at)}</span>${chan(i.channel)}
           <span class="muted">confidence ${Number(i.deid_confidence).toFixed(2)}</span></div>
-        <label>Edit to remove anything identifying</label>
+        ${i.translation_en ? `<div class="kv" style="margin-top:8px"><b>English translation</b>
+          <div style="line-height:1.65">${esc(i.translation_en)}</div></div>` : ''}
+        <label>Edit the original to remove anything identifying</label>
         <textarea id="rq-${i.id}">${esc(i.sanitized_text)}</textarea>
         <div class="flex" style="margin-top:8px">
           <button class="approve" data-redact="${i.id}">Release</button>
@@ -157,7 +223,7 @@ const screens = {
         <td style="max-width:300px">${esc(g.canonical_question_en ?? '—')}</td>
         <td>${g.question_count_30d ?? 0}</td><td>${g.content_count_90d ?? 0}</td>
         <td>${pill(g.coverage_state)}</td><td><b>${Number(g.priority_score).toFixed(0)}</b></td></tr>`).join('')
-      || '<tr><td colspan=7 class="muted">No gap rows yet. Ingest questions and recompute.</td></tr>'}
+      || '<tr><td colspan=7 class="empty">No gap rows yet. Ingest questions and recompute.</td></tr>'}
       </table></div>`;
   },
 
@@ -198,7 +264,8 @@ const screens = {
       </div>`;
     }).join('');
     const v = c.version;
-    return `<div class="eyebrow">Knowledge card</div>
+    return `<a class="backlink" href="#/cards">&larr; Knowledge library</a>
+      <div class="eyebrow">Knowledge card</div>
       <h1>${esc(c.code)} · ${esc(c.canonical_question_en)}</h1>
       <div class="sub flex">${pill(c.status)} ${pill(c.risk_tier)}
         <span class="muted">Topic ${esc(c.topic_code)} · review due ${c.review_due_at ? esc(String(c.review_due_at).slice(0, 10)) : '—'}</span></div>
@@ -250,7 +317,7 @@ const screens = {
       ${r.items.map(i => `<tr><td class="mono">${esc(i.code)}</td><td class="mono">${esc(i.card_code)}</td>
         <td style="max-width:420px" class="mono">${esc(JSON.stringify(i.needs_knowledge_note)?.slice(0, 220) ?? '')}</td>
         <td class="muted">${dt(i.created_at)}</td></tr>`).join('')
-      || '<tr><td colspan=4 class="muted">No open knowledge gaps.</td></tr>'}</table></div>`;
+      || '<tr><td colspan=4 class="empty">No open knowledge gaps.</td></tr>'}</table></div>`;
   },
 
   async families() {
@@ -273,7 +340,7 @@ const screens = {
         <div style="margin:6px 0"><b>Hook:</b> ${esc(c.hook_line)}</div>
         <div class="muted">${esc(c.premise)}</div>
         <div class="muted" style="font-size:12px;margin-top:6px">Why it works: ${esc(c.why_this_works ?? '')}</div>
-      </div>`).join('') || '<div class="card muted">No concepts yet. Use Turn Into Content from Questions.</div>'}`;
+      </div>`).join('') || '<div class="card empty">No concepts yet. Use Turn into content from the Questions screen to start one.</div>'}`;
   },
 
   async scripts() {
@@ -292,7 +359,8 @@ const screens = {
   async script(id) {
     const s = await api('GET', `/content/scripts/${id}`);
     const v = s.version;
-    return `<div class="eyebrow">Script review</div>
+    return `<a class="backlink" href="#/scripts">&larr; All scripts</a>
+      <div class="eyebrow">Script review</div>
       <h1 class="mono">${esc(s.code)}</h1>
       <div class="sub flex">${pill(s.status)} ${pill(s.risk_tier)}
         ${pill(s.validation_result === 'PASS' ? 'PASS' : s.validation_result === 'FAIL' ? 'FAIL' : null)}
@@ -307,7 +375,7 @@ const screens = {
             <div class="muted">${esc(s.translation.back_translation)}</div>`
           : '<span class="muted">No Amharic version yet.</span>'}</div>
       </div>
-      <div class="card"><div class="eyebrow">Claim map — every medical statement and its authority</div>
+      <div class="card"><div class="eyebrow">Claim map: every medical statement and its authority</div>
         ${s.claim_map.map(m => `<div class="claimrow ${['UNSUPPORTED','CONTRADICTED','AMBIGUOUS'].includes(m.verdict) ? 'bad' : ''}">
           <div>${esc(m.statement)}</div>
           <div class="flex" style="margin-top:4px"><span class="mono muted">${esc(m.claim_code)}</span>
@@ -347,7 +415,7 @@ const screens = {
       ${A.map(s => `<tr class="rowlink" data-nav="script/${s.id}">
         <td class="mono">${esc(s.code)}</td><td>${esc(s.language)}</td><td>${pill(s.risk_tier)}</td>
         <td class="muted" style="max-width:340px">${esc(s.hook ?? '')}</td><td>${pill(s.status)}</td></tr>`).join('')
-      || '<tr><td colspan=5 class="muted">Nothing waiting. Generate content from the Questions or Demand screens.</td></tr>'}</table></div>
+      || '<tr><td colspan=5 class="empty">Nothing waiting. Generate content from the Questions or Demand screens.</td></tr>'}</table></div>
 
       <div class="card"><div class="flex"><div class="eyebrow" style="margin:0">2 · Approved, ready to produce (${P.length})</div>
         <div class="spacer"></div>
@@ -356,7 +424,7 @@ const screens = {
       ${P.map(s => `<tr><td class="mono">${esc(s.code)}</td><td>${esc(s.language)}</td>
         <td>${pill(s.risk_tier)}</td><td class="mono muted">${esc(s.family_code)}</td>
         <td>${can('production.request') ? `<button data-produce="${s.id}">Produce</button>` : ''}</td></tr>`).join('')
-      || '<tr><td colspan=5 class="muted">Nothing to produce.</td></tr>'}</table></div>
+      || '<tr><td colspan=5 class="empty">Nothing to produce. Approved scripts queue up here.</td></tr>'}</table></div>
 
       <div class="card"><div class="eyebrow">3 · Ready to publish (${R.length})</div>
       <table><tr><th>Script</th><th>Caption</th><th>Video</th><th>Publish</th></tr>
@@ -373,14 +441,14 @@ const screens = {
               <option value="YOUTUBE">YouTube</option></select>
             <button class="primary" data-pubnow="${esc(r.render_id)}" ${r.final_approved ? '' : 'disabled title="Approve the batch first"'}>Publish</button>
           </div>` : ''}</td></tr>`; }).join('')
-      || '<tr><td colspan=4 class="muted">Nothing rendered yet.</td></tr>'}</table></div>
+      || '<tr><td colspan=4 class="empty">Nothing rendered yet. Produced videos arrive here ready to publish.</td></tr>'}</table></div>
 
       <div class="card"><div class="eyebrow">Recently published</div>
       <table>${qd.recent.map(p => `<tr><td class="mono">${esc(p.family_code)}</td>
         <td><span class="ch ch-${esc(p.platform)}">${esc(p.platform)}</span></td>
         <td class="muted">${dt(p.published_at)}</td>
         <td>${p.permalink ? `<a href="${esc(p.permalink)}" target="_blank">open ↗</a>` : ''}</td></tr>`).join('')
-      || '<tr><td class="muted">Nothing published yet.</td></tr>'}</table></div>`;
+      || '<tr><td class="empty">Nothing published yet.</td></tr>'}</table></div>`;
   },
 
   async production() {
@@ -391,7 +459,7 @@ const screens = {
         <td>${esc(j.engine)}</td><td class="mono muted">${esc(j.template_code ?? '—')}</td>
         <td class="muted">${esc(j.voice_source)}</td><td>${pill(j.status)}</td>
         <td>${j.status === 'QUEUED' && can('production.request') ? `<button class="primary" data-run="${j.id}">Run</button>` : ''}</td>
-      </tr>`).join('') || '<tr><td colspan=7 class="muted">Nothing in production.</td></tr>'}</table></div>`;
+      </tr>`).join('') || '<tr><td colspan=7 class="empty">Nothing in production. Send an approved script here with Produce.</td></tr>'}</table></div>`;
   },
 
   async assets() {
@@ -413,7 +481,7 @@ const screens = {
         <td class="muted">${esc(a.kind)}</td><td class="muted">${esc(a.origin)}</td>
         <td>${a.is_ai_generated ? pill('IN_REVIEW') : ''}</td>
         <td>${a.clinically_approved ? pill('APPROVED') : ''}</td></tr>`).join('')
-      || '<tr><td colspan=6 class="muted">Library is empty. Shoot the first B-roll batch.</td></tr>'}</table></div>`;
+      || '<tr><td colspan=6 class="empty">Library is empty. Shoot the first B-roll batch.</td></tr>'}</table></div>`;
   },
 
   async published() {
@@ -425,7 +493,7 @@ const screens = {
         <td class="muted" style="font-size:11px">${esc(p.video_family)}</td>
         <td class="muted">${dt(p.published_at)}</td>
         <td><a href="${esc(p.platform_url)}" target="_blank">open</a></td></tr>`).join('')
-      || '<tr><td colspan=7 class="muted">Nothing published yet.</td></tr>'}</table></div>`;
+      || '<tr><td colspan=7 class="empty">Nothing published yet.</td></tr>'}</table></div>`;
   },
 
   async analytics() {
@@ -439,7 +507,7 @@ const screens = {
         <td>${a.shares ?? '<span class="muted">n/a</span>'}</td>
         <td>${a.reach_score ?? '—'}</td><td>${a.education_score ?? '—'}</td>
         <td>${a.service_score ?? '—'}</td><td><b>${a.composite_score ?? '—'}</b></td></tr>`).join('')
-      || '<tr><td colspan=9 class="muted">No published content with metrics yet.</td></tr>'}</table></div>`;
+      || '<tr><td colspan=9 class="empty">No published content with metrics yet.</td></tr>'}</table></div>`;
   },
 
   async terminology() {
@@ -461,7 +529,7 @@ const screens = {
         <td class="muted">${esc(t.register)}</td><td>${pill(t.status)}</td>
         <td>${t.status !== 'APPROVED' && can('terminology.approve')
           ? `<button class="approve" data-termapprove="${t.id}">Approve</button>` : ''}</td></tr>`).join('')
-      || '<tr><td colspan=6 class="muted">No terms yet. Seed from the last year of scripts.</td></tr>'}
+      || '<tr><td colspan=6 class="empty">No terms yet. Seed from the last year of scripts.</td></tr>'}
       </table></div>`;
   },
 
@@ -473,13 +541,13 @@ const screens = {
       ${r.scheduled.map(j => `<tr><td>${dt(j.scheduled_for)}</td><td>${chan(j.platform)}</td>
         <td class="mono">${esc(j.family_code)}</td><td class="mono">${esc(j.card_code)}</td>
         <td>${esc(j.language)}</td><td>${pill(j.risk_tier)}</td><td>${pill(j.status)}</td></tr>`).join('')
-      || '<tr><td colspan=7 class="muted">Nothing scheduled.</td></tr>'}</table></div>
+      || '<tr><td colspan=7 class="empty">Nothing scheduled yet. Approved and rendered content lands here.</td></tr>'}</table></div>
       <div class="card"><div class="eyebrow">Recently published</div><table>
       <tr><th>When</th><th>Platform</th><th>Family</th><th>Card</th><th>Link</th></tr>
       ${r.published.map(p => `<tr><td>${dt(p.published_at)}</td><td>${chan(p.platform)}</td>
         <td class="mono">${esc(p.family_code)}</td><td class="mono">${esc(p.card_code)}</td>
         <td><a href="${esc(p.platform_url)}" target="_blank">open</a></td></tr>`).join('')
-      || '<tr><td colspan=5 class="muted">Nothing yet.</td></tr>'}</table></div>`;
+      || '<tr><td colspan=5 class="empty">Nothing published in the last seven days.</td></tr>'}</table></div>`;
   },
 
   async experiments() {
@@ -501,7 +569,7 @@ const screens = {
       ${r.items.map(e => `<tr><td class="mono">${esc(e.code)}</td><td>${esc(e.title)}</td>
         <td class="muted">${esc(e.variable_tested)}</td><td class="muted">${esc(e.primary_metric)}</td>
         <td>${e.variant_count}</td><td>${pill(e.status === 'RUNNING' ? 'IN_REVIEW' : e.status === 'CONCLUDED' ? 'APPROVED' : 'DRAFT')}</td></tr>`).join('')
-      || '<tr><td colspan=6 class="muted">No experiments yet. The pilot plan names four.</td></tr>'}
+      || '<tr><td colspan=6 class="empty">No experiments yet. The pilot plan names four.</td></tr>'}
       </table></div>`;
   },
 
@@ -530,7 +598,7 @@ const screens = {
         ${r.per_piece.map(p => `<tr><td class="mono">${esc(p.family_code)}</td><td class="mono">${esc(p.card_code)}</td>
           <td>${p.published_pieces}</td><td>$${p.ai_cost_usd}</td><td>$${p.render_cost_usd}</td>
           <td>${p.total_views}</td></tr>`).join('')
-        || '<tr><td colspan=6 class="muted">Nothing published yet.</td></tr>'}</table></div>`;
+        || '<tr><td colspan=6 class="empty">Nothing published yet.</td></tr>'}</table></div>`;
   },
 
   async users() {
@@ -620,8 +688,15 @@ document.addEventListener('click', (e) => {
     document.body.classList.remove('nav-open');
   }
 });
+// Keyboard: dashboard tiles act as links; Escape closes the mobile drawer.
+document.addEventListener('keydown', (e) => {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.classList?.contains('tile')) {
+    e.preventDefault(); e.target.click();
+  }
+  if (e.key === 'Escape') document.body.classList.remove('nav-open');
+});
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall]');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall]');
   if (!b) {
     const row = e.target.closest('tr[data-nav]');
     if (row) location.hash = '#/' + row.dataset.nav;
@@ -629,6 +704,19 @@ document.addEventListener('click', async (e) => {
   }
   e.preventDefault();
   try {
+    if (b.dataset.amtoggle) {
+      // Swap between the English translation and the original Amharic in place.
+      const wrap = b.closest('[data-bi]');
+      const en = wrap?.querySelector('.bi-en'), am = wrap?.querySelector('.bi-am');
+      if (en && am) {
+        const showAm = am.hidden;
+        am.hidden = !showAm; en.hidden = showAm;
+        b.setAttribute('aria-pressed', String(showAm));
+        b.textContent = showAm ? 'EN' : 'አማ';
+        b.title = showAm ? 'Show the English translation' : 'Show the original Amharic';
+      }
+      return;
+    }
     if (b.id === 'logout') return logout();
     if (b.dataset.credsave) {
       const input = document.getElementById('cred-' + b.dataset.credsave);
@@ -698,7 +786,7 @@ document.addEventListener('click', async (e) => {
     if (b.dataset.tic) {
       b.disabled = true; b.textContent = 'Working…';
       const r = await api('POST', '/content/turn-into-content', { question_id: b.dataset.tic });
-      if (r.knowledge_gap) toast('No approved knowledge yet — the clinical team has been asked.', true);
+      if (r.knowledge_gap) toast('No approved knowledge yet. The clinical team has been asked.', true);
       else toast(`Created ${r.concepts.length} concepts, ${r.scripts.length} scripts (${r.risk_tier}). Now in review.`);
       location.hash = '#/scripts'; return;
     }
@@ -830,4 +918,21 @@ async function render() {
   }
 }
 window.addEventListener('hashchange', render);
-render();
+
+// SSO landing: the EMR hands over a session as #sso=<token>. Store it exactly
+// the way login() does, swap the hash for the dashboard, load /auth/me, render.
+async function boot() {
+  if (location.hash.startsWith('#sso=')) {
+    const value = location.hash.slice('#sso='.length);
+    sessionStorage.setItem('lcos_token', value);
+    TOKEN = value;
+    location.hash = '#/dashboard';
+    try {
+      const r = await api('GET', '/auth/me');
+      ME = r.user ?? r;
+      sessionStorage.setItem('lcos_me', JSON.stringify(ME));
+    } catch { /* bad token: the next API call routes back to sign-in */ }
+  }
+  render();
+}
+boot();

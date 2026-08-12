@@ -188,6 +188,47 @@ export default async function routes(app) {
     return { items: r.rows.map(({ embedding, ...rest }) => rest) };
   });
 
+  // Question detail: the web app codes against this exact shape.
+  app.get('/questions/:id', { preHandler: requirePerm('question.read') }, async (req, reply) => {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) {
+      return reply.code(404).send(err(404, 'NOT_FOUND', 'question'));
+    }
+    const row = await one(
+      `SELECT aq.id, aq.sanitized_text, aq.translation_en, aq.channel, aq.status, aq.captured_at,
+              aq.consult_mode, aq.answer_text, aq.answer_translation_en, aq.thread,
+              aq.category_hints, aq.urgency_hint, aq.deid_confidence,
+              (qc.id IS NOT NULL) AS has_classification,
+              t.code AS topic_code, qc.intent, qc.urgency,
+              kc.code AS knowledge_card_code, qc.match_confidence
+       FROM lcos.audience_questions aq
+       LEFT JOIN lcos.question_classifications qc ON qc.question_id = aq.id
+       LEFT JOIN lcos.topics t ON t.id = qc.topic_id
+       LEFT JOIN lcos.knowledge_cards kc ON kc.id = qc.knowledge_card_id
+       WHERE aq.id=$1`, [req.params.id]);
+    if (!row) return reply.code(404).send(err(404, 'NOT_FOUND', 'question'));
+    const { has_classification, topic_code, intent, urgency,
+      knowledge_card_code, match_confidence, ...question } = row;
+    return { question,
+      classification: has_classification
+        ? { topic_code, intent, urgency, knowledge_card_code, match_confidence } : null };
+  });
+
+  // Backfill: translate stored (already de-identified) Ethiopic-containing
+  // questions that classification has not translated yet.
+  app.post('/questions/translate-missing', { preHandler: requirePerm('settings.manage') }, async (req) => {
+    const rows = (await q(
+      `SELECT id FROM lcos.audience_questions
+       WHERE status IN ('DEIDENTIFIED','CLASSIFIED','CLUSTERED')
+         AND translation_en IS NULL AND sanitized_text ~ '[ሀ-፿]'
+       ORDER BY captured_at DESC LIMIT LEAST(COALESCE($1::int, 50), 200)`,
+      [req.body?.limit ?? null])).rows;
+    let translated = 0;
+    for (const r of rows) {
+      if (await translateQuestion(r.id).catch(() => null)) translated++;
+    }
+    return { translated };
+  });
+
   app.get('/questions/quarantine', { preHandler: requirePerm('question.redact') }, async () => {
     const r = await q(`SELECT id, sanitized_text, deid_confidence, quarantine_reason, channel, captured_at
                        FROM lcos.audience_questions WHERE status='QUARANTINED' ORDER BY captured_at LIMIT 100`);
@@ -317,8 +358,48 @@ export async function classifyQuestion(questionId) {
              language=COALESCE(language, $3::lcos.content_language)
            WHERE id=$1`, [questionId, vec, out.language]);
   await assignCluster(questionId, topic?.id ?? null, card?.id ?? null, question.sanitized_text, vec);
+
+  // English translation for the clinical/editorial view. Runs strictly AFTER
+  // classification succeeds and only over STORED fields, which are already
+  // de-identified; nothing ever reaches translation before de-identification.
+  // A translation failure never undoes a good classification; the
+  // translate-missing backfill picks the row up later.
+  if (out.language !== 'EN' || ETHIOPIC_RE.test(question.sanitized_text)) {
+    await translateQuestion(questionId).catch(() => null);
+  }
   return { question_id: questionId, ...out, match_confidence: conf,
     resolved: { topic: !!topic, card: card?.id ?? null } };
+}
+
+const ETHIOPIC_RE = /[ሀ-፿]/;
+
+// Translate a stored (de-identified) question into English: sanitized_text ->
+// translation_en, answer_text -> answer_translation_en, and each thread
+// segment's text -> segment.translation_en, written back in one UPDATE.
+export async function translateQuestion(questionId) {
+  const question = await one(
+    `SELECT id, sanitized_text, answer_text, thread FROM lcos.audience_questions WHERE id=$1`,
+    [questionId]);
+  if (!question) return null;
+  const meta = { objectType: 'QUESTION', objectId: questionId, workflowCode: 'WF03' };
+  const translate = async (text) =>
+    (await invokeAgent('question_translator', { text }, meta)).translation_en;
+
+  const translationEn = await translate(question.sanitized_text);
+  const answerTranslationEn = question.answer_text ? await translate(question.answer_text) : null;
+  const thread = [];
+  for (const seg of Array.isArray(question.thread) ? question.thread : []) {
+    thread.push(seg?.text
+      ? { ...seg, translation_en: await translate(seg.text) }
+      : { ...seg });
+  }
+  await q(
+    `UPDATE lcos.audience_questions
+     SET translation_en=$2, answer_translation_en=$3, thread=$4::jsonb, updated_at=now()
+     WHERE id=$1`,
+    [questionId, translationEn, answerTranslationEn, JSON.stringify(thread)]);
+  return { question_id: questionId, translation_en: translationEn,
+    answer_translation_en: answerTranslationEn, segments_translated: thread.filter(s => s.translation_en).length };
 }
 
 async function assignCluster(questionId, topicId, cardId, text, vecLiteral) {

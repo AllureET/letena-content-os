@@ -98,6 +98,50 @@ export default async function routes(app) {
     return { attempted: due.length, results };
   });
 
+  // The whole draft-to-published picture in one call, for the Queue screen:
+  // what awaits the batch click, what needs producing, what is ready to
+  // publish (with caption + downloadable asset so any channel without an API
+  // key can be posted by copy/paste), and what just went out.
+  app.get('/distribution/queue', { preHandler: requirePerm('publish.read') }, async () => {
+    const awaiting = (await q(
+      `SELECT s.id, s.code, s.language, s.status, s.risk_tier, s.validation_result, s.created_at,
+              cf.code AS family_code, kc.code AS card_code,
+              sv.hook, sv.caption
+       FROM lcos.scripts s
+       JOIN lcos.content_families cf ON cf.id=s.family_id
+       JOIN lcos.knowledge_cards kc ON kc.id=cf.knowledge_card_id
+       LEFT JOIN lcos.script_versions sv ON sv.script_id=s.id AND sv.version=s.current_version
+       WHERE s.status IN ('VALIDATED','LANGUAGE_REVIEW','CLINICAL_REVIEW') AND s.validation_result='PASS'
+       ORDER BY s.created_at DESC LIMIT 100`)).rows;
+    const toProduce = (await q(
+      `SELECT s.id, s.code, s.language, s.risk_tier, s.created_at, cf.code AS family_code
+       FROM lcos.scripts s JOIN lcos.content_families cf ON cf.id=s.family_id
+       WHERE s.status='APPROVED' AND NOT EXISTS (
+         SELECT 1 FROM lcos.production_jobs pj WHERE pj.script_id=s.id
+           AND pj.status NOT IN ('FAILED','CANCELLED'))
+       ORDER BY s.created_at DESC LIMIT 100`)).rows;
+    const toPublish = (await q(
+      `SELECT r.id AS render_id, r.script_id, r.storage_key, r.duration_s, r.created_at,
+              s.code AS script_code, s.language, s.risk_tier, cf.code AS family_code,
+              sv.caption, sv.hashtags, sv.platform_variants,
+              EXISTS (SELECT 1 FROM lcos.clinical_reviews cr WHERE cr.render_id=r.id
+                        AND cr.decision IN ('APPROVED','APPROVED_WITH_EDITS')) AS final_approved
+       FROM lcos.renders r
+       JOIN lcos.scripts s ON s.id=r.script_id
+       JOIN lcos.content_families cf ON cf.id=s.family_id
+       LEFT JOIN lcos.script_versions sv ON sv.script_id=s.id
+         AND sv.version=COALESCE(s.approved_version, s.current_version)
+       WHERE r.status='SUCCEEDED' AND NOT EXISTS (
+         SELECT 1 FROM lcos.publishing_jobs pj WHERE pj.render_id=r.id AND pj.status <> 'FAILED')
+       ORDER BY r.created_at DESC LIMIT 100`)).rows
+      .map(r => ({ ...r, download_url: r.storage_key ? storage.url(r.storage_key) : null }));
+    const recent = (await q(
+      `SELECT pc.id, pc.platform, pc.published_at, pc.permalink, cf.code AS family_code
+       FROM lcos.published_content pc JOIN lcos.content_families cf ON cf.id=pc.family_id
+       ORDER BY pc.published_at DESC LIMIT 20`)).rows;
+    return { awaiting_approval: awaiting, to_produce: toProduce, to_publish: toPublish, recent };
+  });
+
   app.get('/distribution/published', { preHandler: requirePerm('publish.read') }, async () => {
     const r = await q(
       `SELECT pc.*, cf.code AS family_code, kc.code AS card_code FROM lcos.published_content pc

@@ -196,11 +196,19 @@ export async function runProductionJob(jobId, actor) {
         modifications, renderId: render.id });
     }
     const done = result.status === 'SUCCEEDED';
+    // Test-mode renders (script.is_test_content, per the admin approval-override
+    // path) get a "_test" suffix on the final filename itself rather than a UI
+    // badge, so the file is unmistakably marked wherever it's downloaded or
+    // shared, per owner direction 2026-08-12 ("just adding _test in the final
+    // filename is enough"). Insert before the extension: output.mp4 -> output_test.mp4.
+    const finalStorageKey = (script.is_test_content && result.storage_key)
+      ? result.storage_key.replace(/(\.[a-zA-Z0-9]+)$/, '_test$1')
+      : result.storage_key ?? null;
     await q(`UPDATE lcos.renders SET status=$2::lcos.render_status, external_render_id=$3,
                storage_key=$4, duration_s=$5, cost_usd=$6, submitted_at=now(),
                completed_at=CASE WHEN $2='SUCCEEDED' THEN now() END
              WHERE id=$1`,
-      [render.id, result.status, result.external_render_id, result.storage_key ?? null,
+      [render.id, result.status, result.external_render_id, finalStorageKey,
        result.duration_s ?? null, result.cost_usd ?? null]);
     await q(`UPDATE lcos.production_jobs SET status=$2::lcos.production_status,
                actual_cost_usd=$3, completed_at=CASE WHEN $2='RENDERED' THEN now() END WHERE id=$1`,

@@ -44,12 +44,6 @@ async function api(method, path, body) {
 const can = (p) => ME?.permissions?.includes(p);
 const isAdmin = () => !!ME?.roles?.includes('admin');
 function logout() { sessionStorage.clear(); TOKEN = null; ME = null; render(); }
-// Test-content badge (admin override / flexible generation, Aug 2026): every
-// family, concept and script produced from an unapproved card via
-// approval.override=ADMIN_TEST_MODE carries is_test_content=true. Flag it
-// everywhere it can appear so nobody mistakes it for real, publishable work.
-const testBadge = (isTest) => isTest
-  ? '<span class="pill" style="color:#fff;background:var(--risk-high)"><span class="d"></span>TEST CONTENT</span>' : '';
 // Style-lint findings on a script version (apps/api/src/ai/style_lint.mjs):
 // mechanical house-style flags (em dash, hedge phrases, AI sign-offs). Never
 // blocks; a reviewer just gets to see them before approving.
@@ -384,7 +378,7 @@ const screens = {
         <td class="mono">${esc(f.code)}</td><td style="max-width:280px">${esc(f.title)}</td>
         <td class="mono">${esc(f.card_code)}</td><td class="muted">${esc(f.segment_slug)}</td>
         <td>${pill(f.risk_tier)}</td><td class="muted">${esc(f.origin)}</td><td class="muted">${dt(f.created_at)}</td>
-        <td>${testBadge(f.is_test_content)}</td></tr>`).join('')
+        <td></td></tr>`).join('')
       || '<tr><td colspan=8 class="empty">No content families yet.</td></tr>'}</table></div>`;
   },
 
@@ -416,7 +410,7 @@ const screens = {
         <td class="mono">${esc(s.code)}</td><td class="mono muted">${esc(s.family_code)}</td>
         <td class="mono">${esc(s.card_code)}</td><td>${esc(s.language)}</td>
         <td>${pill(s.risk_tier)}</td><td>${pill(s.validation_result === 'PASS' ? 'PASS' : s.validation_result === 'FAIL' ? 'FAIL' : null) || '<span class="muted">—</span>'}</td>
-        <td>${pill(s.status)}</td><td>${testBadge(s.is_test_content)}</td>
+        <td>${pill(s.status)}</td><td></td>
         <td>${s.status === 'APPROVED' && can('production.request') ? `<button data-produce="${s.id}">Produce</button>` : ''}</td>
       </tr>`).join('')}</table></div>`;
   },
@@ -429,7 +423,6 @@ const screens = {
       <h1 class="mono">${esc(s.code)}</h1>
       <div class="sub flex">${pill(s.status)} ${pill(s.risk_tier)}
         ${pill(s.validation_result === 'PASS' ? 'PASS' : s.validation_result === 'FAIL' ? 'FAIL' : null)}
-        ${testBadge(s.is_test_content)}
         <span class="muted">${esc(s.language)} · v${s.current_version}</span></div>
       ${styleWarnHtml(v?.style_warnings)}
       <div class="grid2">
@@ -971,7 +964,7 @@ document.addEventListener('click', async (e) => {
       b.disabled = true; b.textContent = 'Generating…';
       const r = await api('POST', '/content/generate', { card_id: b.dataset.cardgenerate, output_types: outputTypes });
       toast(`Created ${r.concepts.length} concept${r.concepts.length === 1 ? '' : 's'}, ${r.scripts.length} script${r.scripts.length === 1 ? '' : 's'} (${r.risk_tier})`
-        + (r.is_test_content ? ' — TEST CONTENT, will never publish while this card is unapproved' : ''),
+        + (r.is_test_content ? '. Test content, will not publish while this card is unapproved.' : ''),
         r.is_test_content ? 'warn' : false);
       location.hash = '#/scripts'; return;
     }

@@ -154,6 +154,41 @@ export default async function routes(app) {
     return doTransition('knowledge_card', req, reply);
   });
 
+  // One-click clinical approval of a card AND its pending facts (owner
+  // decision, Aug 2026: doctors approve facts once; this is that click).
+  // Approves every attached IN_REVIEW claim the doctor did not author, then
+  // runs the card through the normal state machine so all its guards
+  // (reviewer-not-author, all-claims-approved, has-version) still hold.
+  app.post('/knowledge/cards/:id/approve-with-claims',
+    { preHandler: requirePerm('knowledge.approve') }, async (req, reply) => {
+    const claims = (await q(
+      `SELECT mc.id, mc.code FROM lcos.knowledge_card_claims kcc
+       JOIN lcos.medical_claims mc ON mc.id=kcc.claim_id
+       WHERE kcc.card_id=$1 AND mc.status IN ('DRAFT','IN_REVIEW') AND mc.created_by <> $2`,
+      [req.params.id, req.actor.id])).rows;
+    for (const cl of claims) {
+      await q(`UPDATE lcos.medical_claims SET status='APPROVED', reviewed_by=$2,
+                 reviewed_at=now(), review_due_at=CURRENT_DATE + interval '12 months',
+                 updated_at=now() WHERE id=$1`, [cl.id, req.actor.id]);
+      await audit(null, { actor: req.actor, action: 'claim.approved', objectType: 'MEDICAL_CLAIM',
+        objectId: cl.id, objectCode: cl.code });
+    }
+    const card = await one(`SELECT status FROM lcos.knowledge_cards WHERE id=$1`, [req.params.id]);
+    if (!card) return reply.code(404).send(err(404, 'NOT_FOUND', 'card'));
+    if (card.status === 'APPROVED') return { ok: true, claims_approved: claims.length, card: 'already approved' };
+    try {
+      await transition('knowledge_card', req.params.id, 'APPROVED', {
+        actor: req.actor, review_due_months: req.body?.review_due_months ?? 6,
+        reason: 'Clinical approval of facts and card (one click)',
+      });
+    } catch (e) {
+      const status = e.status ?? 500;
+      return reply.code(status).send(err(status, e.code ?? 'INTERNAL',
+        `claims approved (${claims.length}) but card blocked: ${e.message}`, { guard: e.guard }));
+    }
+    return { ok: true, claims_approved: claims.length, card: 'APPROVED' };
+  });
+
   // Expiry sweep (WF19): overdue APPROVED cards and claims -> NEEDS_UPDATE
   // (the DB trigger cancels their scheduled publishes); cards inside the
   // 30-day window get a clinical review task if none is open.

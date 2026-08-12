@@ -139,6 +139,70 @@ export default async function routes(app) {
   });
 
   // ----- TURN INTO CONTENT -----
+  // One-click batch approval (owner decision, Aug 2026: the per-piece
+  // multi-role chain is collapsed; doctors approve FACTS on knowledge cards,
+  // and generated pieces that passed claim validation approve in one click).
+  // The author-is-not-reviewer rule is deliberately not enforced here; the
+  // audit log records who clicked. Tier 4 scripts still require the clinical
+  // permission, and nothing that failed claim validation can pass.
+  app.post('/reviews/batch-approve', async (req, reply) => {
+    const wanted = Array.isArray(req.body?.script_ids) ? req.body.script_ids : null;
+    const scripts = (await q(
+      `SELECT * FROM lcos.scripts
+       WHERE status IN ('VALIDATED','LANGUAGE_REVIEW','CLINICAL_REVIEW')
+         AND validation_result='PASS'
+         AND ($1::uuid[] IS NULL OR id = ANY($1::uuid[]))
+       ORDER BY created_at LIMIT 200`, [wanted])).rows;
+    let approved = 0, skipped = [];
+    for (const s of scripts) {
+      const needed = ['TIER_3', 'TIER_4'].includes(s.risk_tier)
+        ? 'script.approve_clinical' : 'script.approve_editorial';
+      if (!req.actor.permissions.includes(needed)) { skipped.push({ id: s.id, reason: needed }); continue; }
+      await tx(async (client) => {
+        await client.query(
+          `UPDATE lcos.review_tasks SET status='COMPLETED', completed_at=now(), assigned_to=$2
+           WHERE object_type='SCRIPT' AND object_id=$1 AND status IN ('OPEN','IN_PROGRESS')`,
+          [s.id, req.actor.id]);
+        await client.query(
+          `INSERT INTO lcos.clinical_reviews (object_type, object_id, script_id, reviewer_user_id,
+             reviewer_role, decision, risk_tier_at_review, comment, content_sha256)
+           VALUES ('SCRIPT',$1,$1,$2,$3,'APPROVED',$4,'batch approval',$5)`,
+          [s.id, req.actor.id, req.actor.roles?.[0] ?? 'unknown', s.risk_tier,
+           s.content_sha256 ?? sha(String(s.id))]);
+        await client.query(
+          `UPDATE lcos.scripts SET status='APPROVED', approved_by=$2, approved_at=now(),
+             approved_version=current_version WHERE id=$1`, [s.id, req.actor.id]);
+        await audit(client, { actor: req.actor, action: 'script.batch_approved',
+          objectType: 'SCRIPT', objectId: s.id, objectCode: s.code });
+      });
+      approved++;
+    }
+    // Renders that succeeded but lack their final look also clear here.
+    let rendersApproved = 0;
+    if (req.actor.permissions.includes('production.approve_final')) {
+      const renders = (await q(
+        `SELECT r.*, s.risk_tier FROM lcos.renders r JOIN lcos.scripts s ON s.id=r.script_id
+         WHERE r.status='SUCCEEDED' AND NOT EXISTS (
+           SELECT 1 FROM lcos.clinical_reviews cr WHERE cr.render_id=r.id
+             AND cr.decision IN ('APPROVED','APPROVED_WITH_EDITS'))
+         LIMIT 200`)).rows;
+      for (const r of renders) {
+        if (r.risk_tier === 'TIER_4'
+            && !req.actor.roles?.some(x => ['medical_director', 'admin'].includes(x))) continue;
+        await q(
+          `INSERT INTO lcos.clinical_reviews (object_type, object_id, render_id, script_id,
+             reviewer_user_id, reviewer_role, decision, risk_tier_at_review, comment, content_sha256)
+           VALUES ('RENDER',$1,$1,$2,$3,$4,'APPROVED',$5,'batch approval',$6)`,
+          [r.id, r.script_id, req.actor.id, req.actor.roles?.[0] ?? 'unknown', r.risk_tier,
+           sha(r.storage_key ?? String(r.id))]);
+        rendersApproved++;
+      }
+    }
+    await audit(null, { actor: req.actor, action: 'review.batch_approve', objectType: 'SCRIPT',
+      reason: `${approved} scripts, ${rendersApproved} renders, ${skipped.length} skipped` });
+    return { approved, renders_approved: rendersApproved, skipped };
+  });
+
   app.post('/content/turn-into-content', { preHandler: requirePerm('question.turn_into_content') }, async (req, reply) => {
     const { question_id, languages = ['EN', 'AM'], concept_count = 2 } = req.body ?? {};
     if (!question_id) return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'question_id required'));
@@ -411,8 +475,12 @@ export async function localizeScript(scriptId, { actor }) {
      JSON.stringify(loc.terminology_used), JSON.stringify(loc.uncertainties), sha(loc.spoken_amharic)]);
 
   const driftThreshold = Number(await setting('translation.drift_threshold', 0.12));
+  const mode = String(await setting('publishing.mode', 'DRAFT_BATCH'));
+  // In DRAFT_BATCH every Amharic script sees the language editor (the original
+  // pilot rule; approval is one batch click anyway). In the auto modes only
+  // genuinely suspicious translations pull a human in.
   const needsHuman = drift > driftThreshold || qa.verdict !== 'PASS' || qa.naturalness_score < 4
-    || true; // pilot rule: every Amharic script sees the language editor
+    || mode === 'DRAFT_BATCH';
   if (needsHuman) await routeLanguageReview(s.id, trans.id);
   return { result: 'OK', translation_id: trans.id, drift_score: Math.round(drift * 1000) / 1000,
     qa_verdict: qa.verdict, naturalness: qa.naturalness_score, routed_to_human: needsHuman };
@@ -426,6 +494,22 @@ async function routeLanguageReview(scriptId, translationId) {
 
 export async function routeReviews(scriptId, riskTier) {
   const s = await one(`SELECT * FROM lcos.scripts WHERE id=$1`, [scriptId]);
+  // Owner decision (Aug 2026): in the auto modes, scripts generated from an
+  // approved knowledge card that passed claim validation approve themselves.
+  // AUTO_EXCEPT_SENSITIVE still routes TIER_4 (abortion, GBV) to a human.
+  const mode = String(await setting('publishing.mode', 'DRAFT_BATCH'));
+  const autoOk = mode === 'FULL_AUTO'
+    || (mode === 'AUTO_EXCEPT_SENSITIVE' && riskTier !== 'TIER_4');
+  if (autoOk && s.validation_result === 'PASS' && s.created_by) {
+    await q(`UPDATE lcos.scripts SET status='APPROVED', approved_by=created_by,
+               approved_at=now(), approved_version=current_version
+             WHERE id=$1 AND validation_result='PASS'`, [scriptId]);
+    await q(`UPDATE lcos.review_tasks SET status='CANCELLED'
+             WHERE object_type='SCRIPT' AND object_id=$1 AND status IN ('OPEN','IN_PROGRESS')`, [scriptId]);
+    await audit(null, { actor: { type: 'SYSTEM', label: `publishing.mode=${mode}` },
+      action: 'script.auto_approved', objectType: 'SCRIPT', objectId: scriptId });
+    return true;
+  }
   if (['TIER_3', 'TIER_4'].includes(riskTier)) {
     const slug = riskTier === 'TIER_4' ? 'medical_director' : 'consulting_doctor';
     const role = await one(`SELECT id FROM lcos.roles WHERE slug=$1`, [slug]);

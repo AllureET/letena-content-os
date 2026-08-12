@@ -163,15 +163,25 @@ const screens = {
 
   async cards() {
     const r = await api('GET', '/knowledge/cards');
-    return `<h1>Knowledge library</h1><div class="sub">Approved medical answers, versioned and expiring</div>
+    const inReview = r.items.filter(c => c.status === 'IN_REVIEW');
+    const canApprove = can('knowledge.approve');
+    return `<h1>Knowledge library</h1><div class="sub">The medical facts content is built from. Doctors approve facts ONCE here; everything generated is claim-checked against them.</div>
+      ${inReview.length && canApprove ? `<div class="card"><div class="flex">
+        <div><b>${inReview.length} card${inReview.length > 1 ? 's' : ''} awaiting clinical approval.</b>
+          <div class="muted" style="font-size:12px">Open each card to read its facts and sources, or approve the whole batch if the team has reviewed them.</div></div>
+        <div class="spacer"></div>
+        <button class="approve" data-cardapproveall="1">Approve all ${inReview.length} + their facts</button>
+      </div></div>` : ''}
       <div class="card"><table>
-      <tr><th>Code</th><th>Question</th><th>Topic</th><th>Tier</th><th>Claims</th><th>Status</th><th>Review due</th></tr>
+      <tr><th>Code</th><th>Question</th><th>Topic</th><th>Tier</th><th>Claims</th><th>Status</th><th>Review due</th><th></th></tr>
       ${r.items.map(c => `<tr class="rowlink" data-nav="card/${c.id}">
         <td class="mono"><b>${esc(c.code)}</b></td>
         <td style="max-width:340px">${esc(c.canonical_question_en)}</td>
         <td>${esc(c.topic_code)}</td><td>${pill(c.risk_tier)}</td>
         <td>${c.claim_count}</td><td>${pill(c.status)}</td>
-        <td class="muted">${c.review_due_at ? esc(c.review_due_at.slice(0, 10)) : '—'}</td></tr>`).join('')}
+        <td class="muted">${c.review_due_at ? esc(c.review_due_at.slice(0, 10)) : '—'}</td>
+        <td>${c.status === 'IN_REVIEW' && canApprove
+          ? `<button class="approve" data-cardfullapprove="${c.id}">Approve facts + card</button>` : ''}</td></tr>`).join('')}
       </table></div>`;
   },
 
@@ -204,7 +214,7 @@ const screens = {
       <div class="card"><div class="eyebrow">Claims (${c.claims.length})</div>${claimHtml || '<span class="muted">No claims attached.</span>'}</div>
       <div class="flex">
         ${c.status === 'DRAFT' && can('knowledge.submit') ? `<button class="primary" data-cardtx="${c.id}|IN_REVIEW">Submit for clinical review</button>` : ''}
-        ${c.status === 'IN_REVIEW' && can('knowledge.approve') ? `<button class="approve" data-cardapprove="${c.id}">Approve (6 month review)</button>` : ''}
+        ${c.status === 'IN_REVIEW' && can('knowledge.approve') ? `<button class="approve" data-cardfullapprove="${c.id}">Approve facts + card (6 month review)</button>` : ''}
         ${c.status === 'APPROVED' && can('knowledge.retire') ? `<button class="danger" data-cardretire="${c.id}">Retire</button>` : ''}
       </div>`;
   },
@@ -611,7 +621,7 @@ document.addEventListener('click', (e) => {
   }
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save');
+  const b = e.target.closest('[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall]');
   if (!b) {
     const row = e.target.closest('tr[data-nav]');
     if (row) location.hash = '#/' + row.dataset.nav;
@@ -654,6 +664,24 @@ document.addEventListener('click', async (e) => {
         } catch { failed++; }
       }
       toast(`Produced ${done}` + (failed ? `, ${failed} failed` : ''));
+      return render();
+    }
+    if (b.dataset.cardfullapprove) {
+      b.disabled = true; b.textContent = 'Approving…';
+      const r = await api('POST', `/knowledge/cards/${b.dataset.cardfullapprove}/approve-with-claims`, {});
+      toast(`Approved ${r.claims_approved} facts; card ${r.card}`); return render();
+    }
+    if (b.dataset.cardapproveall) {
+      b.disabled = true;
+      const r = await api('GET', '/knowledge/cards');
+      const list = r.items.filter(c => c.status === 'IN_REVIEW');
+      let ok = 0, blocked = 0;
+      for (const c of list) {
+        b.textContent = `Approving ${ok + blocked + 1}/${list.length}…`;
+        try { await api('POST', `/knowledge/cards/${c.id}/approve-with-claims`, {}); ok++; }
+        catch { blocked++; }
+      }
+      toast(`Approved ${ok} cards with their facts` + (blocked ? `; ${blocked} blocked (open them to see why)` : ''));
       return render();
     }
     if (b.dataset.copycap) {

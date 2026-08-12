@@ -4,7 +4,8 @@ import Fastify from 'fastify';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { authPlugin, login, err, q, one, totpSecret, totpVerify } from './core.mjs';
+import { authPlugin, login, err, q, one, totpSecret, totpVerify, audit } from './core.mjs';
+import { CRED_REGISTRY, loadCreds, credStatus, setCred } from './creds.mjs';
 import knowledge from './modules/knowledge.mjs';
 import demand from './modules/demand.mjs';
 import content from './modules/content.mjs';
@@ -22,6 +23,9 @@ export async function buildServer() {
     await q('SELECT 1');
     return { ok: true, service: 'lcos-api' };
   });
+
+  // DB-backed provider credentials (Settings screen). Env stays the fallback.
+  await loadCreds().catch(() => {});
 
   // Admin UI (no build step; EMR design language)
   const webDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
@@ -197,6 +201,27 @@ export async function buildServer() {
       }
       const r = await q(`SELECT key, value, description FROM lcos.settings WHERE NOT is_secret ORDER BY key`);
       return { items: r.rows };
+    });
+    // Provider credentials: statuses only, never values. settings.manage gated.
+    v1.get('/platform/credentials', async (req, reply) => {
+      if (!req.actor.permissions.includes('settings.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'settings.manage'));
+      }
+      return { items: CRED_REGISTRY.map((r) => ({
+        key: r.key, label: r.label, group: r.group, secret: r.secret,
+        hint: r.hint, status: credStatus(r.key) })) };
+    });
+    v1.put('/platform/credentials', async (req, reply) => {
+      if (!req.actor.permissions.includes('settings.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'settings.manage'));
+      }
+      const { key, value } = req.body ?? {};
+      if (!key) return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'key required'));
+      await setCred(key, String(value ?? '').trim(), req.actor.id ?? null);
+      await audit(null, { actor: req.actor,
+        action: String(value ?? '').trim() ? 'credential.set' : 'credential.cleared',
+        objectType: 'SETTING', objectCode: key });
+      return { ok: true, key, status: credStatus(key) };
     });
     v1.get('/platform/dashboard', async () => {
       const [qToday, quarantine, scriptsReview, rendering, awaitingApproval, scheduled, cardsDue, deadLetters] =

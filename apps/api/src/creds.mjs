@@ -34,6 +34,10 @@ export const CRED_REGISTRY = [
     hint: 'Default voice used when a script does not name one.' },
   { key: 'LCOS_TTS_PROVIDER', label: 'TTS routing', group: 'Production services', secret: false,
     hint: 'AZURE or ELEVENLABS. Blank routes Amharic to Azure and English to ElevenLabs.' },
+  { key: 'AZURE_SPEECH_KEY', label: 'Azure Speech key', group: 'Production services', secret: true,
+    hint: 'Microsoft Azure Speech for Amharic voice (am-ET voices).' },
+  { key: 'AZURE_SPEECH_REGION', label: 'Azure Speech region', group: 'Production services', secret: false,
+    hint: 'For example westeurope or eastus.' },
   { key: 'KLING_ACCESS_KEY', label: 'Kling access key', group: 'Production services', secret: true,
     hint: 'Generative b-roll. Never anatomy.' },
   { key: 'KLING_SECRET_KEY', label: 'Kling secret key', group: 'Production services', secret: true,
@@ -52,6 +56,10 @@ export const CRED_REGISTRY = [
     hint: 'Instagram publishing. Gated on Meta App Review.' },
   { key: 'YOUTUBE_OAUTH', label: 'YouTube OAuth', group: 'Publishing', secret: true,
     hint: 'YouTube uploads.' },
+  { key: 'TIKTOK_ACCESS_TOKEN', label: 'TikTok access token', group: 'Publishing', secret: true,
+    hint: 'TikTok Content Posting API. Until set, TikTok content lands in the queue for manual upload.' },
+  { key: 'TIKTOK_OPEN_ID', label: 'TikTok open id', group: 'Publishing', secret: false,
+    hint: 'The account open_id the access token belongs to.' },
 ];
 
 const cache = new Map();

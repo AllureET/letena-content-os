@@ -23,9 +23,12 @@ const biText = (original, en) => {
 };
 const empty = (cols, msg) => `<tr><td colspan="${cols}" class="empty">${msg}</td></tr>`;
 const dt = (v) => v ? new Date(v).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
-const toast = (msg, err = false) => {
-  const t = $('#toast'); t.textContent = msg; t.className = 'show' + (err ? ' err' : '');
-  setTimeout(() => t.className = '', err ? 5000 : 2600);
+// kind: false/undefined = normal, true = error (red, 5s), 'warn' = informational
+// flag (amber, 5s) -- used for non-blocking notices like platform-spec warnings.
+const toast = (msg, kind = false) => {
+  const t = $('#toast'); t.textContent = msg;
+  t.className = 'show' + (kind === 'warn' ? ' warn' : kind ? ' err' : '');
+  setTimeout(() => t.className = '', kind ? 5000 : 2600);
 };
 
 async function api(method, path, body) {
@@ -39,7 +42,28 @@ async function api(method, path, body) {
   return data;
 }
 const can = (p) => ME?.permissions?.includes(p);
+const isAdmin = () => !!ME?.roles?.includes('admin');
 function logout() { sessionStorage.clear(); TOKEN = null; ME = null; render(); }
+// Test-content badge (admin override / flexible generation, Aug 2026): every
+// family, concept and script produced from an unapproved card via
+// approval.override=ADMIN_TEST_MODE carries is_test_content=true. Flag it
+// everywhere it can appear so nobody mistakes it for real, publishable work.
+const testBadge = (isTest) => isTest
+  ? '<span class="pill" style="color:#fff;background:var(--risk-high)"><span class="d"></span>TEST CONTENT</span>' : '';
+// Style-lint findings on a script version (apps/api/src/ai/style_lint.mjs):
+// mechanical house-style flags (em dash, hedge phrases, AI sign-offs). Never
+// blocks; a reviewer just gets to see them before approving.
+const styleWarnHtml = (warnings) => (Array.isArray(warnings) && warnings.length)
+  ? `<div class="claimrow bad" style="border-left-color:var(--risk-mod)"><b>Style check flagged this draft</b><br>
+      ${warnings.map(w => esc(w)).join('<br>')}</div>` : '';
+// Cheap code->id lookup for screens whose list endpoints only carry a
+// knowledge card's code (views built before drill-down existed), so rows can
+// still link to the real card detail screen. Swallows a 403 quietly -- a
+// user without knowledge.read simply sees non-clickable rows there.
+async function cardCodeMap() {
+  try { return new Map((await api('GET', '/knowledge/cards')).items.map(c => [c.code, c.id])); }
+  catch { return new Map(); }
+}
 
 // ---------- navigation ----------
 const NAV = [
@@ -98,12 +122,15 @@ const screens = {
     try {
       const gaps = await api('GET', '/demand/coverage-gaps');
       if (gaps.items.length) {
+        const cardIds = await cardCodeMap();
         gapsHtml = `<div class="card"><div class="eyebrow">High demand, low coverage</div>
           <table><tr><th>Topic</th><th>Card</th><th>Questions 30d</th><th>Content 90d</th><th>State</th><th>Priority</th></tr>
-          ${gaps.items.slice(0, 8).map(g => `<tr>
+          ${gaps.items.slice(0, 8).map(g => {
+            const cardId = cardIds.get(g.card_code);
+            return `<tr${cardId ? ` class="rowlink" data-nav="card/${cardId}" tabindex="0"` : ''}>
             <td>${esc(g.topic_name)}</td><td class="mono">${esc(g.card_code ?? '—')}</td>
             <td>${g.question_count_30d ?? 0}</td><td>${g.content_count_90d ?? 0}</td>
-            <td>${pill(g.coverage_state)}</td><td><b>${Number(g.priority_score).toFixed(0)}</b></td></tr>`).join('')}
+            <td>${pill(g.coverage_state)}</td><td><b>${Number(g.priority_score).toFixed(0)}</b></td></tr>`; }).join('')}
           </table></div>`;
       }
     } catch {}
@@ -119,7 +146,7 @@ const screens = {
     return `<h1>Questions</h1><div class="sub">De-identified audience questions from every channel. English shown first; the chip swaps to the original Amharic. Click a row for the full conversation.</div>
       <div class="card"><table>
       <tr><th>Question</th><th>Channel</th><th>Topic</th><th>Matched card</th><th>Status</th><th>Received</th><th></th></tr>
-      ${(r.items ?? []).map(i => `<tr class="rowlink" data-nav="question/${esc(i.id)}">
+      ${(r.items ?? []).map(i => `<tr class="rowlink" data-nav="question/${esc(i.id)}" tabindex="0">
         <td style="max-width:380px">${biText(i.sanitized_text, i.translation_en)}</td>
         <td>${chan(i.channel)}</td>
         <td>${esc(i.topic_code ?? '—')}</td>
@@ -200,29 +227,35 @@ const screens = {
 
   async clusters() {
     const r = await api('GET', '/clusters');
-    return `<h1>Question clusters</h1><div class="sub">Semantically similar questions, kept apart when answers differ</div>
+    const cardIds = await cardCodeMap();
+    return `<h1>Question clusters</h1><div class="sub">Semantically similar questions, kept apart when answers differ. Click a matched cluster to open its card.</div>
       <div class="card"><table>
       <tr><th>Cluster</th><th>Representative question</th><th>Topic</th><th>Card</th><th>Members</th><th>Last seen</th></tr>
-      ${r.items.map(i => `<tr><td class="mono">${esc(i.code)}</td>
+      ${r.items.map(i => {
+        const cardId = cardIds.get(i.card_code);
+        return `<tr${cardId ? ` class="rowlink" data-nav="card/${cardId}" tabindex="0"` : ''}><td class="mono">${esc(i.code)}</td>
         <td style="max-width:360px">${esc(i.representative_question)}</td>
         <td>${esc(i.topic_code ?? '—')}</td><td class="mono">${esc(i.card_code ?? '—')}</td>
-        <td><b>${i.member_count}</b></td><td class="muted">${dt(i.last_seen_at)}</td></tr>`).join('')}
+        <td><b>${i.member_count}</b></td><td class="muted">${dt(i.last_seen_at)}</td></tr>`; }).join('')}
       </table></div>`;
   },
 
   async coverage() {
     let items = [];
     try { items = (await api('GET', '/demand/coverage-gaps')).items; } catch {}
+    const cardIds = await cardCodeMap();
     return `<h1>Coverage gaps</h1>
-      <div class="sub">What Ethiopia is asking against what Letena has published. This board sets the calendar.</div>
+      <div class="sub">What Ethiopia is asking against what Letena has published. This board sets the calendar. Rows with a matched card open it.</div>
       <div class="flex" style="margin-bottom:10px">
         ${can('settings.manage') ? '<button id="recompute">Recompute now</button>' : ''}</div>
       <div class="card"><table>
       <tr><th>Topic</th><th>Card</th><th>Question</th><th>Questions 30d</th><th>Content 90d</th><th>State</th><th>Priority</th></tr>
-      ${items.map(g => `<tr><td>${esc(g.topic_name)}</td><td class="mono">${esc(g.card_code ?? '—')}</td>
+      ${items.map(g => {
+        const cardId = cardIds.get(g.card_code);
+        return `<tr${cardId ? ` class="rowlink" data-nav="card/${cardId}" tabindex="0"` : ''}><td>${esc(g.topic_name)}</td><td class="mono">${esc(g.card_code ?? '—')}</td>
         <td style="max-width:300px">${esc(g.canonical_question_en ?? '—')}</td>
         <td>${g.question_count_30d ?? 0}</td><td>${g.content_count_90d ?? 0}</td>
-        <td>${pill(g.coverage_state)}</td><td><b>${Number(g.priority_score).toFixed(0)}</b></td></tr>`).join('')
+        <td>${pill(g.coverage_state)}</td><td><b>${Number(g.priority_score).toFixed(0)}</b></td></tr>`; }).join('')
       || '<tr><td colspan=7 class="empty">No gap rows yet. Ingest questions and recompute.</td></tr>'}
       </table></div>`;
   },
@@ -240,7 +273,7 @@ const screens = {
       </div></div>` : ''}
       <div class="card"><table>
       <tr><th>Code</th><th>Question</th><th>Topic</th><th>Tier</th><th>Claims</th><th>Status</th><th>Review due</th><th></th></tr>
-      ${r.items.map(c => `<tr class="rowlink" data-nav="card/${c.id}">
+      ${r.items.map(c => `<tr class="rowlink" data-nav="card/${c.id}" tabindex="0">
         <td class="mono"><b>${esc(c.code)}</b></td>
         <td style="max-width:340px">${esc(c.canonical_question_en)}</td>
         <td>${esc(c.topic_code)}</td><td>${pill(c.risk_tier)}</td>
@@ -253,6 +286,21 @@ const screens = {
 
   async card(id) {
     const c = await api('GET', `/knowledge/cards/${id}`);
+    let genHtml = '';
+    if (can('question.turn_into_content')) {
+      let outputTypes = [];
+      try { outputTypes = (await api('GET', '/content/output-types')).items; } catch {}
+      genHtml = `<div class="card"><div class="eyebrow">Generate content from this card</div>
+        <div class="sub" style="margin-bottom:10px">Pick exactly which output types to generate for this one topic, instead of the full four-output batch.${c.status !== 'APPROVED' ? ' This card is not yet APPROVED; generation will only work if an admin has turned on the test-mode override in Settings.' : ''}</div>
+        <div class="flex" style="flex-wrap:wrap;row-gap:10px">
+          ${outputTypes.map(t => `<label style="display:flex;align-items:center;gap:6px;font-weight:400;margin:0;width:auto">
+            <input type="checkbox" value="${esc(t.code)}" class="gen-ot" style="width:auto">
+            ${esc(t.label)}${t.platform ? ` <span class="muted">(${esc(t.platform)})</span>` : ''}</label>`).join('')
+            || '<span class="muted">No output types configured.</span>'}
+        </div>
+        <div style="margin-top:12px"><button class="primary" data-cardgenerate="${c.id}">Generate selected</button></div>
+      </div>`;
+    }
     const claimHtml = c.claims.map(cl => {
       const src = c.sources.filter(s => s.claim_id === cl.id);
       return `<div class="claimrow">
@@ -260,7 +308,9 @@ const screens = {
           ${cl.is_core ? '<span class="pill p-VALIDATED"><span class="d"></span>core</span>' : ''}</div>
         <div style="margin:4px 0">${esc(cl.claim_text_en)}</div>
         <div class="muted" style="font-size:11.5px">${src.map(s =>
-          `${esc(s.organisation)} · ${esc(s.title)}${s.locator ? ' · ' + esc(s.locator) : ''}`).join('<br>')}</div>
+          `${esc(s.organisation)} · ${s.url
+            ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title)}</a>`
+            : esc(s.title)}${s.locator ? ' · ' + esc(s.locator) : ''}`).join('<br>')}</div>
       </div>`;
     }).join('');
     const v = c.version;
@@ -279,6 +329,7 @@ const screens = {
           <br><br><b>Approved CTAs</b><br>${(v?.approved_ctas ?? []).map(esc).join('<br>') || '<span class="muted">none recorded</span>'}</div></div>
       </div>
       <div class="card"><div class="eyebrow">Claims (${c.claims.length})</div>${claimHtml || '<span class="muted">No claims attached.</span>'}</div>
+      ${genHtml}
       <div class="flex">
         ${c.status === 'DRAFT' && can('knowledge.submit') ? `<button class="primary" data-cardtx="${c.id}|IN_REVIEW">Submit for clinical review</button>` : ''}
         ${c.status === 'IN_REVIEW' && can('knowledge.approve') ? `<button class="approve" data-cardfullapprove="${c.id}">Approve facts + card (6 month review)</button>` : ''}
@@ -304,7 +355,9 @@ const screens = {
       <div class="card"><table>
       <tr><th>Prec.</th><th>Code</th><th>Organisation</th><th>Title</th><th>Type</th><th>Status</th></tr>
       ${r.items.map(s => `<tr><td><b>${s.precedence}</b></td><td class="mono">${esc(s.code)}</td>
-        <td>${esc(s.organisation)}</td><td style="max-width:300px">${esc(s.title)}</td>
+        <td>${esc(s.organisation)}</td><td style="max-width:300px">${s.url
+          ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title)}</a>`
+          : esc(s.title)}</td>
         <td class="muted" style="font-size:11px">${esc(s.source_type)}</td><td>${pill(s.status)}</td></tr>`).join('')}
       </table></div>`;
   },
@@ -314,25 +367,37 @@ const screens = {
     return `<h1>Knowledge gaps</h1>
       <div class="sub">Scripts stopped because a required fact has no approved claim. Each row is real demand the clinical team can answer.</div>
       <div class="card"><table><tr><th>Script</th><th>Card</th><th>Missing knowledge</th><th>When</th></tr>
-      ${r.items.map(i => `<tr><td class="mono">${esc(i.code)}</td><td class="mono">${esc(i.card_code)}</td>
+      ${r.items.map(i => `<tr class="rowlink" data-nav="script/${esc(i.id)}" tabindex="0">
+        <td class="mono">${esc(i.code)}</td><td class="mono">${esc(i.card_code)}</td>
         <td style="max-width:420px" class="mono">${esc(JSON.stringify(i.needs_knowledge_note)?.slice(0, 220) ?? '')}</td>
         <td class="muted">${dt(i.created_at)}</td></tr>`).join('')
       || '<tr><td colspan=4 class="empty">No open knowledge gaps.</td></tr>'}</table></div>`;
   },
 
+  // arg (family id) filters the concepts list below: dashboard-style
+  // drill-down from a family row into what it actually produced.
   async families() {
     const r = await api('GET', '/content/families');
-    return `<h1>Content families</h1><div class="sub">One educational idea, all its derivatives</div>
-      <div class="card"><table><tr><th>Code</th><th>Title</th><th>Card</th><th>Segment</th><th>Tier</th><th>Origin</th><th>Created</th></tr>
-      ${r.items.map(f => `<tr><td class="mono">${esc(f.code)}</td><td style="max-width:280px">${esc(f.title)}</td>
+    return `<h1>Content families</h1><div class="sub">One educational idea, all its derivatives. Click a row to see its concepts.</div>
+      <div class="card"><table><tr><th>Code</th><th>Title</th><th>Card</th><th>Segment</th><th>Tier</th><th>Origin</th><th>Created</th><th></th></tr>
+      ${r.items.map(f => `<tr class="rowlink" data-nav="concepts/${f.id}" tabindex="0">
+        <td class="mono">${esc(f.code)}</td><td style="max-width:280px">${esc(f.title)}</td>
         <td class="mono">${esc(f.card_code)}</td><td class="muted">${esc(f.segment_slug)}</td>
-        <td>${pill(f.risk_tier)}</td><td class="muted">${esc(f.origin)}</td><td class="muted">${dt(f.created_at)}</td></tr>`).join('')}
-      </table></div>`;
+        <td>${pill(f.risk_tier)}</td><td class="muted">${esc(f.origin)}</td><td class="muted">${dt(f.created_at)}</td>
+        <td>${testBadge(f.is_test_content)}</td></tr>`).join('')
+      || '<tr><td colspan=8 class="empty">No content families yet.</td></tr>'}</table></div>`;
   },
 
-  async concepts() {
-    const r = await api('GET', '/content/concepts');
-    return `<h1>Creative concepts</h1><div class="sub">Distinct treatments of approved knowledge. Selection is the cheap place for editorial judgement.</div>
+  // arg (optional): a family id to filter to (see families() row links above).
+  async concepts(familyId) {
+    const r = await api('GET', '/content/concepts' + (familyId ? `?family_id=${encodeURIComponent(familyId)}` : ''));
+    let family = null;
+    if (familyId) {
+      try { family = (await api('GET', '/content/families')).items.find(f => f.id === familyId); } catch {}
+    }
+    return `${familyId ? '<a class="backlink" href="#/families">&larr; Content families</a>' : ''}
+      <h1>Creative concepts</h1>
+      <div class="sub">${family ? `Filtered to ${esc(family.code)} · ${esc(family.title)}` : 'Distinct treatments of approved knowledge. Selection is the cheap place for editorial judgement.'}</div>
       ${r.items.map(c => `<div class="card">
         <div class="flex"><b>${esc(c.title)}</b>${pill(c.status)}<span class="muted">${esc(c.video_family)}</span>
           <span class="spacer"></span>
@@ -340,18 +405,18 @@ const screens = {
         <div style="margin:6px 0"><b>Hook:</b> ${esc(c.hook_line)}</div>
         <div class="muted">${esc(c.premise)}</div>
         <div class="muted" style="font-size:12px;margin-top:6px">Why it works: ${esc(c.why_this_works ?? '')}</div>
-      </div>`).join('') || '<div class="card empty">No concepts yet. Use Turn into content from the Questions screen to start one.</div>'}`;
+      </div>`).join('') || `<div class="card empty">${familyId ? 'No concepts recorded for this family.' : 'No concepts yet. Use Turn into content from the Questions screen to start one.'}</div>`}`;
   },
 
   async scripts() {
     const r = await api('GET', '/content/scripts');
     return `<h1>Scripts</h1><div class="sub">Every medical sentence maps to an approved claim, or the script does not move</div>
-      <div class="card"><table><tr><th>Code</th><th>Family</th><th>Card</th><th>Lang</th><th>Tier</th><th>Validation</th><th>Status</th><th></th></tr>
-      ${r.items.map(s => `<tr class="rowlink" data-nav="script/${s.id}">
+      <div class="card"><table><tr><th>Code</th><th>Family</th><th>Card</th><th>Lang</th><th>Tier</th><th>Validation</th><th>Status</th><th></th><th></th></tr>
+      ${r.items.map(s => `<tr class="rowlink" data-nav="script/${s.id}" tabindex="0">
         <td class="mono">${esc(s.code)}</td><td class="mono muted">${esc(s.family_code)}</td>
         <td class="mono">${esc(s.card_code)}</td><td>${esc(s.language)}</td>
         <td>${pill(s.risk_tier)}</td><td>${pill(s.validation_result === 'PASS' ? 'PASS' : s.validation_result === 'FAIL' ? 'FAIL' : null) || '<span class="muted">—</span>'}</td>
-        <td>${pill(s.status)}</td>
+        <td>${pill(s.status)}</td><td>${testBadge(s.is_test_content)}</td>
         <td>${s.status === 'APPROVED' && can('production.request') ? `<button data-produce="${s.id}">Produce</button>` : ''}</td>
       </tr>`).join('')}</table></div>`;
   },
@@ -364,7 +429,9 @@ const screens = {
       <h1 class="mono">${esc(s.code)}</h1>
       <div class="sub flex">${pill(s.status)} ${pill(s.risk_tier)}
         ${pill(s.validation_result === 'PASS' ? 'PASS' : s.validation_result === 'FAIL' ? 'FAIL' : null)}
+        ${testBadge(s.is_test_content)}
         <span class="muted">${esc(s.language)} · v${s.current_version}</span></div>
+      ${styleWarnHtml(v?.style_warnings)}
       <div class="grid2">
         <div class="card"><div class="eyebrow">Script</div>
           <div class="kv"><b>Hook:</b> ${esc(v?.hook)}<br><br><b>Spoken:</b><br>${esc(v?.spoken_script)}
@@ -402,6 +469,35 @@ const screens = {
       </div>`;
   },
 
+  // Minimal render detail (GET /production/renders/:id): the drill-down
+  // target for the Queue's "ready to publish" rows, which otherwise showed
+  // only a caption and a download link with nothing to click into.
+  async render(id) {
+    let r;
+    try { r = await api('GET', `/production/renders/${id}`); }
+    catch {
+      return `<a class="backlink" href="#/reviews">&larr; Queue</a>
+        <h1>Render not found</h1><div class="card empty">It may have been removed or superseded.</div>`;
+    }
+    return `<a class="backlink" href="#/reviews">&larr; Queue</a>
+      <div class="eyebrow">Render detail</div>
+      <h1 class="mono">${esc(r.code ?? r.id)}</h1>
+      <div class="sub flex">${pill(r.status)} <span class="muted">${esc(r.engine)}</span>
+        ${r.duration_s != null ? `<span class="muted">${esc(String(r.duration_s))}s</span>` : ''}
+        ${r.aspect_ratio ? `<span class="muted">${esc(r.aspect_ratio)}</span>` : ''}</div>
+      <div class="card"><div class="eyebrow">Details</div>
+        <div class="kv">
+          <b>Template</b> ${esc(r.template_code ?? '—')}${r.template_version ? ' v' + esc(String(r.template_version)) : ''}<br>
+          <b>Variant</b> ${esc(r.variant_label ?? '—')}<br>
+          <b>Cost</b> ${r.cost_usd != null ? '$' + esc(String(r.cost_usd)) : '—'}<br>
+          <b>Created</b> ${dt(r.created_at)}
+        </div>
+        ${r.preview_url ? `<div style="margin-top:12px"><a class="btn" href="${esc(r.preview_url)}" target="_blank" rel="noopener" download>Download / preview</a></div>` : ''}
+        ${r.last_error ? `<div class="claimrow bad" style="margin-top:10px"><b>Last error</b><br>${esc(r.last_error)}</div>` : ''}
+      </div>
+      <a class="backlink" href="#/script/${esc(r.script_id)}">Open its script &rarr;</a>`;
+  },
+
   async reviews() {
     const qd = await api('GET', '/distribution/queue');
     const A = qd.awaiting_approval, P = qd.to_produce, R = qd.to_publish;
@@ -412,7 +508,7 @@ const screens = {
         <div class="spacer"></div>
         ${A.length && canApprove ? `<button class="approve" data-batchapprove="1">Approve all ${A.length}</button>` : ''}</div>
       <table><tr><th>Script</th><th>Lang</th><th>Tier</th><th>Hook</th><th>Status</th></tr>
-      ${A.map(s => `<tr class="rowlink" data-nav="script/${s.id}">
+      ${A.map(s => `<tr class="rowlink" data-nav="script/${s.id}" tabindex="0">
         <td class="mono">${esc(s.code)}</td><td>${esc(s.language)}</td><td>${pill(s.risk_tier)}</td>
         <td class="muted" style="max-width:340px">${esc(s.hook ?? '')}</td><td>${pill(s.status)}</td></tr>`).join('')
       || '<tr><td colspan=5 class="empty">Nothing waiting. Generate content from the Questions or Demand screens.</td></tr>'}</table></div>
@@ -421,16 +517,17 @@ const screens = {
         <div class="spacer"></div>
         ${P.length && can('production.request') ? `<button class="primary" data-produceall="1">Produce all ${P.length}</button>` : ''}</div>
       <table><tr><th>Script</th><th>Lang</th><th>Tier</th><th>Family</th><th></th></tr>
-      ${P.map(s => `<tr><td class="mono">${esc(s.code)}</td><td>${esc(s.language)}</td>
+      ${P.map(s => `<tr class="rowlink" data-nav="script/${s.id}" tabindex="0"><td class="mono">${esc(s.code)}</td><td>${esc(s.language)}</td>
         <td>${pill(s.risk_tier)}</td><td class="mono muted">${esc(s.family_code)}</td>
         <td>${can('production.request') ? `<button data-produce="${s.id}">Produce</button>` : ''}</td></tr>`).join('')
       || '<tr><td colspan=5 class="empty">Nothing to produce. Approved scripts queue up here.</td></tr>'}</table></div>
 
       <div class="card"><div class="eyebrow">3 · Ready to publish (${R.length})</div>
+      <div class="sub" style="margin:-6px 0 10px">Click a row to open the render's own detail (duration, engine, preview).</div>
       <table><tr><th>Script</th><th>Caption</th><th>Video</th><th>Publish</th></tr>
       ${R.map(r => {
         const cap = (r.caption ?? '') + (r.hashtags?.length ? '\n' + r.hashtags.join(' ') : '');
-        return `<tr><td class="mono">${esc(r.script_code)}<div class="muted">${esc(r.language)} · ${pill(r.risk_tier)}</div></td>
+        return `<tr class="rowlink" data-nav="render/${esc(r.render_id)}" tabindex="0"><td class="mono">${esc(r.script_code)}<div class="muted">${esc(r.language)} · ${pill(r.risk_tier)}</div></td>
         <td style="max-width:320px"><div class="muted" style="font-size:12px;white-space:pre-wrap">${esc(cap.slice(0, 180))}${cap.length > 180 ? '…' : ''}</div>
           <button data-copycap="${esc(r.render_id)}" data-cap="${esc(cap)}">Copy caption</button></td>
         <td>${r.download_url ? `<a class="btn" href="${esc(r.download_url)}" download>Download</a>` : '<span class="muted">no file</span>'}</td>
@@ -453,9 +550,9 @@ const screens = {
 
   async production() {
     const r = await api('GET', '/production/jobs');
-    return `<h1>Production queue</h1><div class="sub">Approved scripts becoming finished media</div>
+    return `<h1>Production queue</h1><div class="sub">Approved scripts becoming finished media. Click a row to open its script.</div>
       <div class="card"><table><tr><th>Job</th><th>Script</th><th>Engine</th><th>Template</th><th>Voice</th><th>Status</th><th></th></tr>
-      ${r.items.map(j => `<tr><td class="mono">${esc(j.code)}</td><td class="mono">${esc(j.script_code)}</td>
+      ${r.items.map(j => `<tr class="rowlink" data-nav="script/${esc(j.script_id)}" tabindex="0"><td class="mono">${esc(j.code)}</td><td class="mono">${esc(j.script_code)}</td>
         <td>${esc(j.engine)}</td><td class="mono muted">${esc(j.template_code ?? '—')}</td>
         <td class="muted">${esc(j.voice_source)}</td><td>${pill(j.status)}</td>
         <td>${j.status === 'QUEUED' && can('production.request') ? `<button class="primary" data-run="${j.id}">Run</button>` : ''}</td>
@@ -486,13 +583,13 @@ const screens = {
 
   async published() {
     const r = await api('GET', '/distribution/published');
-    return `<h1>Published content</h1><div class="sub">Everything live, traceable to its card, claims and reviewer</div>
+    return `<h1>Published content</h1><div class="sub">Everything live, traceable to its card, claims and reviewer. Click a row for the underlying card; the link opens the live post.</div>
       <div class="card"><table><tr><th>Platform</th><th>Family</th><th>Card</th><th>Lang</th><th>Format</th><th>Published</th><th>Link</th></tr>
-      ${r.items.map(p => `<tr><td>${chan(p.platform)}</td><td class="mono">${esc(p.family_code)}</td>
+      ${r.items.map(p => `<tr class="rowlink" data-nav="card/${esc(p.knowledge_card_id)}" tabindex="0"><td>${chan(p.platform)}</td><td class="mono">${esc(p.family_code)}</td>
         <td class="mono">${esc(p.card_code)}</td><td>${esc(p.language)}</td>
         <td class="muted" style="font-size:11px">${esc(p.video_family)}</td>
         <td class="muted">${dt(p.published_at)}</td>
-        <td><a href="${esc(p.platform_url)}" target="_blank">open</a></td></tr>`).join('')
+        <td>${p.platform_url ? `<a href="${esc(p.platform_url)}" target="_blank" rel="noopener">open ↗</a>` : '<span class="muted">—</span>'}</td></tr>`).join('')
       || '<tr><td colspan=7 class="empty">Nothing published yet.</td></tr>'}</table></div>`;
   },
 
@@ -535,18 +632,20 @@ const screens = {
 
   async calendar() {
     const r = await api('GET', '/distribution/calendar');
-    return `<h1>Publishing calendar</h1><div class="sub">Scheduled next three weeks, published last seven days</div>
+    const cardIds = await cardCodeMap();
+    const rowNav = (code) => { const id = cardIds.get(code); return id ? ` class="rowlink" data-nav="card/${id}" tabindex="0"` : ''; };
+    return `<h1>Publishing calendar</h1><div class="sub">Scheduled next three weeks, published last seven days. Rows with a matched card open it.</div>
       <div class="card"><div class="eyebrow">Scheduled</div><table>
       <tr><th>When</th><th>Platform</th><th>Family</th><th>Card</th><th>Lang</th><th>Tier</th><th>Status</th></tr>
-      ${r.scheduled.map(j => `<tr><td>${dt(j.scheduled_for)}</td><td>${chan(j.platform)}</td>
+      ${r.scheduled.map(j => `<tr${rowNav(j.card_code)}><td>${dt(j.scheduled_for)}</td><td>${chan(j.platform)}</td>
         <td class="mono">${esc(j.family_code)}</td><td class="mono">${esc(j.card_code)}</td>
         <td>${esc(j.language)}</td><td>${pill(j.risk_tier)}</td><td>${pill(j.status)}</td></tr>`).join('')
       || '<tr><td colspan=7 class="empty">Nothing scheduled yet. Approved and rendered content lands here.</td></tr>'}</table></div>
       <div class="card"><div class="eyebrow">Recently published</div><table>
       <tr><th>When</th><th>Platform</th><th>Family</th><th>Card</th><th>Link</th></tr>
-      ${r.published.map(p => `<tr><td>${dt(p.published_at)}</td><td>${chan(p.platform)}</td>
+      ${r.published.map(p => `<tr${rowNav(p.card_code)}><td>${dt(p.published_at)}</td><td>${chan(p.platform)}</td>
         <td class="mono">${esc(p.family_code)}</td><td class="mono">${esc(p.card_code)}</td>
-        <td><a href="${esc(p.platform_url)}" target="_blank">open</a></td></tr>`).join('')
+        <td>${p.platform_url ? `<a href="${esc(p.platform_url)}" target="_blank" rel="noopener">open ↗</a>` : '<span class="muted">—</span>'}</td></tr>`).join('')
       || '<tr><td colspan=5 class="empty">Nothing published in the last seven days.</td></tr>'}</table></div>`;
   },
 
@@ -658,12 +757,65 @@ const screens = {
         </select>
         <button class="primary" id="pm-save">Save</button>
       </div></div>` : '';
+    // Admin test-mode override (Nate, Aug 2026): lets an admin generate from
+    // a not-yet-approved card for testing. Admin-role gated client-side to
+    // match the backend's adminOnlySetting guard; made deliberately alarming
+    // when on so nobody forgets it is a live safety-relevant switch.
+    const override = String(r.items.find(s => s.key === 'approval.override')?.value ?? 'OFF');
+    const overrideOn = override === 'ADMIN_TEST_MODE';
+    const overrideHtml = isAdmin() ? `<div class="card" style="border:1px solid ${overrideOn ? 'var(--risk-high)' : 'var(--line)'};${overrideOn ? 'background:var(--risk-high-bg)' : ''}">
+      <div class="eyebrow" style="color:${overrideOn ? 'var(--risk-high)' : 'var(--plump-purple)'}">Admin test mode override</div>
+      <div class="sub" style="margin-bottom:10px">Lets an admin generate content from a knowledge card that a doctor has not approved yet, for testing. Every use is audit-logged, every piece it makes is marked TEST CONTENT, and none of it can publish while its card stays unapproved.</div>
+      ${overrideOn ? `<div class="flex" style="margin-bottom:10px"><span class="pill" style="color:#fff;background:var(--risk-high)"><span class="d"></span>ADMIN TEST MODE IS ON &mdash; unapproved cards can generate content</span></div>` : ''}
+      <div class="flex">
+        <select id="override-select" style="max-width:360px">
+          <option value="OFF" ${!overrideOn ? 'selected' : ''}>Off (default: only approved cards can generate)</option>
+          <option value="ADMIN_TEST_MODE" ${overrideOn ? 'selected' : ''}>Admin test mode (unapproved cards allowed, admin only)</option>
+        </select>
+        <button class="${overrideOn ? '' : 'danger'}" id="override-save">Save</button>
+      </div></div>` : '';
+    // Writing style / tone preset (content.tone_preset default; per-request
+    // overrides are also available on Turn into content and card generation).
+    let toneHtml = '';
+    try {
+      const tp = await api('GET', '/content/tone-presets');
+      const current = tp.items.find(t => t.key === tp.default);
+      toneHtml = `<div class="card"><div class="eyebrow">Writing style and tone</div>
+        <div class="sub" style="margin-bottom:10px">The default voice for AI-generated copy across every output type.</div>
+        <div class="flex">
+          <select id="tonepreset" style="max-width:320px">
+            ${tp.items.map(t => `<option value="${esc(t.key)}" ${t.key === tp.default ? 'selected' : ''}>${esc(t.label)}</option>`).join('')}
+          </select>
+          ${can('settings.manage') ? '<button class="primary" id="tone-save">Save</button>' : ''}
+        </div>
+        ${current?.description ? `<div class="muted" style="font-size:12px;margin-top:8px">${esc(current.description)}</div>` : ''}
+      </div>`;
+    } catch { /* concept.read missing; hide */ }
+    // Read-only platform specs reference (GET /platform/specs): so producers
+    // can check target sizing without digging through code. Renders are
+    // flagged against these at schedule time, never blocked.
+    let specsHtml = '';
+    try {
+      const sp = await api('GET', '/platform/specs');
+      specsHtml = `<div class="card"><div class="eyebrow">Platform export specs</div>
+        <div class="sub" style="margin-bottom:10px">Target sizing per platform. A render that misses these is flagged when scheduled, never blocked.</div>
+        <table><tr><th>Platform</th><th>Aspect</th><th>Dimensions</th><th>Recommended</th><th>Max</th><th>Notes</th></tr>
+        ${sp.items.map(p => `<tr><td>${chan(p.platform)}</td><td class="mono">${esc(p.aspect_ratio)}</td>
+          <td class="mono">${esc(String(p.width))}&times;${esc(String(p.height))}</td>
+          <td class="muted">${p.recommended_duration_seconds != null ? esc(String(p.recommended_duration_seconds)) + 's' : '—'}</td>
+          <td class="muted">${p.max_duration_seconds != null ? esc(String(p.max_duration_seconds)) + 's' : '—'}</td>
+          <td class="muted" style="font-size:11.5px">${esc(p.format_notes ?? '')}</td></tr>`).join('')
+        || '<tr><td colspan=6 class="empty">No specs seeded yet.</td></tr>'}</table></div>`;
+    } catch { /* publish.read missing; hide */ }
     return `<h1>Settings</h1><div class="sub">Thresholds and weights the team can argue with, without a deploy</div>
+      ${overrideHtml}
       ${pmHtml}
+      ${toneHtml}
       <div class="card"><table><tr><th>Key</th><th>Value</th><th>Description</th></tr>
       ${r.items.map(s => `<tr><td class="mono">${esc(s.key)}</td>
         <td class="mono" style="max-width:260px">${esc(JSON.stringify(s.value))}</td>
         <td class="muted">${esc(s.description ?? '')}</td></tr>`).join('')}</table></div>
+      ${specsHtml}
       ${credsHtml}`;
   },
 
@@ -693,11 +845,22 @@ document.addEventListener('keydown', (e) => {
   if ((e.key === 'Enter' || e.key === ' ') && e.target.classList?.contains('tile')) {
     e.preventDefault(); e.target.click();
   }
+  // Drill-down rows (tr[data-nav], tabindex="0"): Enter/Space activates the
+  // row itself, same as a tile. Only when focus is on the row, not on a
+  // button/link/input inside it -- those already have their own Enter/Space
+  // behaviour and must not also trigger the row's navigation.
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('tr[data-nav]')) {
+    e.preventDefault(); location.hash = '#/' + e.target.dataset.nav;
+  }
   if (e.key === 'Escape') document.body.classList.remove('nav-open');
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall]');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#tone-save');
   if (!b) {
+    // A real link (external platform URL, download, backlink) inside a
+    // drill-down row must keep its native navigation; only fall through to
+    // the row's own data-nav when the click was not on an <a>.
+    if (e.target.closest('a[href],select,input,textarea,label')) return;
     const row = e.target.closest('tr[data-nav]');
     if (row) location.hash = '#/' + row.dataset.nav;
     return;
@@ -731,6 +894,18 @@ document.addEventListener('click', async (e) => {
       const value = $('#pubmode').value;
       await api('PUT', '/platform/settings', { key: 'publishing.mode', value });
       toast('Publishing mode saved: ' + value); return render();
+    }
+    if (b.id === 'override-save') {
+      const value = $('#override-select').value;
+      await api('PUT', '/platform/settings', { key: 'approval.override', value });
+      toast(value === 'ADMIN_TEST_MODE' ? 'Admin test mode is ON. Every generation from an unapproved card now needs this switched back off.' : 'Admin test mode is off.',
+        value === 'ADMIN_TEST_MODE' ? 'warn' : false);
+      return render();
+    }
+    if (b.id === 'tone-save') {
+      const value = $('#tonepreset').value;
+      await api('PUT', '/platform/settings', { key: 'content.tone_preset', value });
+      toast('Tone preset saved: ' + value); return render();
     }
     if (b.dataset.batchapprove) {
       b.disabled = true; b.textContent = 'Approving…';
@@ -781,7 +956,24 @@ document.addEventListener('click', async (e) => {
       const platform = $(`#plat-${b.dataset.pubnow}`).value;
       const job = await api('POST', '/distribution/jobs', { render_id: b.dataset.pubnow, platform });
       await api('POST', `/distribution/jobs/${job.id}/publish-now`);
-      toast('Published to ' + platform); return render();
+      // Platform-spec warnings (duration/aspect ratio) ride along on the
+      // schedule response. Flag, never gate: the publish above already ran.
+      if (job.warnings?.length) {
+        toast(`Published to ${platform}. Note: ${job.warnings.map(w => w.message).join(' ')}`, 'warn');
+      } else {
+        toast('Published to ' + platform);
+      }
+      return render();
+    }
+    if (b.dataset.cardgenerate) {
+      const outputTypes = [...document.querySelectorAll('.gen-ot:checked')].map(x => x.value);
+      if (!outputTypes.length) { toast('Pick at least one output type first', true); return; }
+      b.disabled = true; b.textContent = 'Generating…';
+      const r = await api('POST', '/content/generate', { card_id: b.dataset.cardgenerate, output_types: outputTypes });
+      toast(`Created ${r.concepts.length} concept${r.concepts.length === 1 ? '' : 's'}, ${r.scripts.length} script${r.scripts.length === 1 ? '' : 's'} (${r.risk_tier})`
+        + (r.is_test_content ? ' — TEST CONTENT, will never publish while this card is unapproved' : ''),
+        r.is_test_content ? 'warn' : false);
+      location.hash = '#/scripts'; return;
     }
     if (b.dataset.tic) {
       b.disabled = true; b.textContent = 'Working…';

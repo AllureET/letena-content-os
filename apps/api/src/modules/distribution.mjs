@@ -3,6 +3,7 @@
 import crypto from 'node:crypto';
 import { q, one, tx, audit, requirePerm, err } from '../core.mjs';
 import { publishers, collectors, storage } from '../adapters/index.mjs';
+import { getPlatformSpec, evaluateContent } from './platform_specs.mjs';
 import { reachScore, educationScore, serviceScore, compositeScore } from '../../../../packages/scoring/src/index.mjs';
 
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -36,17 +37,25 @@ export default async function routes(app) {
       [script.id, script.approved_version ?? script.current_version]);
     const variant = v?.platform_variants?.[platform] ?? {};
     const effectiveCaption = caption ?? variant.caption ?? v?.caption ?? null;
+    // 2026 platform sizing: look up the target's spec (lcos.platform_specs,
+    // admin-editable via GET/PUT /platform/specs) and flag -- never block --
+    // a render whose duration or aspect ratio does not fit it. The spec and
+    // any warnings ride along on the job's payload so the Queue screen (and
+    // whatever renders next) can show them without a second lookup.
+    const spec = await getPlatformSpec(platform);
+    const warnings = evaluateContent(spec, { durationSeconds: render.duration_s, aspectRatio: render.aspect_ratio });
     const job = await one(
       `INSERT INTO lcos.publishing_jobs (code, render_id, family_id, platform, platform_account_id,
-         status, scheduled_for, title, caption, hashtags, approved_by, approved_at, created_by)
+         status, scheduled_for, title, caption, hashtags, approved_by, approved_at, created_by, payload)
        VALUES ($1,$2,$3,$4::lcos.publish_platform,$5,'SCHEDULED',COALESCE($6::timestamptz, now()),
-               $7,$8,COALESCE($9::text[],'{}'),$10,now(),$10)
+               $7,$8,COALESCE($9::text[],'{}'),$10,now(),$10,$11)
        RETURNING *`,
       [code('PUB'), render.id, script.family_id, platform, account.id, scheduled_for ?? null,
-       variant.title ?? null, effectiveCaption, v?.hashtags ?? null, req.actor.id]);
+       variant.title ?? null, effectiveCaption, v?.hashtags ?? null, req.actor.id,
+       JSON.stringify({ platform_spec: spec, warnings })]);
     await audit(null, { actor: req.actor, action: 'publish.schedule', objectType: 'PUBLISHING_JOB',
-      objectId: job.id, objectCode: job.code });
-    return reply.code(201).send(job);
+      objectId: job.id, objectCode: job.code, reason: warnings.length ? warnings.map(w => w.code).join(',') : null });
+    return reply.code(201).send({ ...job, platform_spec: spec, warnings });
   });
 
   app.post('/distribution/jobs/:id/publish-now', { preHandler: requirePerm('publish.execute') }, async (req, reply) => {

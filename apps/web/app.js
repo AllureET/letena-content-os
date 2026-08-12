@@ -512,11 +512,32 @@ const screens = {
 
   async settings() {
     const r = await api('GET', '/platform/settings');
+    let credsHtml = '';
+    try {
+      const c = await api('GET', '/platform/credentials');
+      const groups = [...new Set(c.items.map(i => i.group))];
+      const badge = (st) => st === 'saved'
+        ? '<span class="pill p-APPROVED"><span class="d"></span>saved</span>'
+        : st === 'env'
+          ? '<span class="pill p-DRAFT"><span class="d"></span>from server env</span>'
+          : '<span class="pill p-CLOSED"><span class="d"></span>not set</span>';
+      credsHtml = `<h1 style="margin-top:26px">API keys and providers</h1>
+        <div class="sub">Enter and save credentials here, exactly like the EMR integration credentials page. Values are never shown again once saved; leave a field blank to keep what is stored. Saving an empty value clears the saved entry and falls back to the server environment.</div>
+        ${groups.map(g => `<div class="card"><div class="eyebrow">${esc(g)}</div><table>
+          ${c.items.filter(i => i.group === g).map(i => `<tr>
+            <td style="width:220px"><b>${esc(i.label)}</b><div class="muted" style="font-size:11px">${esc(i.hint ?? '')}</div></td>
+            <td style="width:130px">${badge(i.status)}</td>
+            <td><input type="${i.secret ? 'password' : 'text'}" id="cred-${esc(i.key)}"
+              placeholder="${i.status === 'unset' ? 'enter value' : 'enter new value to replace'}" autocomplete="off"></td>
+            <td style="width:90px"><button class="primary" data-credsave="${esc(i.key)}">Save</button></td>
+          </tr>`).join('')}</table></div>`).join('')}`;
+    } catch { /* not settings.manage; hide the credentials section */ }
     return `<h1>Settings</h1><div class="sub">Thresholds and weights the team can argue with, without a deploy</div>
       <div class="card"><table><tr><th>Key</th><th>Value</th><th>Description</th></tr>
       ${r.items.map(s => `<tr><td class="mono">${esc(s.key)}</td>
         <td class="mono" style="max-width:260px">${esc(JSON.stringify(s.value))}</td>
-        <td class="muted">${esc(s.description ?? '')}</td></tr>`).join('')}</table></div>`;
+        <td class="muted">${esc(s.description ?? '')}</td></tr>`).join('')}</table></div>
+      ${credsHtml}`;
   },
 
   async audit() {
@@ -541,7 +562,7 @@ document.addEventListener('click', (e) => {
   }
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout');
+  const b = e.target.closest('[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave]');
   if (!b) {
     const row = e.target.closest('tr[data-nav]');
     if (row) location.hash = '#/' + row.dataset.nav;
@@ -550,6 +571,14 @@ document.addEventListener('click', async (e) => {
   e.preventDefault();
   try {
     if (b.id === 'logout') return logout();
+    if (b.dataset.credsave) {
+      const input = document.getElementById('cred-' + b.dataset.credsave);
+      const value = (input?.value ?? '').trim();
+      b.disabled = true;
+      const r = await api('PUT', '/platform/credentials', { key: b.dataset.credsave, value });
+      toast(value ? 'Saved. Status: ' + r.status : 'Cleared. Status: ' + r.status);
+      return render();
+    }
     if (b.id === 'recompute') { await api('POST', '/demand/recompute'); toast('Demand board recomputed'); return render(); }
     if (b.dataset.tic) {
       b.disabled = true; b.textContent = 'Working…';

@@ -35,6 +35,7 @@ const S = {
   }).strict(),   // strict: a rewritten_text field is a schema failure by design
   cluster_labeller: z.object({ label_en: z.string(), label_am: z.string().nullable(),
     representative_question: z.string() }),
+  question_translator: z.object({ translation_en: z.string() }),
   creative_director: z.object({ concepts: z.array(z.object({
     title: z.string(), video_family: z.string(), hook_line: z.string(),
     premise: z.string(), treatment: z.string(), perspective: z.string().nullable().optional(),

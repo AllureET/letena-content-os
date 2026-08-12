@@ -33,6 +33,12 @@ before(async () => {
   await q(`UPDATE lcos.content_families SET origin_question_id=NULL
            WHERE origin_question_id IN (SELECT id FROM lcos.audience_questions WHERE source_hash LIKE 'test-%')`);
   await q(`DELETE FROM lcos.audience_questions WHERE source_hash LIKE 'test-%'`);
+  // Published rows accumulate across runs and flip the score-confidence
+  // heuristic from LOW (few peers) to FULL; each run starts from a clean slate.
+  await q(`DELETE FROM lcos.content_scores`);
+  await q(`DELETE FROM lcos.content_performance`);
+  await q(`UPDATE lcos.experiment_variants SET published_content_id=NULL`);
+  await q(`DELETE FROM lcos.published_content`);
 });
 after(async () => { await app.close(); await pool.end(); });
 
@@ -346,11 +352,19 @@ test('GOVERNANCE: PII in an agent payload blocks the call before dispatch', asyn
 });
 
 test('GOVERNANCE: approving a card without claims is refused with a named guard', async () => {
-  const card = await one(`SELECT id FROM lcos.knowledge_cards WHERE code='MEN-002'`);
+  // A dedicated empty shell: the seeded pilot cards may legitimately carry
+  // claims once the basics library is loaded, so the test brings its own.
+  await q(`DELETE FROM lcos.knowledge_cards WHERE code='TEST-EMPTY-1'`);
+  const topic = await one(`SELECT id FROM lcos.topics WHERE code='MEN'`);
+  const card = await one(
+    `INSERT INTO lcos.knowledge_cards (code, topic_id, canonical_question_en, status, risk_tier)
+     VALUES ('TEST-EMPTY-1', $1, 'test: empty card must not enter review', 'DRAFT', 'TIER_2')
+     RETURNING id`, [topic.id]);
   const res = await call('POST', `/api/v1/knowledge/cards/${card.id}/transition`, tokens.meddir,
     { to: 'IN_REVIEW' });
   assert.equal(res.statusCode, 422);
   assert.equal(res.json().guard, 'hasClaims');
+  await q(`DELETE FROM lcos.knowledge_cards WHERE id=$1`, [card.id]);
 });
 
 test('audit log recorded the whole journey', async () => {

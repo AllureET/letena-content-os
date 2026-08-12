@@ -132,6 +132,19 @@ export const azureSpeech = {
   },
 };
 
+// Voice preview TTS: hear a script's prepared spoken text without running a
+// production job. Mock mode (or a missing Azure key) writes a placeholder mp3
+// via the storage adapter; PRODUCTION with AZURE_SPEECH_KEY set calls the real
+// Azure am-ET voices.
+export async function previewTts({ text, voice = 'am-ET-MekdesNeural', previewId }) {
+  if (MOCK() || !cred('AZURE_SPEECH_KEY')) {
+    const key = `voice/previews/${previewId}.mp3`;
+    await storage.put(key, Buffer.from(`MOCK-VOICE-PREVIEW ${voice} ${text.slice(0, 160)}`));
+    return { status: 'SUCCEEDED', storage_key: key, cost_usd: 0, provider: 'MOCK' };
+  }
+  return azureSpeech.tts({ text, language: 'am-ET', voice, assetId: `previews/${previewId}` });
+}
+
 // Provider-agnostic TTS entry point. Amharic routes to Azure by default
 // (LCOS_TTS_PROVIDER overrides); English routes to ElevenLabs when a key
 // exists, else Azure.

@@ -53,6 +53,8 @@ const NAV = [
 
 function shell(active, content) {
   return `<div id="shell">
+    <div id="mtop"><button id="burger" aria-label="Open menu">&#9776;</button><span class="mark">letena<b>.</b>os</span></div>
+    <div id="navveil"></div>
     <nav id="side">
       <div class="mark">letena<b>.</b>os</div>
       ${NAV.map(([grp, items]) => `<div class="grp">${grp}</div>` +
@@ -531,6 +533,13 @@ const screens = {
 };
 
 // ---------- actions ----------
+// Mobile drawer: the burger toggles the sidebar, the veil or any nav link closes it.
+document.addEventListener('click', (e) => {
+  if (e.target.closest('#burger')) { document.body.classList.toggle('nav-open'); return; }
+  if (e.target.closest('#navveil') || e.target.closest('#side a')) {
+    document.body.classList.remove('nav-open');
+  }
+});
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout');
   if (!b) {

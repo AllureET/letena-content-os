@@ -13,7 +13,8 @@
     "api": "node apps/api/src/server.mjs",
     "demo": "node scripts/demo.mjs",
     "test": "node --test packages/*/test/*.test.mjs apps/api/test/*.test.mjs",
-    "seed:basics": "node packages/db/src/seed_basics.mjs"
+    "seed:basics": "node packages/db/src/seed_basics.mjs",
+    "seed:terminology": "node packages/db/src/seed_terminology.mjs"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

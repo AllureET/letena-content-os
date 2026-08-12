@@ -9,6 +9,15 @@ import { priorityScore, coverageState } from '../../../../packages/scoring/src/i
 const FORBIDDEN_KEYS = ['patient_id', 'matter_id', 'consult_id', 'alias', 'phone',
   'phone_number', 'name', 'full_name', 'email', 'telegram_id', 'platform_user_id', 'msisdn'];
 
+// Full-inquiry ingest (v2): a record may carry the clinician's answer and the
+// back-and-forth beyond the opening message. Thread segments are strictly
+// shaped so an exporter bug cannot smuggle an identifier in through a nested
+// object: only these keys, only these roles. 'note' = clinical note
+// (owner-approved as content material, Aug 2026).
+const THREAD_ROLES = ['patient', 'doctor', 'note'];
+const THREAD_KEYS = ['role', 'text', 'at'];
+const MAX_THREAD_SEGMENTS = 60;
+
 export default async function routes(app) {
   // ----- ingest (open route; HMAC or bearer question.ingest) -----
   app.post('/ingest/questions', async (req, reply) => {
@@ -38,13 +47,34 @@ export default async function routes(app) {
 
     // Forbidden keys reject the WHOLE batch, deliberately loud: one leaked
     // field means the exporting job is misconfigured and the rest is suspect.
+    // The scan covers thread segments too, and segments are additionally held
+    // to a strict shape (only role/text/at, only known roles) so a nested
+    // object can never carry an identifier past the top-level key check.
+    const rejectBatch = async (i, why) => {
+      await audit(null, { actor: { type: 'SYSTEM', label: 'ingest' }, action: 'ingest.rejected_forbidden_key',
+        objectType: 'INGEST_BATCH', reason: `record ${i}: ${why}` });
+      return reply.code(422).send(err(422, 'VALIDATION_ERROR',
+        `record ${i}: ${why}; whole batch rejected`));
+    };
     for (let i = 0; i < questions.length; i++) {
       for (const k of Object.keys(questions[i])) {
         if (FORBIDDEN_KEYS.includes(k.toLowerCase())) {
-          await audit(null, { actor: { type: 'SYSTEM', label: 'ingest' }, action: 'ingest.rejected_forbidden_key',
-            objectType: 'INGEST_BATCH', reason: `record ${i} carried forbidden key ${k}` });
-          return reply.code(422).send(err(422, 'VALIDATION_ERROR',
-            `record ${i} contains forbidden key "${k}"; whole batch rejected`));
+          return rejectBatch(i, `contains forbidden key "${k}"`);
+        }
+      }
+      const thread = questions[i].thread;
+      if (thread !== undefined) {
+        if (!Array.isArray(thread) || thread.length > MAX_THREAD_SEGMENTS) {
+          return rejectBatch(i, `thread must be an array of at most ${MAX_THREAD_SEGMENTS} segments`);
+        }
+        for (const seg of thread) {
+          if (typeof seg !== 'object' || seg === null || Array.isArray(seg)) {
+            return rejectBatch(i, 'thread segment is not an object');
+          }
+          for (const k of Object.keys(seg)) {
+            if (!THREAD_KEYS.includes(k)) return rejectBatch(i, `thread segment carries unexpected key "${k}"`);
+          }
+          if (!THREAD_ROLES.includes(seg.role)) return rejectBatch(i, `thread segment role must be one of ${THREAD_ROLES.join('/')}`);
         }
       }
     }
@@ -57,39 +87,88 @@ export default async function routes(app) {
       [body.batch_id ?? null, questions[0]?.channel ?? 'OTHER', sig ? 'letena.et' : 'manual',
        questions.length, req.actor?.id ?? null]);
 
-    let accepted = 0, duplicates = 0, quarantined = 0;
+    let accepted = 0, duplicates = 0, updated = 0, quarantined = 0;
     const ids = [];
+    const threshold = Number(await setting('deid.confidence_threshold', 0.85));
     for (const item of questions) {
       const text = String(item.text ?? '').trim();
       if (text.length < 3 || text.length > 4000) continue;
       const hash = item.source_hash
         ?? crypto.createHash('sha256').update('adhoc:' + text).digest('hex');
       // De-identify IN MEMORY before any insert. Raw text is never stored.
+      // Every part of the inquiry goes through the same scrubber: the opening
+      // question, the clinician's answer, and each thread segment. One low
+      // confidence anywhere quarantines the whole row; a partially-scrubbed
+      // inquiry is not safer than a partially-scrubbed question.
       const deid = deidentify(text);
-      const threshold = Number(await setting('deid.confidence_threshold', 0.85));
-      const status = deid.confidence >= threshold ? 'DEIDENTIFIED' : 'QUARANTINED';
+      let minConf = deid.confidence;
+
+      const answerRaw = String(item.answer_text ?? '').trim();
+      let answerText = null;
+      if (answerRaw.length >= 3) {
+        const d = deidentify(answerRaw.slice(0, 8000));
+        answerText = d.text.slice(0, 8000);
+        minConf = Math.min(minConf, d.confidence);
+      }
+
+      const threadClean = [];
+      for (const seg of item.thread ?? []) {
+        const segText = String(seg.text ?? '').trim();
+        if (segText.length < 3) continue;
+        const d = deidentify(segText.slice(0, 4000));
+        minConf = Math.min(minConf, d.confidence);
+        threadClean.push({ role: seg.role, text: d.text.slice(0, 4000) });
+      }
+
+      const consultMode = ['WRITTEN', 'PHONE'].includes(item.consult_mode) ? item.consult_mode : null;
+      const status = minConf >= threshold ? 'DEIDENTIFIED' : 'QUARANTINED';
       if (status === 'QUARANTINED') quarantined++;
       try {
         const row = await one(
           `INSERT INTO lcos.audience_questions (batch_id, channel, source_hash, sanitized_text,
              language, status, deid_confidence, deid_redactions, quarantine_reason,
-             category_hints, urgency_hint, captured_at)
+             category_hints, urgency_hint, captured_at,
+             answer_text, answered_at, thread, consult_mode)
            VALUES ($1, COALESCE($2,'OTHER')::lcos.ingest_channel, $3, $4,
-             $5::lcos.content_language, $6::lcos.question_status, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()))
+             $5::lcos.content_language, $6::lcos.question_status, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, now()),
+             $13, $14::timestamptz, $15::jsonb, $16)
            RETURNING id`,
           [batch.id, item.channel ?? null, hash, deid.text,
            ['EN','AM','OM','TI'].includes((item.language_hint ?? '').toUpperCase()) ? item.language_hint.toUpperCase() : null,
-           status, deid.confidence, JSON.stringify(deid.redactions),
+           status, minConf, JSON.stringify(deid.redactions),
            status === 'QUARANTINED' ? 'low de-identification confidence' : null,
-           item.category_hints ?? [], item.urgency_hint ?? null, item.captured_at ?? null]);
+           item.category_hints ?? [], item.urgency_hint ?? null, item.captured_at ?? null,
+           answerText, item.answered_at ?? null, JSON.stringify(threadClean), consultMode]);
         accepted++; ids.push(row.id);
       } catch (e) {
-        if (e.code === '23505') duplicates++; else throw e;
+        if (e.code !== '23505') throw e;
+        // Same source_hash seen before. If this record brings substance the
+        // stored row lacks (an answer, a fuller thread), attach it instead of
+        // dropping it: this is how the archive's answers and the v2 exporter's
+        // threads reach questions ingested earlier as bare text. A quarantined
+        // record never updates a clean row.
+        if (status !== 'QUARANTINED' && (answerText || threadClean.length)) {
+          const row = await one(
+            `UPDATE lcos.audience_questions SET
+               answer_text  = COALESCE($2::text, answer_text),
+               answered_at  = COALESCE($3::timestamptz, answered_at),
+               thread       = CASE WHEN jsonb_array_length($4::jsonb) > jsonb_array_length(thread)
+                                   THEN $4::jsonb ELSE thread END,
+               consult_mode = COALESCE($5::text, consult_mode),
+               updated_at   = now()
+             WHERE source_hash = $1
+               AND (($2::text IS NOT NULL AND answer_text IS DISTINCT FROM $2::text)
+                    OR jsonb_array_length($4::jsonb) > jsonb_array_length(thread))
+             RETURNING id`,
+            [hash, answerText, item.answered_at ?? null, JSON.stringify(threadClean), consultMode]);
+          if (row) { updated++; ids.push(row.id); continue; }
+        }
+        duplicates++;
       }
     }
     await q(`UPDATE lcos.ingest_batches SET accepted_count=$2, quarantined_count=$3, rejected_count=$4 WHERE id=$1`,
-      [batch.id, accepted, quarantined, duplicates]);
-    return reply.code(202).send({ batch_id: batch.id, accepted, duplicates, quarantined, question_ids: ids });
+      [batch.id, accepted + updated, quarantined, duplicates]);
+    return reply.code(202).send({ batch_id: batch.id, accepted, duplicates, updated, quarantined, question_ids: ids });
   });
 
   // ----- questions -----

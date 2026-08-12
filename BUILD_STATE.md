@@ -1,7 +1,107 @@
 # BUILD_STATE — Letena Content OS
 
-Authoritative resume point. Updated: 2026-08-11, session 2, increment 4.
-Tests: 78/78 green. Demo: 14 steps green. DEPLOYED TO LETENAV2 (all byte-verified after commit): phase82 migrations, cron_lcos_export.php, cron_lcos_backfill.php (NEW: legacy questions history), api/lcos/aggregates.php, content_os.php (live), lcos_export + lcos_backfill registered in the dispatch allowlist, cron.yml schedules both every 15 min, and the LCOS credentials card is LIVE on letena.et/integration_credentials.php (lib/integration_creds.php registry edit; verified rendering with all three fields). Remaining to activate: run phase82 via run_updates.php, paste the three lcos creds into the live LCOS card, and host LCOS on a VPS as its own repo (letena-content-os; repo exists, private, code upload pending).
+Authoritative resume point. Updated: 2026-08-12, session 2, increment 5 (domain, HTTPS, deploy key, menu link).
+Tests: 78/78 green. Demo: 14 steps green. DEPLOYED TO LETENAV2 (all byte-verified after commit): phase82 migrations, cron_lcos_export.php, cron_lcos_backfill.php (NEW: legacy questions history), api/lcos/aggregates.php, content_os.php (live), lcos_export + lcos_backfill registered in the dispatch allowlist, cron.yml schedules both every 15 min, and the LCOS credentials card is LIVE on letena.et/integration_credentials.php (lib/integration_creds.php registry edit; verified rendering with all three fields). DEPLOYED TO PRODUCTION 2026-08-11 night: Hetzner CX23 "lcos-1", 204.168.161.47, Helsinki, Ubuntu 24.04. Bootstrap via cloud-init (scripts/bootstrap-hetzner.sh; two live fixes: dpkg --configure -a for a postgres configure race, ALTER ROLE lcos CREATEROLE for the 0001 role grants). Service lcos-api active, UI live at http://204.168.161.47:8080, ufw allows 22+8080, all secrets minted on-server in /root/lcos-handoff.txt. phase82 confirmed applied on the EMR (run_updates: 173 applied, 0 pending). Repo upload complete (61/61 files). PIPELINE VERIFIED LIVE 2026-08-12 ~00:40 EAT: EMR exporter and legacy backfill both delivering 202-accepted batches to lcos-1. Fixed in the process: ingest HMAC now verified over RAW request bytes (PHP json_encode escaping differs from JSON.stringify; JS-only tests had masked it); admin password operator-set via scripts/reset-admin.mjs; ingest secret operator-set via scripts/set-ingest-secret.mjs (transcription-proof). DOMAIN + HTTPS LIVE 2026-08-12 ~03:00 EAT: lcos.letena.et A 204.168.161.47 added in the Ethio Telecom Hosting Portal (myportal.ethiotelecom.et, DNS module racent_zdns; the REAL zone lives there, NOT in Plesk, whose subscription has no DNS management; Plesk-created subdomains do land in that zone, which is how test.letena.et got there). Caddy 2.6.2 from Ubuntu universe on lcos-1, /etc/caddy/Caddyfile is just `lcos.letena.et { reverse_proxy 127.0.0.1:8080 }`, Let's Encrypt cert auto-issued, ufw allows 80+443, https://lcos.letena.et serves the UI. EMR card lcos_base_url updated to https://lcos.letena.et (saved 23:51 UTC); content_os.php shows connected with the HTTPS button. Content app sidebar now has a Content OS item (lib/content_nav.php, gated content.dashboard). Deploy key DONE: ed25519 key on lcos-1, added read-only to the GitHub repo (fingerprint SHA256:AnAJtRy50tO/DaHUYh3GwO226K8S/y+TIv1UjKtcXso); /root/.ssh/config aliases Host gh -> github.com, remote origin is gh:AllureET/letena-content-os.git, `git -C /opt/lcos pull` works with NO visibility flips ever again. Console craft learned the hard way: the Hetzner web console DROPS ALL MODIFIERS (every shifted symbol types as its unshifted key: @>2, :>;, {>[ etc.; Ctrl combos type the bare letter, so Ctrl+D never works) AND drops keystrokes beyond ~170 chars per typing burst. File delivery recipe that works: type `dd of=/tmp/x.hex bs=1 count=N` (N = exact byte count INCLUDING newlines; exact count replaces EOF), type hex in short bursts, then `xxd -r -ps /tmp/x.hex /target` — but rm the target first, xxd -r does NOT truncate. Verify with sha256sum. A stuck dd can only be cleared by the console's Ctrl+Alt+Del button (graceful VM reboot; root must log back in). Remaining: verify first ingest 202 arriving via https://lcos.letena.et (next cron), then optionally ufw deny 8080; team passwords in the LCOS Users screen; optional cleanup of the now-unused lcos subdomain + app.js relay inside Plesk (DNS bypasses it entirely).
+
+CRITICAL HOSTING FACTS (confirmed 2026-08-12 against the letena-emr-knowledge
+skill and live phpMyAdmin): the LIVE docroot for letena.et IS the
+test.letena.et folder (/data/var/www/vhosts/letena.et/test.letena.et);
+httpdocs exists but is orphaned and unserved. The LIVE database is
+letena_test_db (user letenaai1). letenaet_complete is the OLD pre-migration
+system's database, stale since 2026-03, and the live DB user has NO access to
+it (SELECT denied, verified). Never treat anything named test.letena.et as
+disposable. The only Plesk folder safe to remove from this session's work is
+lcos.letena.et (the abandoned relay: default site files + app.js).
+
+THE 140-QUESTIONS MYSTERY, SOLVED 2026-08-12: LCOS's 140 questions are the
+complete live dataset. unified_inbox had 153 messages ever (watermark
+inbox=153); 140 had text (3 WHATSAPP + 5 TELEGRAM + 132 MANUAL_ENTRY over 3
+batches). The live questions table holds only 9 rows (ids 1-103), so the
+legacy backfill finished in ONE run (watermark legacy_q=1). The real written
+Q&A archive is letenaet_complete.questions: 3,885 rows, 2025-03-03 to
+2026-03-09, every one inside 18 months, with question_text populated, and an
+answers table beside it. Import plan (awaiting Nate's go): grant the live DB
+user read access to letenaet_complete in Plesk Databases > User Management,
+then a cron_lcos_backfill_old.php walking letenaet_complete.questions
+newest-first with watermark k='legacy_q_old', same privacy contract.
+
+MOBILE UI SHIPPED 2026-08-12: lcos.letena.et admin UI is now responsive.
+index.html gained a mobile drawer (fixed #mtop topbar + burger, #side slides
+in under 860px, #navveil overlay, cards scroll tables horizontally, grid2
+stacks, 16px inputs against iOS zoom); app.js shell() renders #mtop/#navveil
+and a delegated click handler toggles body.nav-open. Deployed via deploy-key
+pull + service restart; index.html references /app.js?v=2 for cache busting.
+
+CREDENTIALS PAGE SHIPPED 2026-08-12 (Nate approved all three streams below):
+the LCOS Settings screen now has an "API keys and providers" section, the
+EMR-integration-credentials pattern: apps/api/src/creds.mjs (CRED_REGISTRY of
+21 keys across AI generation / Production services / Publishing; cred() reads
+DB-first env-fallback from lcos.settings rows keyed cred.<NAME> with
+is_secret=true; loadCreds() cache refreshed at boot and on save),
+GET/PUT /api/v1/platform/credentials (settings.manage gated, statuses only,
+never values, audit-logged), provider.mjs/gateway.mjs/adapters/index.mjs all
+read via cred() so saving a key or flipping LCOS_AI_PROVIDER/LCOS_ADAPTER_MODE
+takes effect WITHOUT a restart. 78/78 tests green after the change. One
+regression caught live: #navveil needed display:none outside the mobile media
+query or it consumed a desktop grid cell. Note: Chrome autofill fills random
+saved values into these inputs despite autocomplete=off; consider
+autocomplete=new-password on secret inputs later.
+
+OLD-ARCHIVE IMPORT SHIPPED 2026-08-12 ~12:05 UTC: cron_lcos_backfill_old.php
+live in letenav2 (walks `letenaet_complete`.`questions` cross-schema,
+newest-first 300/run, watermark k='legacy_q_old', source_hash namespace
+sha256(salt:legacy_old:id), graceful exit-0 skip while the DB grant is
+missing so runs never fail); registered as job=lcos_backfill_old in
+api/cron/dispatch.php and scheduled every 15 min in cron.yml. Plesk grant
+DONE: DB user letenaai1 changed from letena_test_db-only to "Any database"
+(covers letenaet_complete; all within the same subscription). Expect the
+~3,885-question archive to drain in ~13 cron cycles (~3.5 h). These batches
+travel via https://lcos.letena.et, which doubles as the HTTPS-path proof.
+The old DB's answers table is NOT exported yet; answers ride in with the
+full-inquiry export v2 (update-capable ingest keyed by source_hash).
+2. FULL-INQUIRY EXPORT V2 (Nate said go; his words: "export our past 2000
+   full inquiries"): consult-level export covering BOTH started_mode written
+   AND phone, carrying the whole back-and-forth (multi-turn patient/doctor
+   thread), not just first message: for written consults assemble patient
+   messages (unified_inbox / clarification threads) + doctor replies
+   (answers); for phone consults the material is clinical notes, which is
+   deeper PHI, so decide deliberately what phone consults contribute
+   (candidates: category + ai_triage_results.message_summary + outcome, not
+   raw notes) and flag to Dr. Ousman if in doubt.
+   OWNER DECISION (Nate, 2026-08-12): clinical notes ARE approved as export
+   material for phone consults. His reasoning: names etc are not shared, he
+   wants the most accurate content engine possible from the data in hand,
+   and the medical notes double as an accuracy check on generated content.
+   So export note text through the same deid pipe (identifiers stripped on
+   arrival, clinical substance kept), not summaries only. LCOS side: additive
+   migration (thread jsonb / answer_text on audience_questions or a new
+   inquiries table), ingest contract extension, deid every segment on
+   arrival, same HMAC pipe. Doctor answers can seed knowledge cards.
+   ai_triage_results.message_summary solves the "hello doctor" greeting
+   problem for the summary field.
+
+PRODUCT DIRECTION (Nate, 2026-08-12): first inbox messages are often just
+greetings ("hello doctor", "can I ask a question"), so single-message export
+is weak raw material. Wanted: consult-level export carrying the back and
+forth and the doctor's ANSWER (see letena_test_db consult/answers/
+clarification_threads; ai_triage_results.message_summary already distills
+the real question). Design sketch: exporter v2 posts per-consult Q&A pairs
+(summary or concatenated patient side + answer text), LCOS ingest contract
+gains optional answer/summary fields (additive migration), same HMAC and
+PII-stripping path; doctor answers can seed knowledge cards. Not built yet.
+
+## Backfill + HTTPS verification outcome (12 Aug, afternoon)
+
+VERIFIED FLOWING. After the Plesk grant (letenaai1 -> Any database, ~12:05
+UTC) the old-archive job's probe passes and cron_lcos_backfill_old.php posts
+up to 300 archive questions per 15-minute cycle. Dashboard questions_24h
+climbed 140 -> 441 within the first cycles, heading toward ~4,000 over
+~3.5h. journalctl on lcos-1 shows the ingest POSTs arriving with hostname
+lcos.letena.et and remoteAddress 127.0.0.1, i.e. through Caddy over HTTPS,
+which closes the pending HTTPS-path verification (earlier entries still show
+the old direct 204.168.161.47:8080 path for contrast). letenav2 Actions
+runs all green. Port 8080 can now be closed (ufw delete allow 8080/tcp);
+offered to Nate, not yet executed.
 
 ## Historical backfill (increment 4)
 
@@ -23,12 +123,76 @@ country/address/phone/username/passcode/user_id/remarks/answers. Channel from
 social_media_platform, default WEBSITE. source_hash =
 sha256(salt:legacy_q:id), a distinct namespace from inbox ids.
 
+## THE PIVOT (owner decision, Nate, 12 Aug 2026) — read this first
+
+Nate's words: the per-piece multi-role review chain was "going overboard...
+imaginary safeguards. Cancel that." The operating model is now: **doctors
+approve FACTS once (knowledge cards); the machine generates, claim-checks
+against the approved card, and content flows by `publishing.mode`**:
+
+- `DRAFT_BATCH` (start mode): everything queues; ONE click approves the
+  batch; each rendered item gets a Publish button (Telegram live) plus
+  copy-caption and download for channels without API keys yet.
+- `AUTO_EXCEPT_SENSITIVE`: tiers 1-3 self-approve, TIER_4 (abortion, GBV)
+  still gets one human look.
+- `FULL_AUTO`: everything from an approved card flows.
+
+Mode is a Settings dropdown (migration 0005 seeds it; PUT /platform/settings
+edits it). What did NOT get cut: deid at ingest (invisible, costs nothing)
+and claim validation against approved cards (it is what makes automation
+safe). SHIPPED AND LIVE 12 Aug: batch-approve endpoint
+(POST /reviews/batch-approve, also clears succeeded renders' final look),
+GET /distribution/queue aggregate, the Queue screen (approve all → produce
+all → publish/copy/download → recently published), publishing-mode card in
+Settings, Azure Speech + TikTok credential fields.
+
+Also SHIPPED AND LIVE 12 Aug — ingest v2 (full inquiries): migration 0004
+adds answer_text / answered_at / thread jsonb / consult_mode to
+audience_questions; /ingest/questions accepts answer_text + thread
+(role patient|doctor|note, strict shape, every segment through deidentify(),
+one low confidence quarantines the whole row) and is UPDATE-CAPABLE on a
+known source_hash (attaches answers/threads to rows ingested earlier as bare
+text; quarantined records never update clean rows). 82/82 tests green.
+Owner approved clinical notes as content material (role 'note').
+
+ALSO SHIPPED AND LIVE 12 Aug — the basics knowledge library: 16 real
+sources (3 WHO fact sheets, Ethiopian FMOH FP guideline 2020, 8 NHS pages,
+4 CDC pages, every claim cited to a page actually fetched), 86 claims, all
+20 pilot cards now carry claims + an EN canonical answer + an Amharic
+canonical answer + key points + prohibited claims + referral conditions.
+Data files packages/db/src/basics_facts.json + basics_amharic.json, seeder
+seed_basics.mjs (npm run seed:basics, idempotent, never touches APPROVED).
+Seeded on the server: everything IN_REVIEW. Doctors approve on the Cards
+screen: per-card "Approve facts + card" or one "Approve all 20 + their
+facts" button (POST /knowledge/cards/:id/approve-with-claims approves
+attached claims the actor did not author, then runs the card through the
+normal state machine so its guards still hold). Console gotcha learned:
+`:` and `_` both drop on the Hetzner console; ran the seeder via
+node + backtick-grep substitution.
+
+Remaining owner asks captured 12 Aug (in flight):
+1. DONE (see above) — basics knowledge cards await the doctors' click.
+2. English-first UI everywhere (Nate cannot read Amharic): store an EN
+   translation for Amharic text, show EN by default with the original a tap
+   away; handle Amharish (Latin-script Amharic); TMEM stays on the roadmap.
+3. Real drill-downs: dashboard tiles → filtered lists → question → full
+   conversation view (data layer for this is ingest v2, done).
+4. UI overhaul with the ui-ux-pro-max skill against the EMR brand kit
+   (Nate: colors are token-matched but it doesn't feel like the EMR).
+5. EMR-side full-inquiry exporter v2 (threads + answers + clinical notes
+   for written AND phone consults) feeding ingest v2.
+6. Publish-path niceties: OneDrive/accessible store for manual-channel
+   packages (Nate: "maybe even storing it on our one drive").
+
+What only Nate can do: enter ANTHROPIC_API_KEY (+ OPENAI_API_KEY for
+embeddings) on Settings → API keys; then content generation goes real.
+
 ## Current phase
 
 MVP core complete + breadth increment complete: publishing calendar and
 automation sweeps, terminology + structured language review, asset library
 with upload/search/generation, experiments + weekly report, security
-hardening (rate limits, headers, TOTP).
+hardening (rate limits, headers, TOTP). Pivot increment (above) live.
 
 ## Engineering decisions taken this session
 
@@ -142,21 +306,17 @@ claims, reviewer) → analytics (honest nulls) → scores → demand recompute.
    migration 0003 seeds extracted_topic slug mappings (31 total). PHP lint
    clean on both files.
 
-## Next five tasks
+## Next tasks (post-pivot order; items 1-6 in THE PIVOT section come first)
 
-1. Deploy the EMR exporter into letenav2 (Nate or a browser session: number
-   the migration against the highest phaseNN, upload via GitHub web editor
-   per EMR rules, register cron job, enter credentials via
-   integration_credentials.php; note config/cron_auth.php must exist first)
-2. WF12-style asset binding in the production router: search library for
+1. Knowledge cards basics library (pivot item 1) — the content blocker.
+2. English-first UI + drill-downs + ui-ux-pro-max pass (pivot items 2-4).
+3. EMR full-inquiry exporter v2 (pivot item 5).
+4. WF12-style asset binding in the production router: search library for
    scene_plan asset_requirements and bind storage keys into the Creatomate
    payload (currently typography-only modifications ship)
-3. Quarantine purge job (14-day rule) + questions text purge at 24 months
-   (retention policy from LCOS_02 section 7)
-4. Publishing platform variants: per-platform caption/title from
-   script_versions.platform_variants applied on publishing jobs
-5. Experiment variant auto-attach: link published_content into running
-   experiments by family + variable, fill primary_metric_value on conclude
+5. Quarantine purge job (14-day rule) + questions text purge at 24 months;
+   experiment variant auto-attach; platform variants already apply on
+   publishing jobs.
 
 ## Outstanding blockers (need Nate)
 - Meta App Review / Business Verification still gates live Meta publishing

@@ -202,6 +202,30 @@ export async function buildServer() {
       const r = await q(`SELECT key, value, description FROM lcos.settings WHERE NOT is_secret ORDER BY key`);
       return { items: r.rows };
     });
+    // Editable operational settings. Non-secret keys only; cred.* goes through
+    // the credentials route. publishing.mode gets its values validated so a
+    // typo cannot silently turn review off.
+    v1.put('/platform/settings', async (req, reply) => {
+      if (!req.actor.permissions.includes('settings.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'settings.manage'));
+      }
+      const { key, value } = req.body ?? {};
+      if (!key || String(key).startsWith('cred.')) {
+        return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'bad settings key'));
+      }
+      if (key === 'publishing.mode'
+          && !['DRAFT_BATCH', 'AUTO_EXCEPT_SENSITIVE', 'FULL_AUTO'].includes(value)) {
+        return reply.code(422).send(err(422, 'VALIDATION_ERROR',
+          'publishing.mode must be DRAFT_BATCH, AUTO_EXCEPT_SENSITIVE or FULL_AUTO'));
+      }
+      const row = await q(
+        `UPDATE lcos.settings SET value=$2::jsonb, updated_by=$3, updated_at=now()
+         WHERE key=$1 AND NOT is_secret RETURNING key`,
+        [key, JSON.stringify(value), req.actor.id ?? null]);
+      if (!row.rows.length) return reply.code(404).send(err(404, 'NOT_FOUND', 'unknown setting'));
+      await audit(null, { actor: req.actor, action: 'setting.updated', objectType: 'SETTING', objectCode: key });
+      return { ok: true, key, value };
+    });
     // Provider credentials: statuses only, never values. settings.manage gated.
     v1.get('/platform/credentials', async (req, reply) => {
       if (!req.actor.permissions.includes('settings.manage')) {

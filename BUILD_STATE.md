@@ -1,5 +1,39 @@
 # BUILD_STATE — Letena Content OS
 
+BULK GENERATION SHIPPED 2026-08-12 (Nate decision: "I don't want to have to
+approve knowledge cards anymore... generate content automatically... human
+approval each step of the way, IE script, ie video"). Root cause of "why do
+I have to click one question at a time": classifyQuestion() only ever ran
+per-question, on demand; the EMR backfill landed thousands of questions but
+nothing swept them, so they piled up at DEIDENTIFIED and never reached a
+cluster or the gap board (confirmed live: one cluster total, gap board
+empty after recompute, against thousands ingested). planner.auto_commission
+turned out to be dead: it only exists in the WF05 n8n doc, never wired into
+the real API (Turn Into Content runs in-process by design, n8n was never
+actually deployed for sweeps).
+Two new pieces: POST /questions/classify-pending (apps/api/src/modules/
+demand.mjs, cluster.manage-gated) walks up to 500 DEIDENTIFIED questions
+newest-first per call and classifies them, which also triggers clustering
+(assignCluster already runs inside classifyQuestion, so this alone
+populates the cluster and gap boards). bulkCommission() + POST
+/content/bulk-commission (apps/api/src/modules/content.mjs,
+question.turn_into_content-gated) loops the top N (default 10, capped 25)
+knowledge cards with real cluster demand behind them -- approved or not --
+through generateContent() with the full active output-type spread (9
+formats). Requires admin actor + approval.override=ADMIN_TEST_MODE to
+reach unapproved cards, same door as the existing single-card override;
+unapproved-card output carries is_test_content=true same as before.
+Deliberately unchanged: resolveCardForGeneration()'s admin+test-mode guard,
+and executePublish()'s card.status='APPROVED' re-check at publish time --
+Nate confirmed clinical review still happens at script (EN+AM) and final
+output (EN+AM) review, by medical and content teams, so the human
+checkpoint moves later in the pipeline rather than disappearing. UI:
+"Classify pending questions" button on Question clusters, "Generate
+content now" button on Coverage gaps (apps/web/app.js). NOT run against a
+live DB in this sandbox (no Postgres here) -- node --check clean on all
+three files, verify live on lcos.letena.et after deploy the way every prior
+increment this session was verified.
+
 Authoritative resume point. Updated: 2026-08-12, session 2, increment 5 (domain, HTTPS, deploy key, menu link).
 Tests: 78/78 green. Demo: 14 steps green. DEPLOYED TO LETENAV2 (all byte-verified after commit): phase82 migrations, cron_lcos_export.php, cron_lcos_backfill.php (NEW: legacy questions history), api/lcos/aggregates.php, content_os.php (live), lcos_export + lcos_backfill registered in the dispatch allowlist, cron.yml schedules both every 15 min, and the LCOS credentials card is LIVE on letena.et/integration_credentials.php (lib/integration_creds.php registry edit; verified rendering with all three fields). DEPLOYED TO PRODUCTION 2026-08-11 night: Hetzner CX23 "lcos-1", 204.168.161.47, Helsinki, Ubuntu 24.04. Bootstrap via cloud-init (scripts/bootstrap-hetzner.sh; two live fixes: dpkg --configure -a for a postgres configure race, ALTER ROLE lcos CREATEROLE for the 0001 role grants). Service lcos-api active, UI live at http://204.168.161.47:8080, ufw allows 22+8080, all secrets minted on-server in /root/lcos-handoff.txt. phase82 confirmed applied on the EMR (run_updates: 173 applied, 0 pending). Repo upload complete (61/61 files). PIPELINE VERIFIED LIVE 2026-08-12 ~00:40 EAT: EMR exporter and legacy backfill both delivering 202-accepted batches to lcos-1. Fixed in the process: ingest HMAC now verified over RAW request bytes (PHP json_encode escaping differs from JSON.stringify; JS-only tests had masked it); admin password operator-set via scripts/reset-admin.mjs; ingest secret operator-set via scripts/set-ingest-secret.mjs (transcription-proof). DOMAIN + HTTPS LIVE 2026-08-12 ~03:00 EAT: lcos.letena.et A 204.168.161.47 added in the Ethio Telecom Hosting Portal (myportal.ethiotelecom.et, DNS module racent_zdns; the REAL zone lives there, NOT in Plesk, whose subscription has no DNS management; Plesk-created subdomains do land in that zone, which is how test.letena.et got there). Caddy 2.6.2 from Ubuntu universe on lcos-1, /etc/caddy/Caddyfile is just `lcos.letena.et { reverse_proxy 127.0.0.1:8080 }`, Let's Encrypt cert auto-issued, ufw allows 80+443, https://lcos.letena.et serves the UI. EMR card lcos_base_url updated to https://lcos.letena.et (saved 23:51 UTC); content_os.php shows connected with the HTTPS button. Content app sidebar now has a Content OS item (lib/content_nav.php, gated content.dashboard). Deploy key DONE: ed25519 key on lcos-1, added read-only to the GitHub repo (fingerprint SHA256:AnAJtRy50tO/DaHUYh3GwO226K8S/y+TIv1UjKtcXso); /root/.ssh/config aliases Host gh -> github.com, remote origin is gh:AllureET/letena-content-os.git, `git -C /opt/lcos pull` works with NO visibility flips ever again. Console craft learned the hard way: the Hetzner web console DROPS ALL MODIFIERS (every shifted symbol types as its unshifted key: @>2, :>;, {>[ etc.; Ctrl combos type the bare letter, so Ctrl+D never works) AND drops keystrokes beyond ~170 chars per typing burst. File delivery recipe that works: type `dd of=/tmp/x.hex bs=1 count=N` (N = exact byte count INCLUDING newlines; exact count replaces EOF), type hex in short bursts, then `xxd -r -ps /tmp/x.hex /target` — but rm the target first, xxd -r does NOT truncate. Verify with sha256sum. A stuck dd can only be cleared by the console's Ctrl+Alt+Del button (graceful VM reboot; root must log back in). Remaining: verify first ingest 202 arriving via https://lcos.letena.et (next cron), then optionally ufw deny 8080; team passwords in the LCOS Users screen; optional cleanup of the now-unused lcos subdomain + app.js relay inside Plesk (DNS bypasses it entirely).
 

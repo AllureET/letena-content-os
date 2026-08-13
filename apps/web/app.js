@@ -223,6 +223,9 @@ const screens = {
     const r = await api('GET', '/clusters');
     const cardIds = await cardCodeMap();
     return `<h1>Question clusters</h1><div class="sub">Semantically similar questions, kept apart when answers differ. Click a matched cluster to open its card.</div>
+      <div class="flex" style="margin-bottom:10px">
+        ${can('cluster.manage') ? '<button id="classify-pending">Classify pending questions</button>' : ''}
+        <span class="muted">Groups the newest 100 unclassified questions into clusters. Run it a few times to work through a large backlog.</span></div>
       <div class="card"><table>
       <tr><th>Cluster</th><th>Representative question</th><th>Topic</th><th>Card</th><th>Members</th><th>Last seen</th></tr>
       ${r.items.map(i => {
@@ -241,7 +244,9 @@ const screens = {
     return `<h1>Coverage gaps</h1>
       <div class="sub">What Ethiopia is asking against what Letena has published. This board sets the calendar. Rows with a matched card open it.</div>
       <div class="flex" style="margin-bottom:10px">
-        ${can('settings.manage') ? '<button id="recompute">Recompute now</button>' : ''}</div>
+        ${can('settings.manage') ? '<button id="recompute">Recompute now</button>' : ''}
+        ${can('question.turn_into_content') ? '<button id="bulk-commission">Generate content now</button>' : ''}</div>
+      <div class="sub">Generate content now runs the top 10 gap-flagged topics through the full output spread, unapproved cards included as test content (requires admin test mode on in Settings). Nothing it makes can publish until a card is approved or a human clears it in review.</div>
       <div class="card"><table>
       <tr><th>Topic</th><th>Card</th><th>Question</th><th>Questions 30d</th><th>Content 90d</th><th>State</th><th>Priority</th></tr>
       ${items.map(g => {
@@ -800,16 +805,22 @@ const screens = {
           <td class="muted" style="font-size:11.5px">${esc(p.format_notes ?? '')}</td></tr>`).join('')
         || '<tr><td colspan=6 class="empty">No specs seeded yet.</td></tr>'}</table></div>`;
     } catch { /* publish.read missing; hide */ }
-    return `<h1>Settings</h1><div class="sub">Thresholds and weights the team can argue with, without a deploy</div>
+    // Raw settings dump is reference-only, nothing on this table is clicked
+    // or edited day to day, so it sits last, after every screen someone
+    // actually acts on (override, publishing mode, tone, specs, API keys).
+    const rawTableHtml = `<h1 style="margin-top:26px">All settings (raw)</h1>
+      <div class="sub">Every key/value this instance holds, for reference. Thresholds and weights the team can argue with, without a deploy.</div>
+      <div class="card"><table><tr><th>Key</th><th>Value</th><th>Description</th></tr>
+      ${r.items.map(s => `<tr><td class="mono">${esc(s.key)}</td>
+        <td class="mono" style="max-width:260px;overflow-wrap:anywhere">${esc(JSON.stringify(s.value))}</td>
+        <td class="muted">${esc(s.description ?? '')}</td></tr>`).join('')}</table></div>`;
+    return `<h1>Settings</h1><div class="sub">What the team can actually change, without a deploy</div>
       ${overrideHtml}
       ${pmHtml}
       ${toneHtml}
-      <div class="card"><table><tr><th>Key</th><th>Value</th><th>Description</th></tr>
-      ${r.items.map(s => `<tr><td class="mono">${esc(s.key)}</td>
-        <td class="mono" style="max-width:260px">${esc(JSON.stringify(s.value))}</td>
-        <td class="muted">${esc(s.description ?? '')}</td></tr>`).join('')}</table></div>
       ${specsHtml}
-      ${credsHtml}`;
+      ${credsHtml}
+      ${rawTableHtml}`;
   },
 
   async audit() {
@@ -883,6 +894,22 @@ document.addEventListener('click', async (e) => {
       return render();
     }
     if (b.id === 'recompute') { await api('POST', '/demand/recompute'); toast('Demand board recomputed'); return render(); }
+    if (b.id === 'classify-pending') {
+      b.disabled = true; toast('Classifying the newest 100 pending questions...');
+      try {
+        const r = await api('POST', '/questions/classify-pending', { limit: 100 });
+        toast(`Classified ${r.classified}/${r.attempted}${r.failed ? `, ${r.failed} failed` : ''}. Run again to keep working through the backlog.`);
+      } catch (e) { toast(e.message ?? 'Classification sweep failed', 'warn'); }
+      return render();
+    }
+    if (b.id === 'bulk-commission') {
+      b.disabled = true; toast('Generating content for the top gap-flagged topics...');
+      try {
+        const r = await api('POST', '/content/bulk-commission', { limit: 10 });
+        toast(`Commissioned ${r.commissioned}/${r.candidates_considered} topics, ${r.total_pieces} pieces. Check Scripts for review.`);
+      } catch (e) { toast(e.message ?? 'Bulk commission failed', 'warn'); }
+      return render();
+    }
     if (b.id === 'pm-save') {
       const value = $('#pubmode').value;
       await api('PUT', '/platform/settings', { key: 'publishing.mode', value });

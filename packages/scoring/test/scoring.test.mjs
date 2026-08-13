@@ -69,6 +69,37 @@ test('overlay catches prohibited claim in different wording', () => {
   assert.ok(f.some(x => x.code === 'PROHIBITED_CLAIM'));
 });
 
+// Regression cases for the 2026-08-12 fix, real bug hit while testing
+// card CON-001 (condom effectiveness): the old flat trigram-containment
+// check on prohibited claims both flagged a safe sentence and would have
+// missed the actual violation it exists to catch.
+const CONDOM_CARD = {
+  prohibited_claims: ['Never claim condoms are 100% effective against pregnancy or all STIs',
+    'Never say lubricant type does not matter with latex condoms'],
+  approved_ctas: ['Message Letena on Telegram to talk to a doctor privately. It is free.'],
+  referral_conditions: [],
+};
+const CONDOM_CLAIMS = [
+  { claim_text_en: 'Used perfectly every time, condoms are up to 98% effective at preventing pregnancy.', certainty: 'ESTABLISHED' },
+  { claim_text_en: 'With typical real-life use they are about 82% effective.', certainty: 'ESTABLISHED' },
+];
+
+test('prohibited-claim check does not flag an unrelated, correct sentence', () => {
+  const f = validatorOverlay({
+    scriptText: 'Condoms prevent pregnancy and infection by acting as a barrier; laboratory '
+      + 'studies show latex condoms provide an effective barrier against even the smallest '
+      + 'STD pathogens. Condoms are up to 98% effective at preventing pregnancy when used perfectly.',
+    claims: CONDOM_CLAIMS, card: CONDOM_CARD, riskTier: 'TIER_3', cta: CONDOM_CARD.approved_ctas[0] });
+  assert.ok(!f.some(x => x.code === 'PROHIBITED_CLAIM'), JSON.stringify(f));
+});
+
+test('prohibited-claim check catches the actual 100% overclaim', () => {
+  const f = validatorOverlay({
+    scriptText: 'Condoms are 100% effective at preventing pregnancy.',
+    claims: CONDOM_CLAIMS, card: CONDOM_CARD, riskTier: 'TIER_3', cta: CONDOM_CARD.approved_ctas[0] });
+  assert.ok(f.some(x => x.code === 'PROHIBITED_CLAIM' && x.severity === 'BLOCKER'), JSON.stringify(f));
+});
+
 test('tier 4 without referral phrase is blocked', () => {
   const f = validatorOverlay({
     scriptText: 'This is very serious information about your safety only.',

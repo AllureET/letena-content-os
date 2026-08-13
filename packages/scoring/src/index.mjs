@@ -98,6 +98,16 @@ export function extractTimeWindows(text) {
   return [...(text.matchAll(TIME_RE))].map(m => `${m[1]} ${m[2].toLowerCase()}`);
 }
 
+// A prohibited-claims entry is normally phrased as an instruction, "Never
+// claim X" or "Never say X". The actual assertion to check for is X, not
+// the wrapper. Stripping the wrapper keeps the wrapper's own vocabulary
+// (the word "never" itself, for instance) from diluting or contaminating
+// the similarity check below.
+const PROHIBITION_PREFIX = /^\s*(never|do\s*not|don.?t|avoid)\s+(claim|say|state|imply|suggest)(\s+that)?\s+/i;
+export function coreProhibitedAssertion(p) {
+  return p.replace(PROHIBITION_PREFIX, '').trim();
+}
+
 function trigramSet(s) {
   const t = s.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, ' ').replace(/\s+/g, ' ').trim();
   const grams = new Set();
@@ -144,14 +154,45 @@ export function validatorOverlay({ scriptText, claims, card, riskTier, cta, pres
         explanation: `The time expression "${t}" does not appear in any approved claim.` });
     }
   }
-  // Prohibited claims: trigram match against the card's prohibited list.
-  // Entries are plain strings from the demo/manual seed, or
-  // {reason, statement} objects from the basics-library seed; normalize.
+  // Prohibited claims: match against the card's prohibited list. Entries
+  // are plain strings from the demo/manual seed, or {reason, statement}
+  // objects from the basics-library seed; normalize.
+  //
+  // Trigram containment of the FULL "Never claim X" sentence against each
+  // script sentence used to be the whole check, at a flat 0.6 threshold.
+  // That was unreliable in both directions, confirmed against a real case
+  // 2026-08-12 (card CON-001, condom effectiveness): a sentence about the
+  // barrier mechanism and lab studies, with no percentage in it at all,
+  // scored 0.615 and got wrongly blocked, while a sentence that actually
+  // said "condoms are 100% effective" scored only 0.538 and would have
+  // sailed through. Ordinary shared vocabulary ("condoms", "effective",
+  // "pregnancy") moves that score more than the one distinguishing token
+  // ("100%") does, since the token is a small fraction of the needle's
+  // trigrams either way.
+  //
+  // Fixed by anchoring on the distinguishing part of the claim instead of
+  // the sentence as a whole. Most prohibited claims exist to rule out a
+  // specific number or absolute qualifier (100%, always, guaranteed, ...).
+  // When the core assertion has one of those, the sentence must contain
+  // that same anchor to be flagged at all, on top of a moderate topical
+  // floor so a stray, unrelated "100" elsewhere can't trigger it alone.
+  // When the assertion has no such anchor (e.g. "lubricant type does not
+  // matter"), there is nothing precise to anchor on, so it falls back to
+  // trigram containment of the core assertion at the original 0.6 bar.
   for (const entry of card?.prohibited_claims ?? []) {
     const p = typeof entry === 'string' ? entry : entry?.statement;
     if (!p) continue;
+    const core = coreProhibitedAssertion(p);
+    const anchors = [...extractNumbers(core),
+      ...(core.match(new RegExp(ABSOLUTES.source, 'gi')) ?? [])]
+      .map(a => a.toLowerCase().replace(/\s+/g, ''));
     for (const sentence of scriptText.split(/(?<=[.!?።])\s+/)) {
-      if (sentence.length > 15 && trigramContainment(p, sentence) >= 0.6) {
+      if (sentence.length <= 15) continue;
+      const containment = trigramContainment(core, sentence);
+      const matches = anchors.length
+        ? anchors.some(a => sentence.toLowerCase().replace(/\s+/g, '').includes(a)) && containment >= 0.35
+        : containment >= 0.6;
+      if (matches) {
         findings.push({ code: 'PROHIBITED_CLAIM', severity: 'BLOCKER',
           statement: sentence.slice(0, 200),
           explanation: `Matches prohibited claim: "${p}"` });

@@ -262,6 +262,23 @@ export default async function routes(app) {
       return reply.code(status).send(err(status, e.code ?? 'PIPELINE_ERROR', e.message, e.guard ? { guard: e.guard } : {}));
     }
   });
+
+  // Bulk commission from real demand, unapproved cards included -- see
+  // bulkCommission() above for the owner decision this implements. Gated on
+  // the same capability as the other generation entry points; bulkCommission
+  // itself enforces admin + ADMIN_TEST_MODE before it will touch a card
+  // nobody has approved.
+  app.post('/content/bulk-commission', { preHandler: requirePerm('question.turn_into_content') }, async (req, reply) => {
+    const { limit = 10, output_types = null } = req.body ?? {};
+    try {
+      const result = await bulkCommission({ limit, outputTypes: output_types, actor: req.actor });
+      return reply.code(202).send(result);
+    } catch (e) {
+      const status = e.status ?? 500;
+      if (status >= 500) req.log.error(e);
+      return reply.code(status).send(err(status, e.code ?? 'PIPELINE_ERROR', e.message, e.guard ? { guard: e.guard } : {}));
+    }
+  });
 }
 
 // ============ card resolution (approval gate + admin test-mode override) ============
@@ -539,6 +556,79 @@ export async function generateContent({ cardId, conceptId, outputTypes, question
     is_test_content: isTestContent, tone_preset: effectiveTone, risk_tier: family.risk_tier,
     concepts: conceptRows.map(c => ({ id: c.id, code: c.code, title: c.title, video_family: c.video_family })),
     scripts, steps };
+}
+
+// ============ bulk commission (owner decision, 12 Aug 2026) ============
+
+// Nate's words: "I don't want to have to approve knowledge cards anymore...
+// I just want to generate content automatically. We don't have to put it
+// out until it gets human approval each step of the way, IE script, ie
+// video, etc." This is the bulk driver for that: instead of one
+// Turn Into Content click per question, it loops over every knowledge card
+// that has real question demand behind it -- approved or not -- and
+// generates a full spread of output types for each.
+//
+// What this does NOT change: resolveCardForGeneration() still requires
+// approval.override='ADMIN_TEST_MODE' plus an admin actor to touch an
+// unapproved card, exactly the door Nate had built for himself weeks ago to
+// test without waiting on Dr. Ousman; content made that way still carries
+// is_test_content=true; and executePublish() in distribution.mjs still
+// re-checks card.status='APPROVED' at publish time no matter how the
+// content was generated. So bulk commission can run against the entire
+// backlog, unapproved cards included, and nothing it makes can reach a
+// real user until a card is approved or a human clears it downstream --
+// the human checkpoint just moves to the script/render review Nate
+// described instead of sitting in front of generation.
+export async function bulkCommission({ limit = 10, outputTypes = null, actor }) {
+  if (!actor?.roles?.includes('admin')) {
+    const e = new Error('bulk commission requires an admin actor: it is the same door as the single-card admin test-mode override, just looped');
+    e.status = 403; e.code = 'FORBIDDEN'; e.guard = 'adminOnlyBulk'; throw e;
+  }
+  const override = String(await setting('approval.override', 'OFF'));
+  if (override !== 'ADMIN_TEST_MODE') {
+    const e = new Error('approval.override must be ADMIN_TEST_MODE for bulk commission to reach cards nobody has approved yet -- flip it on the Settings screen first');
+    e.status = 422; e.code = 'GUARD_FAILED'; e.guard = 'adminTestModeRequired'; throw e;
+  }
+  const boundedLimit = Math.min(Math.max(Number(limit) || 10, 1), 25);
+  const types = (Array.isArray(outputTypes) && outputTypes.length) ? outputTypes
+    : (await q(`SELECT code FROM lcos.content_output_types WHERE is_active ORDER BY sort_order`)).rows.map(r => r.code);
+
+  // Candidates: any non-retired card with a real question cluster behind
+  // it, ranked by the latest priority score when one exists (falls back to
+  // raw question volume for cards /demand/recompute hasn't scored yet).
+  // The 14-day guard against a card that already got a family stops the
+  // same card from being re-commissioned every time this runs.
+  const candidates = (await q(
+    `SELECT kc.id, kc.code, kc.status, count(DISTINCT qc.id)::int AS cluster_count,
+            count(DISTINCT qcm.question_id)::int AS question_count,
+            COALESCE(max(tps.priority_score), 0) AS priority_score
+     FROM lcos.knowledge_cards kc
+     JOIN lcos.question_clusters qc ON qc.knowledge_card_id = kc.id AND qc.is_active
+     LEFT JOIN lcos.question_cluster_members qcm ON qcm.cluster_id = qc.id
+     LEFT JOIN lcos.topic_priority_scores tps ON tps.knowledge_card_id = kc.id
+       AND tps.computed_for = (SELECT max(computed_for) FROM lcos.topic_priority_scores)
+     WHERE kc.status <> 'RETIRED'
+       AND NOT EXISTS (SELECT 1 FROM lcos.content_families cf WHERE cf.knowledge_card_id = kc.id
+                        AND cf.created_at > now() - interval '14 days')
+     GROUP BY kc.id, kc.code, kc.status
+     ORDER BY priority_score DESC, question_count DESC
+     LIMIT $1`, [boundedLimit])).rows;
+
+  const results = [];
+  for (const c of candidates) {
+    try {
+      const r = await generateContent({ cardId: c.id, outputTypes: types, actor });
+      results.push({ card_id: c.id, card_code: c.code, card_status: c.status, family_code: r.family_code,
+        is_test_content: r.is_test_content, pieces: r.scripts.length, status: 'OK' });
+    } catch (e) {
+      results.push({ card_id: c.id, card_code: c.code, card_status: c.status, status: 'FAILED', error: e.message });
+    }
+  }
+  const ok = results.filter(r => r.status === 'OK');
+  const totalPieces = ok.reduce((n, r) => n + r.pieces, 0);
+  await audit(null, { actor, action: 'content.bulk_commission',
+    reason: `${ok.length}/${candidates.length} cards commissioned, ${totalPieces} pieces, output_types=${types.join(',')}` });
+  return { candidates_considered: candidates.length, commissioned: ok.length, total_pieces: totalPieces, results };
 }
 
 export async function generateScript({ concept, family, card, cardVersion, claims, actor, seedUnsupported = false,

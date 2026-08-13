@@ -286,6 +286,37 @@ export default async function routes(app) {
     return { items: r.rows };
   });
 
+  // Bulk classification sweep. classifyQuestion() previously only ran when
+  // someone opened one question and clicked it (or as a side effect of
+  // Turn Into Content for that one question). With the EMR backfill landing
+  // thousands of questions at once (BUILD_STATE.md, Aug 2026), the queue
+  // piled up at DEIDENTIFIED and never reached a cluster or the gap board --
+  // confirmed live 2026-08-12: one cluster total against thousands ingested.
+  // This walks the backlog newest-first (matching the backfill's own
+  // "freshest demand drives content first" policy) in a bounded batch so a
+  // click (or a future cron) makes real progress without one uncapped call
+  // running an unbounded number of AI classification calls.
+  app.post('/questions/classify-pending', { preHandler: requirePerm('cluster.manage') }, async (req, reply) => {
+    const limit = Math.min(Math.max(Number(req.body?.limit) || 100, 1), 500);
+    const pending = (await q(
+      `SELECT id FROM lcos.audience_questions WHERE status='DEIDENTIFIED'
+       ORDER BY captured_at DESC LIMIT $1`, [limit])).rows;
+    let classified = 0;
+    const failures = [];
+    for (const row of pending) {
+      try {
+        const result = await classifyQuestion(row.id);
+        if (result) classified++;
+      } catch (e) {
+        failures.push({ question_id: row.id, error: e.message });
+      }
+    }
+    await audit(null, { actor: req.actor, action: 'question.bulk_classify',
+      reason: `${classified}/${pending.length} classified, ${failures.length} failed` });
+    return reply.code(202).send({ attempted: pending.length, classified,
+      failed: failures.length, failures: failures.slice(0, 10) });
+  });
+
   // ----- demand board -----
   app.post('/demand/recompute', { preHandler: requirePerm('settings.manage') }, async () => computeDemand());
   app.get('/demand/coverage-gaps', { preHandler: requirePerm('question.read') }, async () => {

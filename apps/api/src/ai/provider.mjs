@@ -292,7 +292,7 @@ export class OpenAIProvider extends BaseProvider {
 // ---------- Anthropic ----------
 export class AnthropicProvider extends BaseProvider {
   name = 'ANTHROPIC';
-  model = cred('ANTHROPIC_MODEL') || 'claude-sonnet-4-5';
+  model = cred('ANTHROPIC_MODEL') || 'claude-sonnet-5';
   async generateStructured({ agent, system, user, maxTokens = 4000, temperature = 0.2 }) {
     const key = cred('ANTHROPIC_API_KEY');
     if (!key) throw new Error('ANTHROPIC_API_KEY not set (use LCOS_AI_PROVIDER=MOCK for demo mode)');

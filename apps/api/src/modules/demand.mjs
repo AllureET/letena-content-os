@@ -18,6 +18,19 @@ const THREAD_ROLES = ['patient', 'doctor', 'note'];
 const THREAD_KEYS = ['role', 'text', 'at'];
 const MAX_THREAD_SEGMENTS = 60;
 
+// Exact-match (after lowercasing + stripping .!?,\s) greeting/placeholder
+// strings quarantined on sight, before classification ever runs -- see the
+// longer comment at the ingest loop for why this exists and what it does
+// NOT do (it is not spam detection). English, common Amharic greetings
+// (native script and transliterated), and one known frontend placeholder
+// string ("Ask a question") observed being submitted verbatim.
+const GREETING_FILLER_SET = new Set([
+  'hi', 'hii', 'hiii', 'hey', 'heyy', 'hello', 'helo', 'yo',
+  'selam', 'slm', 'sls', 'selamu', 'salam', 'hay',
+  'ሰላም', 'ጤና ይስጥልኝ', 'ጤናይስጥልኝ',
+  'ask a question', 'question', 'test', 'testing',
+]);
+
 export default async function routes(app) {
   // ----- ingest (open route; HMAC or bearer question.ingest) -----
   app.post('/ingest/questions', async (req, reply) => {
@@ -93,6 +106,20 @@ export default async function routes(app) {
     for (const item of questions) {
       const text = String(item.text ?? '').trim();
       if (text.length < 3 || text.length > 4000) continue;
+      // Stopgap greeting/filler quarantine. This is NOT spam detection --
+      // real spam and off-topic detection belongs to the AI classifier
+      // (question_classifier), and only works once LCOS_AI_PROVIDER is set
+      // to ANTHROPIC in Settings; the MOCK provider is keyword-based and
+      // has no concept of "this isn't a real question." This deny-list only
+      // catches the handful of exact greeting/placeholder strings observed
+      // flooding Question clusters in practice (confirmed live 13 Aug 2026:
+      // "Selam" x7, "Hii" x3, "Ask a question" x3 -- the last one is the
+      // intake form's own placeholder text being submitted verbatim, a
+      // separate frontend bug worth fixing at the source). It will miss
+      // most real spam and most Amharic variants -- it is a bandage, not
+      // the fix.
+      const bare = text.toLowerCase().replace(/[.!?,\s]+/g, '');
+      const isGreetingOrFiller = GREETING_FILLER_SET.has(bare);
       const hash = item.source_hash
         ?? crypto.createHash('sha256').update('adhoc:' + text).digest('hex');
       // De-identify IN MEMORY before any insert. Raw text is never stored.
@@ -121,7 +148,10 @@ export default async function routes(app) {
       }
 
       const consultMode = ['WRITTEN', 'PHONE'].includes(item.consult_mode) ? item.consult_mode : null;
-      const status = minConf >= threshold ? 'DEIDENTIFIED' : 'QUARANTINED';
+      const status = isGreetingOrFiller ? 'QUARANTINED'
+        : (minConf >= threshold ? 'DEIDENTIFIED' : 'QUARANTINED');
+      const quarantineReason = isGreetingOrFiller ? 'greeting_or_placeholder_text'
+        : (status === 'QUARANTINED' ? 'low de-identification confidence' : null);
       if (status === 'QUARANTINED') quarantined++;
       try {
         const row = await one(
@@ -135,8 +165,7 @@ export default async function routes(app) {
            RETURNING id`,
           [batch.id, item.channel ?? null, hash, deid.text,
            ['EN','AM','OM','TI'].includes((item.language_hint ?? '').toUpperCase()) ? item.language_hint.toUpperCase() : null,
-           status, minConf, JSON.stringify(deid.redactions),
-           status === 'QUARANTINED' ? 'low de-identification confidence' : null,
+           status, minConf, JSON.stringify(deid.redactions), quarantineReason,
            item.category_hints ?? [], item.urgency_hint ?? null, item.captured_at ?? null,
            answerText, item.answered_at ?? null, JSON.stringify(threadClean), consultMode]);
         accepted++; ids.push(row.id);
@@ -185,7 +214,13 @@ export default async function routes(app) {
          AND ($2::text IS NULL OR aq.channel=$2::lcos.ingest_channel)
        ORDER BY aq.captured_at DESC LIMIT LEAST(COALESCE($3::int, 50), 200)`,
       [status ?? null, channel ?? null, limit ?? null]);
-    return { items: r.rows.map(({ embedding, ...rest }) => rest) };
+    // How many are still sitting at DEIDENTIFIED (ingested but not yet run
+    // through classifyQuestion) -- the number "Classify pending questions"
+    // will actually chew through. Without this the button gives no sense of
+    // how much backlog is left after a click.
+    const pendingCount = (await one(
+      `SELECT count(*)::int AS n FROM lcos.audience_questions WHERE status='DEIDENTIFIED'`)).n;
+    return { items: r.rows.map(({ embedding, ...rest }) => rest), pending_count: pendingCount };
   });
 
   // Question detail: the web app codes against this exact shape.
@@ -283,7 +318,12 @@ export default async function routes(app) {
        LEFT JOIN lcos.topics t ON t.id=qc.topic_id
        LEFT JOIN lcos.knowledge_cards kc ON kc.id=qc.knowledge_card_id
        WHERE qc.is_active ORDER BY qc.member_count DESC LIMIT 200`);
-    return { items: r.rows };
+    // Same backlog signal as /questions: how many classified-but-unclustered
+    // and not-yet-classified questions remain, so the screen can say how
+    // much is left instead of just "here are however many clusters exist."
+    const pendingCount = (await one(
+      `SELECT count(*)::int AS n FROM lcos.audience_questions WHERE status='DEIDENTIFIED'`)).n;
+    return { items: r.rows, pending_count: pendingCount };
   });
 
   // Bulk classification sweep. classifyQuestion() previously only ran when
@@ -311,10 +351,20 @@ export default async function routes(app) {
         failures.push({ question_id: row.id, error: e.message });
       }
     }
+    // Recompute the coverage-gap board in the same pass: it reads a
+    // materialized snapshot (topic_priority_scores/coverage_snapshots), not
+    // question_classifications live, so without this a freshly classified
+    // batch would sit invisible on Coverage gaps until someone with
+    // settings.manage separately clicked "Recompute now" -- confirmed live
+    // 13 Aug 2026 (classified questions existed, board stayed empty). Only
+    // bother if this batch actually classified something.
+    if (classified > 0) await computeDemand().catch(() => null);
+    const remaining = (await one(
+      `SELECT count(*)::int AS n FROM lcos.audience_questions WHERE status='DEIDENTIFIED'`)).n;
     await audit(null, { actor: req.actor, action: 'question.bulk_classify',
       reason: `${classified}/${pending.length} classified, ${failures.length} failed` });
     return reply.code(202).send({ attempted: pending.length, classified,
-      failed: failures.length, failures: failures.slice(0, 10) });
+      failed: failures.length, failures: failures.slice(0, 10), remaining_pending: remaining });
   });
 
   // ----- demand board -----

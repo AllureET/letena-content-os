@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # LCOS (Letena Content OS) — one-command deploy, Letena v2 / Fidelify pattern.
 # Usage: ./deploy.sh "your commit message"
@@ -68,8 +67,25 @@ echo "• deploying to lcos-1 ($LCOS_HOST) over SSH"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new)
 if ssh "${SSH_OPTS[@]}" "$LCOS_USER@$LCOS_HOST" "true" 2>/dev/null; then
   echo "  ssh reachable — pulling, migrating, restarting"
-  if ssh "${SSH_OPTS[@]}" "$LCOS_USER@$LCOS_HOST" \
-      "cd $LCOS_PATH && git pull && npm run migrate && systemctl restart lcos-api && sleep 2 && systemctl is-active lcos-api"; then
+  # migrate has intermittently thrown a transient "password authentication
+  # failed for user lcos" (Postgres auth blip, code 28P01) with nothing
+  # actually pending — happened 3x in one night, 12-13 Aug 2026. Previously
+  # this was chained with a single &&, so one flaky migrate attempt aborted
+  # the whole deploy *before* the restart step ever ran, even though the
+  # new code had already landed on disk via git pull. Retry migrate a few
+  # times first (cheap, and fixes the common transient case automatically);
+  # only if it still fails after retries do we stop short of restarting —
+  # that part stays a hard stop on purpose, since restarting app code that
+  # expects a schema change which never applied is worse than a delayed
+  # deploy.
+  REMOTE_CMD='cd '"$LCOS_PATH"' && git pull && \
+    ok=0; for i in 1 2 3 4; do \
+      npm run migrate && { ok=1; break; }; \
+      echo "  (migrate attempt $i failed, retrying in 3s...)"; sleep 3; \
+    done; \
+    if [ "$ok" -ne 1 ]; then echo "MIGRATE_FAILED_AFTER_RETRIES"; exit 1; fi; \
+    systemctl restart lcos-api && sleep 2 && systemctl is-active lcos-api'
+  if ssh "${SSH_OPTS[@]}" "$LCOS_USER@$LCOS_HOST" "$REMOTE_CMD"; then
     echo "  ✓ lcos-api pulled, migrated, and restarted on lcos-1"
   else
     echo "  ✗ remote deploy steps failed partway — check lcos-1 by hand:"

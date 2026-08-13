@@ -138,6 +138,10 @@ const screens = {
   async questions() {
     const r = await api('GET', '/questions?limit=50');
     return `<h1>Questions</h1><div class="sub">De-identified audience questions from every channel. English shown first; the chip swaps to the original Amharic. Click a row for the full conversation.</div>
+      ${r.pending_count ? `<div class="sub" style="margin-top:-6px">
+        <b>${r.pending_count}</b> question${r.pending_count === 1 ? '' : 's'} still waiting to be classified,
+        not yet in a cluster or the coverage gap board.
+        Go to <a href="#/clusters">Question clusters</a> and run "Classify pending questions".</div>` : ''}
       <div class="card"><table>
       <tr><th>Question</th><th>Channel</th><th>Topic</th><th>Matched card</th><th>Status</th><th>Received</th><th></th></tr>
       ${(r.items ?? []).map(i => `<tr class="rowlink" data-nav="question/${esc(i.id)}" tabindex="0">
@@ -226,6 +230,10 @@ const screens = {
       <div class="flex" style="margin-bottom:10px">
         ${can('cluster.manage') ? '<button id="classify-pending">Classify pending questions</button>' : ''}
         <span class="muted">Groups the newest 100 unclassified questions into clusters. Run it a few times to work through a large backlog.</span></div>
+      ${r.pending_count ? `<div class="sub" style="margin-top:-6px;margin-bottom:10px">
+        <b>${r.pending_count}</b> question${r.pending_count === 1 ? '' : 's'} still pending classification.
+        At 100 per click, that is about ${Math.ceil(r.pending_count / 100)} more run${Math.ceil(r.pending_count / 100) === 1 ? '' : 's'}.</div>`
+        : `<div class="sub" style="margin-top:-6px;margin-bottom:10px">Nothing pending. Every ingested question has been classified.</div>`}
       <div class="card"><table>
       <tr><th>Cluster</th><th>Representative question</th><th>Topic</th><th>Card</th><th>Members</th><th>Last seen</th></tr>
       ${r.items.map(i => {
@@ -900,7 +908,8 @@ document.addEventListener('click', async (e) => {
       b.disabled = true; toast('Classifying the newest 100 pending questions...');
       try {
         const r = await api('POST', '/questions/classify-pending', { limit: 100 });
-        toast(`Classified ${r.classified}/${r.attempted}${r.failed ? `, ${r.failed} failed` : ''}. Run again to keep working through the backlog.`);
+        toast(`Classified ${r.classified}/${r.attempted}${r.failed ? `, ${r.failed} failed` : ''}. ` +
+          (r.remaining_pending ? `${r.remaining_pending} still pending, run it again.` : 'Nothing left pending.'));
       } catch (e) { toast(e.message ?? 'Classification sweep failed', 'warn'); }
       return render();
     }

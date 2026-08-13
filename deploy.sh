@@ -72,7 +72,13 @@ echo "  ✓ pushed $PUSHED_SHA to origin/main"
 # --- remote deploy over SSH (best-effort) -----------------------------------
 echo "• deploying to lcos-1 ($LCOS_HOST) over SSH"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new)
-if ssh "${SSH_OPTS[@]}" "$LCOS_USER@$LCOS_HOST" "true" 2>/dev/null; then
+# Was `2>/dev/null` -- swallowed the real reason every failure, so "not
+# configured" printed identically whether SSH was truly unreachable, a key
+# needed a passphrase BatchMode can't prompt for, or something else
+# entirely. Capture stderr and print it on failure instead of guessing again.
+SSH_CHECK_ERR="$(ssh "${SSH_OPTS[@]}" "$LCOS_USER@$LCOS_HOST" "true" 2>&1 1>/dev/null)"
+SSH_CHECK_STATUS=$?
+if [ "$SSH_CHECK_STATUS" -eq 0 ]; then
   echo "  ssh reachable — pulling, migrating, restarting"
   # migrate has intermittently thrown a transient "password authentication
   # failed for user lcos" (Postgres auth blip, code 28P01) with nothing
@@ -113,6 +119,9 @@ else
     access to lcos-1 (ssh-copy-id, or add a Host entry in ~/.ssh/config for
     $LCOS_HOST), or override LCOS_DEPLOY_HOST / LCOS_DEPLOY_USER /
     LCOS_DEPLOY_PATH as env vars if any of those differ.
+
+    Actual SSH error (exit $SSH_CHECK_STATUS):
+    ${SSH_CHECK_ERR:-<no stderr output -- likely a plain connect timeout>}
 EOF
 fi
 

@@ -10,6 +10,18 @@ import { containsForbidden } from '../../../../packages/deid/src/index.mjs';
 // ---------- output schemas (zod, mirrors LCOS_06 JSON Schemas) ----------
 const S = {
   question_classifier: z.object({
+    // Found live 13 Aug 2026 (Nate: "are you sure youre reading the back and
+    // forth and not just the original question"): this agent was only ever
+    // given the opening message, never the thread/answer_text columns that
+    // migration 0004 added specifically so classification could see the
+    // whole exchange. Separately, the EMR exporter's own guessed table names
+    // for that back-and-forth (consult_message, clarification_threads,
+    // answers) don't exist anywhere in the live emr_v2 codebase, so thread
+    // is empty for nearly everything reaching LCOS right now regardless.
+    // Until that's fixed upstream, this flag is the safety net: a single
+    // stray message ("Eshi", "Age 28 addis abeba") should never get treated
+    // as real content demand just because it's all we currently have.
+    is_genuine_question: z.boolean(),
     topic_code: z.string().nullable(), subtopic: z.string().nullable().optional(),
     intent: z.enum(['FACT_SEEKING','REASSURANCE_SEEKING','MYTH_CHECK','SYMPTOM_CONCERN','METHOD_CHOICE','ACCESS_QUESTION','RELATIONSHIP_CONTEXT','URGENT_HELP','SERVICE_REQUEST','OTHER']),
     is_myth: z.boolean(), myth_text: z.string().nullable().optional(),

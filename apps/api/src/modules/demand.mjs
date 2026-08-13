@@ -391,12 +391,13 @@ export default async function routes(app) {
     const pending = (await q(
       `SELECT id FROM lcos.audience_questions WHERE status='DEIDENTIFIED'
        ORDER BY captured_at DESC LIMIT $1`, [limit])).rows;
-    let classified = 0;
+    let classified = 0, quarantinedNotGenuine = 0;
     const failures = [];
     for (const row of pending) {
       try {
         const result = await classifyQuestion(row.id);
-        if (result) classified++;
+        if (result?.quarantined) quarantinedNotGenuine++;
+        else if (result) classified++;
       } catch (e) {
         failures.push({ question_id: row.id, error: e.message });
       }
@@ -412,8 +413,9 @@ export default async function routes(app) {
     const remaining = (await one(
       `SELECT count(*)::int AS n FROM lcos.audience_questions WHERE status='DEIDENTIFIED'`)).n;
     await audit(null, { actor: req.actor, action: 'question.bulk_classify', objectType: 'INGEST_BATCH',
-      reason: `${classified}/${pending.length} classified, ${failures.length} failed` });
+      reason: `${classified}/${pending.length} classified, ${quarantinedNotGenuine} not genuine questions, ${failures.length} failed` });
     return reply.code(202).send({ attempted: pending.length, classified,
+      quarantined_not_genuine: quarantinedNotGenuine,
       failed: failures.length, failures: failures.slice(0, 10), remaining_pending: remaining });
   });
 
@@ -448,8 +450,17 @@ export async function classifyQuestion(questionId) {
     `SELECT emr_category, topic_code FROM lcos.emr_category_map WHERE topic_code IS NOT NULL`)).rows
     .map(r => [r.emr_category, r.topic_code]));
 
+  // thread/answer_text (migration 0004) are sent whenever the source consult
+  // actually captured more than the opening message -- found live 13 Aug
+  // 2026 that this was being silently dropped, so classification only ever
+  // saw question_text even when a fuller exchange was on the row. Most rows
+  // still won't have one (see the 0010 migration comment for why), but when
+  // they do, the classifier needs to read the whole thing, not just the
+  // opening line, to judge what was actually being asked.
   const out = await invokeAgent('question_classifier', {
     question_text: question.sanitized_text,
+    thread: Array.isArray(question.thread) && question.thread.length ? question.thread : undefined,
+    answer_text: question.answer_text || undefined,
     topics, cards: cards.map(c => ({ code: c.code, canonical_question_en: c.canonical_question_en })),
     emr_category_hints: question.category_hints, hint_topic_map: hintMap,
     urgency_hint: question.urgency_hint,
@@ -483,6 +494,23 @@ export async function classifyQuestion(questionId) {
      segment?.id ?? null, card?.id ?? null, conf, out.content_value,
      out.content_opportunity ?? null, out.referral_relevant ?? false,
      out.sentiment ?? null, JSON.stringify(out)]);
+
+  // Not a real question -- a greeting, an acknowledgment, a bare demographic
+  // answer with no question attached, whatever the model judged this record
+  // to actually be given what context it had (see migration 0010). The
+  // classification above stays on record (so a human can see why), but the
+  // question itself is quarantined rather than embedded/clustered/
+  // translated: it has no content-demand signal to contribute, and letting
+  // it through is exactly what produced junk single-message clusters like
+  // "Eshi" and "Age 28, addis abeba" tonight.
+  if (out.is_genuine_question === false) {
+    await q(`UPDATE lcos.audience_questions SET status='QUARANTINED',
+               quarantine_reason='not_a_genuine_question',
+               language=COALESCE(language, $2::lcos.content_language)
+             WHERE id=$1`, [questionId, out.language]);
+    return { question_id: questionId, ...out, match_confidence: conf,
+      resolved: { topic: false, card: null }, quarantined: true };
+  }
 
   const vec = toVectorLiteral(await embed(question.sanitized_text));
   await q(`UPDATE lcos.audience_questions SET embedding=$2::vector, status='CLASSIFIED',

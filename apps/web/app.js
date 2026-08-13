@@ -928,7 +928,9 @@ document.addEventListener('click', async (e) => {
       b.disabled = true; toast(`Classifying the newest ${limit} pending questions...`);
       try {
         const r = await api('POST', '/questions/classify-pending', { limit });
-        toast(`Classified ${r.classified}/${r.attempted}${r.failed ? `, ${r.failed} failed` : ''}. ` +
+        toast(`Classified ${r.classified}/${r.attempted}` +
+          `${r.quarantined_not_genuine ? `, ${r.quarantined_not_genuine} not real questions (quarantined)` : ''}` +
+          `${r.failed ? `, ${r.failed} failed` : ''}. ` +
           (r.remaining_pending ? `${r.remaining_pending} still pending, run it again.` : 'Nothing left pending.'));
       } catch (e) { toast(e.message ?? 'Classification sweep failed', 'warn'); }
       return render();

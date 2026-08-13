@@ -14,16 +14,19 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MSG="${1:-deploy: $(date '+%Y-%m-%d %H:%M')}"
 cd "$REPO"
 
-LCOS_HOST="${LCOS_DEPLOY_HOST:-lcos-1}"   # SSH config alias for 204.168.161.47, Hetzner
+LCOS_HOST="${LCOS_DEPLOY_HOST:-204.168.161.47}"   # lcos-1, Hetzner
 LCOS_USER="${LCOS_DEPLOY_USER:-root}"
 LCOS_PATH="${LCOS_DEPLOY_PATH:-/opt/lcos}"
-# Deliberately the "lcos-1" alias, not the bare IP (confirmed working
-# 13 Aug 2026: `ssh lcos-1` succeeds from this machine every time; `ssh
-# root@204.168.161.47` does not, because ~/.ssh/config's Host block is
-# matched against the literal name "lcos-1" on the command line, not
-# against the address it resolves to. Using the raw IP here silently
-# skipped that config block (wrong/no identity file, wrong user) and made
-# every deploy report "SSH not configured" even though it plainly was.
+# "lcos-1" is the SERVER's own hostname (its shell prompt reads root@lcos-1),
+# not a resolvable name on this Mac -- confirmed 13 Aug 2026: `ssh lcos-1`
+# fails here with "Could not resolve hostname lcos-1: nodename nor servname
+# provided". A prior fix wrongly assumed lcos-1 was a working local SSH
+# config alias because that's what past interactive sessions showed in the
+# prompt; that prompt just reflects the box's own hostname regardless of
+# how you connected to it (Hetzner's web console included). Use the IP here
+# unless/until a real `Host lcos-1` block is added to this Mac's
+# ~/.ssh/config (see the connectivity error text below for what's actually
+# blocking it if this still fails).
 
 # --- resolve a working node CLI ------------------------------------------
 NODE="${LCOS_NODE:-}"

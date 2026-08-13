@@ -287,6 +287,56 @@ export default async function routes(app) {
     return { ok: true };
   });
 
+  // One-time cleanup for content ingested before two things were true: (1)
+  // the greeting/placeholder quarantine at ingest existed, and (2) a real
+  // AI provider was configured (was MOCK -- keyword classifier, trigram-hash
+  // "embeddings" that only ever merge near-verbatim text, not real meaning).
+  // classify-pending only ever picks up status='DEIDENTIFIED', so nothing
+  // already at CLASSIFIED/CLUSTERED gets touched by it, no matter how many
+  // times it runs or how good the AI provider now is -- confirmed live 13
+  // Aug 2026 (switched to ANTHROPIC, backlog re-ran, but old junk clusters
+  // like "[legacy phone consult notes] Reason: Consult" x114 and "Selam"
+  // x7 stayed exactly as they were). This is the one-time fix: junk gets
+  // quarantined and removed from its cluster; everything else gets its
+  // cluster membership and classification cleared and its status reset to
+  // DEIDENTIFIED so classify-pending picks it up again -- this time for
+  // real, with whatever AI provider Settings is actually configured with.
+  app.post('/questions/cleanup-and-requeue', { preHandler: requirePerm('settings.manage') }, async (req, reply) => {
+    const rows = (await q(
+      `SELECT id, sanitized_text FROM lcos.audience_questions
+       WHERE status IN ('DEIDENTIFIED','CLASSIFIED','CLUSTERED')`)).rows;
+    let quarantined = 0, requeued = 0;
+    for (const row of rows) {
+      const bare = row.sanitized_text.toLowerCase().trim().replace(/[.!?,\s]+/g, '');
+      const isJunk = GREETING_FILLER_SET.has(bare)
+        || /^\[legacy phone consult notes\]/i.test(row.sanitized_text.trim());
+      await q(`DELETE FROM lcos.question_cluster_members WHERE question_id=$1`, [row.id]);
+      if (isJunk) {
+        await q(`DELETE FROM lcos.question_classifications WHERE question_id=$1`, [row.id]);
+        await q(`UPDATE lcos.audience_questions SET status='QUARANTINED',
+                   quarantine_reason='greeting_or_placeholder_text_cleanup', embedding=NULL
+                 WHERE id=$1`, [row.id]);
+        quarantined++;
+      } else {
+        await q(`DELETE FROM lcos.question_classifications WHERE question_id=$1`, [row.id]);
+        await q(`UPDATE lcos.audience_questions SET status='DEIDENTIFIED', embedding=NULL WHERE id=$1`, [row.id]);
+        requeued++;
+      }
+    }
+    // Any cluster left with zero members (every member was junk, or was
+    // requeued away) should stop showing up in the UI immediately rather
+    // than lingering until something else happens to touch it.
+    const deactivated = (await q(
+      `UPDATE lcos.question_clusters SET is_active=false
+       WHERE is_active AND member_count=0 RETURNING id`)).rows.length;
+    await audit(null, { actor: req.actor, action: 'question.cleanup_and_requeue',
+      reason: `${quarantined} quarantined, ${requeued} requeued, ${deactivated} clusters emptied` });
+    return reply.code(202).send({ quarantined, requeued, clusters_deactivated: deactivated,
+      note: requeued > 0
+        ? `${requeued} real questions are back in the pending queue. Run "Classify pending questions" (maybe more than once) to reclassify and re-cluster them with the current AI provider.`
+        : 'Nothing needed requeuing.' });
+  });
+
   // ----- classification + embedding (WF03 equivalent, callable inline) -----
   app.post('/questions/:id/classify', async (req, reply) => {
     if (!req.actor?.permissions?.some(p => ['question.ingest', 'cluster.manage'].includes(p))) {

@@ -230,6 +230,9 @@ const screens = {
       <div class="flex" style="margin-bottom:10px">
         ${can('cluster.manage') ? '<button id="classify-pending">Classify pending questions</button>' : ''}
         <span class="muted">Groups the newest 100 unclassified questions into clusters. Run it a few times to work through a large backlog.</span></div>
+      ${can('settings.manage') ? `<div class="flex" style="margin-bottom:10px">
+        <button id="cleanup-requeue">Clean up junk and reclassify with current AI provider</button>
+        <span class="muted">One-time: quarantines greetings/placeholder text already sitting in clusters (like "Selam" or "[legacy phone consult notes]"), and sends everything else back through classification so it uses whatever AI provider is set in Settings now, not whatever it used when it was first ingested.</span></div>` : ''}
       ${r.pending_count ? `<div class="sub" style="margin-top:-6px;margin-bottom:10px">
         <b>${r.pending_count}</b> question${r.pending_count === 1 ? '' : 's'} still pending classification.
         At 100 per click, that is about ${Math.ceil(r.pending_count / 100)} more run${Math.ceil(r.pending_count / 100) === 1 ? '' : 's'}.</div>`
@@ -869,7 +872,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') document.body.classList.remove('nav-open');
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#tone-save,#classify-pending,#bulk-commission');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
   if (!b) {
     // A real link (external platform URL, download, backlink) inside a
     // drill-down row must keep its native navigation; only fall through to
@@ -911,6 +914,15 @@ document.addEventListener('click', async (e) => {
         toast(`Classified ${r.classified}/${r.attempted}${r.failed ? `, ${r.failed} failed` : ''}. ` +
           (r.remaining_pending ? `${r.remaining_pending} still pending, run it again.` : 'Nothing left pending.'));
       } catch (e) { toast(e.message ?? 'Classification sweep failed', 'warn'); }
+      return render();
+    }
+    if (b.id === 'cleanup-requeue') {
+      if (!confirm('Quarantine already-ingested greetings/placeholder junk and send every other classified question back through classification with the current AI provider? This clears their existing topic and cluster and cannot be undone in one click.')) return;
+      b.disabled = true; toast('Cleaning up and requeuing...');
+      try {
+        const r = await api('POST', '/questions/cleanup-and-requeue', {});
+        toast(`Quarantined ${r.quarantined} junk question${r.quarantined === 1 ? '' : 's'}, requeued ${r.requeued} for reclassification, retired ${r.clusters_deactivated} empty cluster${r.clusters_deactivated === 1 ? '' : 's'}. ${r.note}`);
+      } catch (e) { toast(e.message ?? 'Cleanup failed', 'warn'); }
       return render();
     }
     if (b.id === 'bulk-commission') {

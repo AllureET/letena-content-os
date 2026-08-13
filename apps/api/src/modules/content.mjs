@@ -626,7 +626,7 @@ export async function bulkCommission({ limit = 10, outputTypes = null, actor }) 
   }
   const ok = results.filter(r => r.status === 'OK');
   const totalPieces = ok.reduce((n, r) => n + r.pieces, 0);
-  await audit(null, { actor, action: 'content.bulk_commission',
+  await audit(null, { actor, action: 'content.bulk_commission', objectType: 'KNOWLEDGE_CARD',
     reason: `${ok.length}/${candidates.length} cards commissioned, ${totalPieces} pieces, output_types=${types.join(',')}` });
   return { candidates_considered: candidates.length, commissioned: ok.length, total_pieces: totalPieces, results };
 }

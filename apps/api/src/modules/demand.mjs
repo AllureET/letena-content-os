@@ -329,7 +329,7 @@ export default async function routes(app) {
     const deactivated = (await q(
       `UPDATE lcos.question_clusters SET is_active=false
        WHERE is_active AND member_count=0 RETURNING id`)).rows.length;
-    await audit(null, { actor: req.actor, action: 'question.cleanup_and_requeue',
+    await audit(null, { actor: req.actor, action: 'question.cleanup_and_requeue', objectType: 'INGEST_BATCH',
       reason: `${quarantined} quarantined, ${requeued} requeued, ${deactivated} clusters emptied` });
     return reply.code(202).send({ quarantined, requeued, clusters_deactivated: deactivated,
       note: requeued > 0
@@ -411,7 +411,7 @@ export default async function routes(app) {
     if (classified > 0) await computeDemand().catch(() => null);
     const remaining = (await one(
       `SELECT count(*)::int AS n FROM lcos.audience_questions WHERE status='DEIDENTIFIED'`)).n;
-    await audit(null, { actor: req.actor, action: 'question.bulk_classify',
+    await audit(null, { actor: req.actor, action: 'question.bulk_classify', objectType: 'INGEST_BATCH',
       reason: `${classified}/${pending.length} classified, ${failures.length} failed` });
     return reply.code(202).send({ attempted: pending.length, classified,
       failed: failures.length, failures: failures.slice(0, 10), remaining_pending: remaining });

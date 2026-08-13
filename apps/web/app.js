@@ -809,7 +809,14 @@ const screens = {
     } catch { /* concept.read missing; hide */ }
     // Read-only platform specs reference (GET /platform/specs): so producers
     // can check target sizing without digging through code. Renders are
-    // flagged against these at schedule time, never blocked.
+    // flagged against these at schedule time, never blocked. Deliberately
+    // NOT an editable table here -- these values are what OTHER things get
+    // validated against, so an in-place edit with no review step could
+    // silently change what "passes" scheduling. Same reference-only status
+    // as the raw settings dump below, so it lives in that same spot on the
+    // page (13 Aug 2026: was sitting above the editable rows, which
+    // contradicted the page's own stated rule of acted-on stuff first,
+    // reference stuff last -- moved down here to actually follow it).
     let specsHtml = '';
     try {
       const sp = await api('GET', '/platform/specs');
@@ -825,7 +832,7 @@ const screens = {
     } catch { /* publish.read missing; hide */ }
     // Raw settings dump is reference-only, nothing on this table is clicked
     // or edited day to day, so it sits last, after every screen someone
-    // actually acts on (override, publishing mode, tone, specs, API keys).
+    // actually acts on (override, publishing mode, tone, API keys).
     const rawTableHtml = `<h1 style="margin-top:26px">All settings (raw)</h1>
       <div class="sub">Every key/value this instance holds, for reference. Thresholds and weights the team can argue with, without a deploy.</div>
       <div class="card"><table><tr><th>Key</th><th>Value</th><th>Description</th></tr>
@@ -836,8 +843,8 @@ const screens = {
       ${overrideHtml}
       ${pmHtml}
       ${toneHtml}
-      ${specsHtml}
       ${credsHtml}
+      ${specsHtml}
       ${rawTableHtml}`;
   },
 

@@ -101,6 +101,11 @@ if [ "$SSH_CHECK_STATUS" -eq 0 ]; then
   # expects a schema change which never applied is worse than a delayed
   # deploy.
   REMOTE_CMD='cd '"$LCOS_PATH"' && git pull && \
+    LOCAL_HEAD="$(git rev-parse HEAD)"; REMOTE_HEAD="$(git rev-parse @{u})"; \
+    if [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then \
+      echo "PULL_DID_NOT_ACTUALLY_UPDATE (HEAD=$LOCAL_HEAD, origin/main=$REMOTE_HEAD) -- likely a permission error on a .git internal that git pull treated as non-fatal. Check file ownership under '"$LCOS_PATH"'."; \
+      exit 1; \
+    fi; \
     ok=0; for i in 1 2 3 4; do \
       npm run migrate && { ok=1; break; }; \
       echo "  (migrate attempt $i failed, retrying in 3s...)"; sleep 3; \

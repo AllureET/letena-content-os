@@ -14,9 +14,16 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MSG="${1:-deploy: $(date '+%Y-%m-%d %H:%M')}"
 cd "$REPO"
 
-LCOS_HOST="${LCOS_DEPLOY_HOST:-204.168.161.47}"   # lcos-1, Hetzner
+LCOS_HOST="${LCOS_DEPLOY_HOST:-lcos-1}"   # SSH config alias for 204.168.161.47, Hetzner
 LCOS_USER="${LCOS_DEPLOY_USER:-root}"
 LCOS_PATH="${LCOS_DEPLOY_PATH:-/opt/lcos}"
+# Deliberately the "lcos-1" alias, not the bare IP (confirmed working
+# 13 Aug 2026: `ssh lcos-1` succeeds from this machine every time; `ssh
+# root@204.168.161.47` does not, because ~/.ssh/config's Host block is
+# matched against the literal name "lcos-1" on the command line, not
+# against the address it resolves to. Using the raw IP here silently
+# skipped that config block (wrong/no identity file, wrong user) and made
+# every deploy report "SSH not configured" even though it plainly was.
 
 # --- resolve a working node CLI ------------------------------------------
 NODE="${LCOS_NODE:-}"

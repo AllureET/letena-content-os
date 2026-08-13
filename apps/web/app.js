@@ -228,14 +228,19 @@ const screens = {
     const cardIds = await cardCodeMap();
     return `<h1>Question clusters</h1><div class="sub">Semantically similar questions, kept apart when answers differ. Click a matched cluster to open its card.</div>
       <div class="flex" style="margin-bottom:10px">
-        ${can('cluster.manage') ? '<button id="classify-pending">Classify pending questions</button>' : ''}
-        <span class="muted">Groups the newest 100 unclassified questions into clusters. Run it a few times to work through a large backlog.</span></div>
+        ${can('cluster.manage') ? `<button id="classify-pending">Classify pending questions</button>
+        <select id="classify-limit" style="width:110px">
+          <option value="100">100 at a time</option>
+          <option value="250">250 at a time</option>
+          <option value="500">500 at a time</option>
+        </select>` : ''}
+        <span class="muted">Groups the newest batch of unclassified questions into clusters. Bigger batches take longer per click (each question is a real AI call); run it a few times to work through a large backlog.</span></div>
       ${can('settings.manage') ? `<div class="flex" style="margin-bottom:10px">
         <button id="cleanup-requeue">Clean up junk and reclassify with current AI provider</button>
         <span class="muted">One-time: quarantines greetings/placeholder text already sitting in clusters (like "Selam" or "[legacy phone consult notes]"), and sends everything else back through classification so it uses whatever AI provider is set in Settings now, not whatever it used when it was first ingested.</span></div>` : ''}
       ${r.pending_count ? `<div class="sub" style="margin-top:-6px;margin-bottom:10px">
         <b>${r.pending_count}</b> question${r.pending_count === 1 ? '' : 's'} still pending classification.
-        At 100 per click, that is about ${Math.ceil(r.pending_count / 100)} more run${Math.ceil(r.pending_count / 100) === 1 ? '' : 's'}.</div>`
+        At 500 per click (the largest batch size), that is about ${Math.ceil(r.pending_count / 500)} more run${Math.ceil(r.pending_count / 500) === 1 ? '' : 's'}; more at smaller batch sizes.</div>`
         : `<div class="sub" style="margin-top:-6px;margin-bottom:10px">Nothing pending. Every ingested question has been classified.</div>`}
       <div class="card"><table>
       <tr><th>Cluster</th><th>Representative question</th><th>Topic</th><th>Card</th><th>Members</th><th>Last seen</th></tr>
@@ -908,9 +913,14 @@ document.addEventListener('click', async (e) => {
     }
     if (b.id === 'recompute') { await api('POST', '/demand/recompute'); toast('Demand board recomputed'); return render(); }
     if (b.id === 'classify-pending') {
-      b.disabled = true; toast('Classifying the newest 100 pending questions...');
+      // Matches the server's own clamp (packages/api's classify-pending route
+      // limits 1-500 regardless of what's sent), so a stray/tampered value
+      // here can't request more than the backend will ever actually run in
+      // one request.
+      const limit = Math.min(Math.max(Number($('#classify-limit')?.value) || 100, 1), 500);
+      b.disabled = true; toast(`Classifying the newest ${limit} pending questions...`);
       try {
-        const r = await api('POST', '/questions/classify-pending', { limit: 100 });
+        const r = await api('POST', '/questions/classify-pending', { limit });
         toast(`Classified ${r.classified}/${r.attempted}${r.failed ? `, ${r.failed} failed` : ''}. ` +
           (r.remaining_pending ? `${r.remaining_pending} still pending, run it again.` : 'Nothing left pending.'));
       } catch (e) { toast(e.message ?? 'Classification sweep failed', 'warn'); }

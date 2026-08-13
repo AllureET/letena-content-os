@@ -15,7 +15,13 @@ MSG="${1:-deploy: $(date '+%Y-%m-%d %H:%M')}"
 cd "$REPO"
 
 LCOS_HOST="${LCOS_DEPLOY_HOST:-204.168.161.47}"   # lcos-1, Hetzner
-LCOS_USER="${LCOS_DEPLOY_USER:-root}"
+# lcossvc, not root: it already owns /opt/lcos (so git pull/npm run migrate
+# need no special privilege) and has one narrowly scoped NOPASSWD sudo rule
+# for exactly `systemctl restart lcos-api` / `systemctl is-active lcos-api`
+# (see /etc/sudoers.d/lcossvc-deploy on the server, set up 13 Aug 2026).
+# Routine deploys no longer need root's full blast radius; root SSH access
+# still exists for anything that genuinely needs it.
+LCOS_USER="${LCOS_DEPLOY_USER:-lcossvc}"
 LCOS_PATH="${LCOS_DEPLOY_PATH:-/opt/lcos}"
 # "lcos-1" is the SERVER's own hostname (its shell prompt reads root@lcos-1),
 # not a resolvable name on this Mac -- confirmed 13 Aug 2026: `ssh lcos-1`
@@ -100,13 +106,13 @@ if [ "$SSH_CHECK_STATUS" -eq 0 ]; then
       echo "  (migrate attempt $i failed, retrying in 3s...)"; sleep 3; \
     done; \
     if [ "$ok" -ne 1 ]; then echo "MIGRATE_FAILED_AFTER_RETRIES"; exit 1; fi; \
-    systemctl restart lcos-api && sleep 2 && systemctl is-active lcos-api'
+    sudo systemctl restart lcos-api && sleep 2 && sudo systemctl is-active lcos-api'
   if ssh "${SSH_OPTS[@]}" "$LCOS_USER@$LCOS_HOST" "$REMOTE_CMD"; then
     echo "  ✓ lcos-api pulled, migrated, and restarted on lcos-1"
   else
     echo "  ✗ remote deploy steps failed partway — check lcos-1 by hand:"
     echo "      ssh $LCOS_USER@$LCOS_HOST"
-    echo "      cd $LCOS_PATH && git pull && npm run migrate && systemctl restart lcos-api"
+    echo "      cd $LCOS_PATH && git pull && npm run migrate && sudo systemctl restart lcos-api"
     exit 1
   fi
 else
@@ -116,7 +122,7 @@ else
     yet — LCOS has no auto-deploy webhook. Finish it by hand, either via
     the Hetzner web console or SSH once it's set up:
 
-      cd $LCOS_PATH && git pull && npm run migrate && systemctl restart lcos-api
+      cd $LCOS_PATH && git pull && npm run migrate && sudo systemctl restart lcos-api
 
     To make this script finish the job automatically next time, set up SSH
     access to lcos-1 (ssh-copy-id, or add a Host entry in ~/.ssh/config for

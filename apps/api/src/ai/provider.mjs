@@ -296,10 +296,20 @@ export class AnthropicProvider extends BaseProvider {
   async generateStructured({ agent, system, user, maxTokens = 4000, temperature = 0.2 }) {
     const key = cred('ANTHROPIC_API_KEY');
     if (!key) throw new Error('ANTHROPIC_API_KEY not set (use LCOS_AI_PROVIDER=MOCK for demo mode)');
+    // temperature deliberately NOT sent: confirmed live 13 Aug 2026 that the
+    // default model (claude-sonnet-5) rejects it outright with a 400
+    // ("`temperature` is deprecated for this model"), which was silently
+    // failing every single structured call -- 100% failure rate, $0 cost
+    // recorded because the request never got past validation to bill
+    // anything. This is why every classification/label/translation call
+    // looked identical to MOCK output all night even after a real API key
+    // and ANTHROPIC were both saved: nothing was ever actually reaching the
+    // model. If a future model here DOES support/require temperature,
+    // reintroduce it conditionally rather than unconditionally again.
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: this.model, max_tokens: maxTokens, temperature,
+      body: JSON.stringify({ model: this.model, max_tokens: maxTokens,
         system: `${system}\n\nRespond with a single valid JSON object and nothing else.`,
         messages: [{ role: 'user', content: user }] }),
     });

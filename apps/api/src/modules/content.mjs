@@ -728,6 +728,15 @@ export async function validateScript(scriptId, { actor }) {
   const findings = [...agentOut.findings, ...overlay];
   const result = overallResult(agentOut.statements, findings);
 
+  // Superseded by this run: without this, a re-validate (the "Re-run
+  // validation" button on a VALIDATION_FAILED script) only ever adds rows,
+  // so an old FAIL finding from before a fix keeps showing next to a fresh
+  // PASS forever, since the GET route filters on NOT resolved with no
+  // recency cutoff.
+  await q(`UPDATE lcos.script_findings SET resolved=true, resolved_by=$3, resolved_at=now()
+           WHERE script_id=$1 AND script_version=$2 AND NOT resolved`,
+    [s.id, s.current_version, actor?.id ?? null]);
+
   for (const st of agentOut.statements) {
     await q(`UPDATE lcos.script_claims SET verdict=$3::lcos.validation_verdict, verdict_reason=$4, validated_at=now()
              WHERE script_id=$1 AND script_version=$2 AND statement=$5`,

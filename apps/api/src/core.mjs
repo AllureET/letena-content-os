@@ -211,7 +211,17 @@ const G = {
   hasReason: (name) => ({ ctx }) => {
     if (!ctx.reason) throw new GuardError(name, 'A reason is required for this transition.');
   },
+  // Maker-checker: the person who drafted a card or claim cannot also be its
+  // only approval, so a real second set of eyes is on record for every piece
+  // of clinical content. admin is exempted (owner decision, Nate/MD, 12 Aug
+  // 2026): in a small team the MD is sometimes the only person available to
+  // both draft and clear a card, and as the org's top authority they take
+  // that responsibility knowingly rather than being blocked by a rule meant
+  // to catch everyone else. This does not relax anything else in the
+  // approval chain, claim validation and the publish-time card check still
+  // apply exactly as before.
   reviewerIsNotAuthor: ({ object, ctx }) => {
+    if (ctx.actor?.roles?.includes('admin')) return;
     if (object.created_by && object.created_by === ctx.actor.id) {
       throw new GuardError('reviewerIsNotAuthor', 'You cannot approve your own work.');
     }

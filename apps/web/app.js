@@ -461,6 +461,8 @@ const screens = {
            <button data-langreview-reason="${s.id}|CHANGES_REQUESTED">Language: request changes</button>` : ''}
         ${s.status === 'LANGUAGE_REVIEW' && can('script.approve_language') ?
           `<button data-scripttx="${s.id}|${['TIER_3','TIER_4'].includes(s.risk_tier) ? 'CLINICAL_REVIEW' : 'APPROVED'}">Advance state</button>` : ''}
+        ${['DRAFT','VALIDATION_FAILED'].includes(s.status) && can('script.write') ?
+          `<button data-scriptvalidate="${s.id}">Re-run validation</button>` : ''}
         ${s.status === 'VALIDATION_FAILED' && can('script.write') ?
           `<button data-scripttx="${s.id}|DRAFT">Back to draft</button>` : ''}
         ${s.status === 'APPROVED' && can('production.request') ? `<button class="primary" data-produce="${s.id}">Send to production</button>` : ''}
@@ -859,7 +861,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') document.body.classList.remove('nav-open');
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#tone-save');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#tone-save,#classify-pending,#bulk-commission');
   if (!b) {
     // A real link (external platform URL, download, backlink) inside a
     // drill-down row must keep its native navigation; only fall through to
@@ -1033,6 +1035,13 @@ document.addEventListener('click', async (e) => {
     if (b.dataset.scripttx) {
       const [id, to] = b.dataset.scripttx.split('|');
       await api('POST', `/content/scripts/${id}/transition`, { to }); toast(`Script → ${to}`); return render();
+    }
+    if (b.dataset.scriptvalidate) {
+      b.disabled = true; b.textContent = 'Validating…';
+      const r = await api('POST', `/content/scripts/${b.dataset.scriptvalidate}/validate`, {});
+      toast(r.overall_result === 'PASS' ? 'Validation passed.' : `Validation failed: ${r.findings?.[0]?.explanation ?? 'see findings below'}`,
+        r.overall_result === 'PASS' ? false : 'warn');
+      return render();
     }
     if (b.id === 'u-create') {
       await api('POST', '/platform/users', { email: $('#u-email').value, full_name: $('#u-name').value,

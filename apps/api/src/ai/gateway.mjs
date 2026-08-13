@@ -123,6 +123,96 @@ const S = {
 S.content_recommender = S.editorial_analyst;
 export const agentSchemas = S;
 
+// ---------- schema -> plain-English field guide, injected into every prompt ----------
+// Root cause found live 13 Aug 2026: real ANTHROPIC/OPENAI calls were reaching
+// the model fine (once the temperature-400 bug above was fixed) but every
+// question_classifier call still failed SCHEMA_FAIL, missing content_value
+// and language on every response. The seed system_prompt for that agent
+// (packages/db/src/seed.mjs) never actually names those two fields, so a
+// model with no other source of truth for the exact JSON shape has no way to
+// know they're required -- it can only guess from the prose. This is not a
+// one-agent problem: any agent whose free-text prompt doesn't happen to
+// enumerate every field name will hit the same SCHEMA_FAIL wall the moment it
+// runs against a real provider instead of MOCK (which builds its output
+// directly from the schema and can never disagree with it). Rather than hand
+// -write a field list into each of the ~13 prompt rows and hope every future
+// schema edit gets a matching prompt edit, derive the field guide from the
+// zod schema itself -- the schema stays the single source of truth -- and
+// append it to every agent's system prompt automatically.
+function unwrapZod(def) {
+  let optional = false, nullable = false, hasDefault = false, defaultValue;
+  for (;;) {
+    if (def.typeName === 'ZodOptional') { optional = true; def = def.innerType._def; continue; }
+    if (def.typeName === 'ZodNullable') { nullable = true; def = def.innerType._def; continue; }
+    if (def.typeName === 'ZodDefault') { hasDefault = true; defaultValue = def.defaultValue(); def = def.innerType._def; continue; }
+    break;
+  }
+  return { def, optional, nullable, hasDefault, defaultValue };
+}
+
+// Returns { headline, nested }: headline is a one-line type summary; nested
+// (if present) is a pre-indented multi-line field list for the caller to
+// print on its own line below the field's bullet, so tags never end up
+// glued onto the last line of a nested block.
+function describeZodType(def, indent, depth) {
+  if (depth > 8) return { headline: '...' };
+  switch (def.typeName) {
+    case 'ZodString': return { headline: 'string' };
+    case 'ZodNumber': {
+      const checks = def.checks || [];
+      const isInt = checks.some(c => c.kind === 'int');
+      const min = checks.find(c => c.kind === 'min');
+      const max = checks.find(c => c.kind === 'max');
+      const range = [min ? `>= ${min.value}` : null, max ? `<= ${max.value}` : null].filter(Boolean).join(', ');
+      const base = isInt ? 'integer' : 'number';
+      return { headline: range ? `${base} (${range})` : base };
+    }
+    case 'ZodBoolean': return { headline: 'boolean' };
+    case 'ZodEnum': return { headline: `one of ${def.values.map(v => JSON.stringify(v)).join(' | ')}` };
+    case 'ZodLiteral': return { headline: `literally ${JSON.stringify(def.value)}` };
+    case 'ZodArray': {
+      const itemDef = def.type._def;
+      if (itemDef.typeName === 'ZodObject') {
+        return { headline: 'array of objects, each with:',
+          nested: describeZodObjectFields(itemDef, indent + '    ', depth + 1) };
+      }
+      return { headline: `array of ${describeZodType(itemDef, indent, depth + 1).headline}` };
+    }
+    case 'ZodObject': return { headline: 'object with:',
+      nested: describeZodObjectFields(def, indent + '    ', depth + 1) };
+    case 'ZodRecord': return { headline: 'free-form object' };
+    case 'ZodAny': return { headline: 'any JSON value' };
+    case 'ZodUnion': return { headline: 'one of several types' };
+    case 'ZodDiscriminatedUnion': {
+      const opts = def.options.map(o => describeZodObjectFields(o._def, indent + '    ', depth + 1))
+        .join(`\n${indent}  OR:\n`);
+      return { headline: `one of several shapes depending on "${def.discriminator}":`,
+        nested: `${indent}  ${opts}` };
+    }
+    default: return { headline: (def.typeName || 'value').replace(/^Zod/, '').toLowerCase() };
+  }
+}
+
+function describeZodObjectFields(objDef, indent, depth) {
+  if (depth > 8) return `${indent}...`;
+  const shape = typeof objDef.shape === 'function' ? objDef.shape() : objDef.shape;
+  return Object.entries(shape).map(([name, fieldSchema]) => {
+    const { def, optional, nullable, hasDefault, defaultValue } = unwrapZod(fieldSchema._def);
+    const { headline, nested } = describeZodType(def, indent, depth);
+    const tags = [optional ? 'optional' : 'required', nullable ? 'nullable' : null,
+      hasDefault ? `default ${JSON.stringify(defaultValue)}` : null].filter(Boolean).join(', ');
+    const line = `${indent}- ${name}: ${headline} (${tags})`;
+    return nested ? `${line}\n${nested}` : line;
+  }).join('\n');
+}
+
+export function schemaFieldGuide(schema) {
+  const def = schema._def;
+  if (def.typeName === 'ZodObject') return describeZodObjectFields(def, '', 0);
+  const { headline, nested } = describeZodType(def, '', 0);
+  return nested ? `${headline}\n${nested}` : headline;
+}
+
 export class AgentError extends Error {
   constructor(msg, outcome) { super(msg); this.outcome = outcome; }
 }
@@ -172,7 +262,15 @@ export async function invokeAgent(agentKey, context, { objectType = null, object
   const provider = getProvider(providerName);
   const started = Date.now();
   const toneInstructions = await getTonePresetInstructions(tonePreset);
-  const system = buildAgentSystemPrompt(prompt?.system_prompt ?? '', toneInstructions);
+  // Schema guide goes last, after the agent's own task instructions -- it is
+  // the strictest, most mechanical constraint (exact field names/types), so
+  // it should be the thing freshest in context right before the model
+  // writes its answer. See the schemaFieldGuide comment above for why this
+  // exists: prose prompts alone reliably omit fields they don't happen to
+  // name (found live 13 Aug 2026 on question_classifier -- content_value and
+  // language, neither ever mentioned by name in that agent's prompt text).
+  const schemaGuide = `Respond with a single JSON object with exactly these fields. Do not omit any required field, do not invent extra fields:\n${schemaFieldGuide(schema)}`;
+  const system = `${buildAgentSystemPrompt(prompt?.system_prompt ?? '', toneInstructions)}\n\n${schemaGuide}`;
 
   // PII assertion on the full outbound payload. BLOCKED_PII is terminal.
   const payloadText = JSON.stringify(context);

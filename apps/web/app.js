@@ -790,6 +790,25 @@ const screens = {
         </select>
         <button class="${overrideOn ? '' : 'danger'}" id="override-save">Save</button>
       </div></div>` : '';
+    // Clinical review kill switch (Nate, 14 Aug 2026: "we dont want to have
+    // clinical review anymore... allow this to just run... add an admin
+    // toggle... have it off for now"). Modeled directly on the admin test
+    // mode override above: admin-role gated client-side to match the
+    // backend's adminOnlySetting guard, and made deliberately alarming when
+    // OFF (the unsafe-by-omission state here, opposite of override) so
+    // nobody mistakes a quiet toggle for a minor preference.
+    const clinicalOn = Boolean(r.items.find(s => s.key === 'review.clinical_review_enabled')?.value ?? false);
+    const clinicalHtml = isAdmin() ? `<div class="card" style="border:1px solid ${clinicalOn ? 'var(--line)' : 'var(--risk-high)'};${clinicalOn ? '' : 'background:var(--risk-high-bg)'}">
+      <div class="eyebrow" style="color:${clinicalOn ? 'var(--plump-purple)' : 'var(--risk-high)'}">Clinical review gate</div>
+      <div class="sub" style="margin-bottom:10px">Whether a TIER 3/TIER 4 script that passes claim validation stops for a doctor's clinical sign-off, or auto-approves straight through with nobody reviewing it.</div>
+      ${clinicalOn ? '' : `<div class="flex" style="margin-bottom:10px"><span class="pill" style="color:#fff;background:var(--risk-high)"><span class="d"></span>CLINICAL REVIEW IS OFF &mdash; Tier 3/4 scripts auto-approve with no doctor sign-off</span></div>`}
+      <div class="flex">
+        <select id="clinical-select" style="max-width:360px">
+          <option value="false" ${clinicalOn ? '' : 'selected'}>Off (testing the rest of the pipeline; scripts auto-approve)</option>
+          <option value="true" ${clinicalOn ? 'selected' : ''}>On (default: Tier 3/4 scripts require a doctor's sign-off)</option>
+        </select>
+        <button class="${clinicalOn ? 'primary' : 'danger'}" id="clinical-save">Save</button>
+      </div></div>` : '';
     // Writing style / tone preset (content.tone_preset default; per-request
     // overrides are also available on Turn into content and card generation).
     let toneHtml = '';
@@ -841,6 +860,7 @@ const screens = {
         <td class="muted">${esc(s.description ?? '')}</td></tr>`).join('')}</table></div>`;
     return `<h1>Settings</h1><div class="sub">What the team can actually change, without a deploy</div>
       ${overrideHtml}
+      ${clinicalHtml}
       ${pmHtml}
       ${toneHtml}
       ${credsHtml}
@@ -884,7 +904,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') document.body.classList.remove('nav-open');
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
   if (!b) {
     // A real link (external platform URL, download, backlink) inside a
     // drill-down row must keep its native navigation; only fall through to
@@ -962,6 +982,13 @@ document.addEventListener('click', async (e) => {
       await api('PUT', '/platform/settings', { key: 'approval.override', value });
       toast(value === 'ADMIN_TEST_MODE' ? 'Admin test mode is ON. Every generation from an unapproved card now needs this switched back off.' : 'Admin test mode is off.',
         value === 'ADMIN_TEST_MODE' ? 'warn' : false);
+      return render();
+    }
+    if (b.id === 'clinical-save') {
+      const value = $('#clinical-select').value === 'true';
+      await api('PUT', '/platform/settings', { key: 'review.clinical_review_enabled', value });
+      toast(value ? 'Clinical review is back on. Tier 3/4 scripts will require a doctor\'s sign-off again.' : 'Clinical review is OFF. Tier 3/4 scripts will auto-approve with no doctor reviewing them.',
+        value ? false : 'warn');
       return render();
     }
     if (b.id === 'tone-save') {

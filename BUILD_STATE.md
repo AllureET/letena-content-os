@@ -180,7 +180,7 @@ full-inquiry export v2 (update-capable ingest keyed by source_hash).
    (answers); for phone consults the material is clinical notes, which is
    deeper PHI, so decide deliberately what phone consults contribute
    (candidates: category + ai_triage_results.message_summary + outcome, not
-   raw notes) and flag to Dr. Ousman if in doubt.
+   raw notes) and flag to Dr. Blen or Dr. Maraki if in doubt.
    OWNER DECISION (Nate, 2026-08-12): clinical notes ARE approved as export
    material for phone consults. His reasoning: names etc are not shared, he
    wants the most accurate content engine possible from the data in hand,

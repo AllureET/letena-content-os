@@ -284,6 +284,27 @@ export async function buildServer() {
             'approval.override may only be changed by the admin role', { guard: 'adminOnlySetting' }));
         }
       }
+      // review.clinical_review_enabled: whether a TIER_3/TIER_4 script that
+      // passes claim validation stops for a doctor's clinical sign-off, or
+      // auto-approves straight through (routeReviews() in content.mjs).
+      // Added 14 Aug 2026 (Nate: "we dont want to have clinical review
+      // anymore... allow this to just run so we can see that it works
+      // first... add an admin toggle... have it off for now") to unblock
+      // testing the rest of the pipeline (production, publish) without a
+      // human reviewer in the loop, with an explicit path back to turning
+      // it on. Admin-only and strict-boolean for the same reason
+      // approval.override is: this is a safety gate, not a preference, so a
+      // typo or a non-admin flipping it must not be possible.
+      if (key === 'review.clinical_review_enabled') {
+        if (typeof value !== 'boolean') {
+          return reply.code(422).send(err(422, 'VALIDATION_ERROR',
+            'review.clinical_review_enabled must be true or false'));
+        }
+        if (!req.actor.roles?.includes('admin')) {
+          return reply.code(403).send(err(403, 'FORBIDDEN',
+            'review.clinical_review_enabled may only be changed by the admin role', { guard: 'adminOnlySetting' }));
+        }
+      }
       // content.tone_preset selects the default tone/voice for AI-generated
       // copy (apps/api/src/ai/gateway.mjs); only a known, active preset key
       // is accepted so a typo cannot silently fall through to no guidance.
@@ -302,7 +323,7 @@ export async function buildServer() {
       if (!row.rows.length) return reply.code(404).send(err(404, 'NOT_FOUND', 'unknown setting'));
       invalidateSetting(key);
       await audit(null, { actor: req.actor, action: 'setting.updated', objectType: 'SETTING', objectCode: key,
-        toState: key === 'approval.override' || key === 'publishing.mode' ? String(value) : null });
+        toState: ['approval.override', 'publishing.mode', 'review.clinical_review_enabled'].includes(key) ? String(value) : null });
       return { ok: true, key, value };
     });
     // Provider credentials: statuses only, never values. settings.manage gated.

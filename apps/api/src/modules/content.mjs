@@ -594,7 +594,7 @@ export async function generateContent({ cardId, conceptId, outputTypes, question
 // What this does NOT change: resolveCardForGeneration() still requires
 // approval.override='ADMIN_TEST_MODE' plus an admin actor to touch an
 // unapproved card, exactly the door Nate had built for himself weeks ago to
-// test without waiting on Dr. Ousman; content made that way still carries
+// test without waiting on medical-director sign-off; content made that way still carries
 // is_test_content=true; and executePublish() in distribution.mjs still
 // re-checks card.status='APPROVED' at publish time no matter how the
 // content was generated. So bulk commission can run against the entire
@@ -847,19 +847,30 @@ export async function routeReviews(scriptId, riskTier) {
   // approved knowledge card that passed claim validation approve themselves.
   // AUTO_EXCEPT_SENSITIVE still routes TIER_4 (abortion, GBV) to a human.
   const mode = String(await setting('publishing.mode', 'DRAFT_BATCH'));
-  const autoOk = mode === 'FULL_AUTO'
+  const modeAutoOk = mode === 'FULL_AUTO'
     || (mode === 'AUTO_EXCEPT_SENSITIVE' && riskTier !== 'TIER_4');
+  const isClinicalTier = ['TIER_3', 'TIER_4'].includes(riskTier);
+  // Separate, dedicated kill switch for the clinical-sign-off gate itself
+  // (Settings -> admin toggle), independent of publishing.mode. Added 14 Aug
+  // 2026 to unblock testing the rest of the pipeline without a doctor in the
+  // loop; the plan is to turn this back on once that's verified, so it is
+  // its own setting rather than folded into publishing.mode's existing auto
+  // levels, which govern a broader set of behavior (language review too).
+  const clinicalReviewEnabled = Boolean(await setting('review.clinical_review_enabled', false));
+  const clinicalGateOff = isClinicalTier && !clinicalReviewEnabled;
+  const autoOk = modeAutoOk || clinicalGateOff;
   if (autoOk && s.validation_result === 'PASS' && s.created_by) {
     await q(`UPDATE lcos.scripts SET status='APPROVED', approved_by=created_by,
                approved_at=now(), approved_version=current_version
              WHERE id=$1 AND validation_result='PASS'`, [scriptId]);
     await q(`UPDATE lcos.review_tasks SET status='CANCELLED'
              WHERE object_type='SCRIPT' AND object_id=$1 AND status IN ('OPEN','IN_PROGRESS')`, [scriptId]);
-    await audit(null, { actor: { type: 'SYSTEM', label: `publishing.mode=${mode}` },
+    const reason = modeAutoOk ? `publishing.mode=${mode}` : 'review.clinical_review_enabled=false';
+    await audit(null, { actor: { type: 'SYSTEM', label: reason },
       action: 'script.auto_approved', objectType: 'SCRIPT', objectId: scriptId });
     return true;
   }
-  if (['TIER_3', 'TIER_4'].includes(riskTier)) {
+  if (isClinicalTier) {
     const slug = riskTier === 'TIER_4' ? 'medical_director' : 'consulting_doctor';
     const role = await one(`SELECT id FROM lcos.roles WHERE slug=$1`, [slug]);
     const sla = (await setting('review.sla_hours', {}))[riskTier] ?? 24;

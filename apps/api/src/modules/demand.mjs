@@ -387,36 +387,10 @@ export default async function routes(app) {
   // click (or a future cron) makes real progress without one uncapped call
   // running an unbounded number of AI classification calls.
   app.post('/questions/classify-pending', { preHandler: requirePerm('cluster.manage') }, async (req, reply) => {
-    const limit = Math.min(Math.max(Number(req.body?.limit) || 100, 1), 500);
-    const pending = (await q(
-      `SELECT id FROM lcos.audience_questions WHERE status='DEIDENTIFIED'
-       ORDER BY captured_at DESC LIMIT $1`, [limit])).rows;
-    let classified = 0, quarantinedNotGenuine = 0;
-    const failures = [];
-    for (const row of pending) {
-      try {
-        const result = await classifyQuestion(row.id);
-        if (result?.quarantined) quarantinedNotGenuine++;
-        else if (result) classified++;
-      } catch (e) {
-        failures.push({ question_id: row.id, error: e.message });
-      }
-    }
-    // Recompute the coverage-gap board in the same pass: it reads a
-    // materialized snapshot (topic_priority_scores/coverage_snapshots), not
-    // question_classifications live, so without this a freshly classified
-    // batch would sit invisible on Coverage gaps until someone with
-    // settings.manage separately clicked "Recompute now" -- confirmed live
-    // 13 Aug 2026 (classified questions existed, board stayed empty). Only
-    // bother if this batch actually classified something.
-    if (classified > 0) await computeDemand().catch(() => null);
-    const remaining = (await one(
-      `SELECT count(*)::int AS n FROM lcos.audience_questions WHERE status='DEIDENTIFIED'`)).n;
+    const result = await classifyPendingBatch(req.body?.limit);
     await audit(null, { actor: req.actor, action: 'question.bulk_classify', objectType: 'INGEST_BATCH',
-      reason: `${classified}/${pending.length} classified, ${quarantinedNotGenuine} not genuine questions, ${failures.length} failed` });
-    return reply.code(202).send({ attempted: pending.length, classified,
-      quarantined_not_genuine: quarantinedNotGenuine,
-      failed: failures.length, failures: failures.slice(0, 10), remaining_pending: remaining });
+      reason: `${result.classified}/${result.attempted} classified, ${result.quarantined_not_genuine} not genuine questions, ${result.failed} failed` });
+    return reply.code(202).send(result);
   });
 
   // ----- demand board -----
@@ -438,6 +412,41 @@ export default async function routes(app) {
 }
 
 // ---------- pipeline functions (exported for the orchestrator and tests) ----------
+// Bounded batch of classify-pending work, shared by the route handler and
+// the background sweep at the bottom of this file (added 14 Aug 2026:
+// manual/browser-driven sweeping of the backlog measured ~10-11s/question,
+// so clearing thousands of DEIDENTIFIED questions needed a real recurring
+// job, not a click).
+export async function classifyPendingBatch(limit = 100) {
+  limit = Math.min(Math.max(Number(limit) || 100, 1), 500);
+  const pending = (await q(
+    `SELECT id FROM lcos.audience_questions WHERE status='DEIDENTIFIED'
+     ORDER BY captured_at DESC LIMIT $1`, [limit])).rows;
+  let classified = 0, quarantinedNotGenuine = 0;
+  const failures = [];
+  for (const row of pending) {
+    try {
+      const result = await classifyQuestion(row.id);
+      if (result?.quarantined) quarantinedNotGenuine++;
+      else if (result) classified++;
+    } catch (e) {
+      failures.push({ question_id: row.id, error: e.message });
+    }
+  }
+  // Recompute the coverage-gap board in the same pass: it reads a
+  // materialized snapshot (topic_priority_scores/coverage_snapshots), not
+  // question_classifications live, so without this a freshly classified
+  // batch would sit invisible on Coverage gaps until someone with
+  // settings.manage separately clicked "Recompute now" -- confirmed live
+  // 13 Aug 2026 (classified questions existed, board stayed empty). Only
+  // bother if this batch actually classified something.
+  if (classified > 0) await computeDemand().catch(() => null);
+  const remaining = (await one(
+    `SELECT count(*)::int AS n FROM lcos.audience_questions WHERE status='DEIDENTIFIED'`)).n;
+  return { attempted: pending.length, classified, quarantined_not_genuine: quarantinedNotGenuine,
+    failed: failures.length, failures: failures.slice(0, 10), remaining_pending: remaining };
+}
+
 export async function classifyQuestion(questionId) {
   const question = await one(
     `SELECT * FROM lcos.audience_questions WHERE id=$1 AND status IN ('DEIDENTIFIED','CLASSIFIED')`,
@@ -645,4 +654,34 @@ export async function computeDemand() {
     inserted++;
   }
   return { computed_for: today, rows: inserted };
+}
+
+// ---------- background sweep (added 14 Aug 2026) ----------
+// Clears the classify-pending backlog automatically so it doesn't require
+// someone to keep a browser tab open and click a button every few minutes.
+// Guarded against overlapping runs (a slow AI call could otherwise let two
+// sweeps stack up) and against test runs (matches the NODE_ENV convention
+// already used in server.mjs for the request logger).
+let sweepRunning = false;
+async function backgroundClassifySweep() {
+  if (sweepRunning) return;
+  sweepRunning = true;
+  try {
+    const result = await classifyPendingBatch(30);
+    if (result.attempted > 0) {
+      await audit(null, { actor: { type: 'SYSTEM', label: 'classify-sweep' },
+        action: 'question.bulk_classify', objectType: 'INGEST_BATCH',
+        reason: `scheduled sweep: ${result.classified}/${result.attempted} classified, ` +
+          `${result.quarantined_not_genuine} not genuine, ${result.failed} failed, ` +
+          `${result.remaining_pending} still pending` }).catch(() => null);
+    }
+  } catch (e) {
+    // A bad interval tick must never crash the server -- swallow and retry
+    // on the next tick.
+  } finally {
+    sweepRunning = false;
+  }
+}
+if (process.env.NODE_ENV !== 'test') {
+  setInterval(backgroundClassifySweep, 5 * 60 * 1000);
 }

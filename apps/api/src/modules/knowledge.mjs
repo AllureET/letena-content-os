@@ -159,13 +159,25 @@ export default async function routes(app) {
   // Approves every attached IN_REVIEW claim the doctor did not author, then
   // runs the card through the normal state machine so all its guards
   // (reviewer-not-author, all-claims-approved, has-version) still hold.
+  //
+  // Found live 14 Aug 2026 (Nate: "claims approved (0) but card blocked").
+  // core.mjs's reviewerIsNotAuthor guard exempts admins (13 Aug fix, "a
+  // small team sometimes has only one person to draft and clear a card"),
+  // but this endpoint pre-selects claims with its own hand-rolled SQL
+  // before that guard ever runs, and that query still hardcoded
+  // `created_by <> actor`. For every card an admin authored themselves
+  // (which is all 20 of the seeded/generated ones here), that silently
+  // excluded every claim from the batch, so 0 got approved and the
+  // transition's own all-claims-approved guard then blocked the card with
+  // no indication why. Same admin exemption as the guard, applied here too.
   app.post('/knowledge/cards/:id/approve-with-claims',
     { preHandler: requirePerm('knowledge.approve') }, async (req, reply) => {
+    const isAdmin = req.actor.roles?.includes('admin');
     const claims = (await q(
       `SELECT mc.id, mc.code FROM lcos.knowledge_card_claims kcc
        JOIN lcos.medical_claims mc ON mc.id=kcc.claim_id
-       WHERE kcc.card_id=$1 AND mc.status IN ('DRAFT','IN_REVIEW') AND mc.created_by <> $2`,
-      [req.params.id, req.actor.id])).rows;
+       WHERE kcc.card_id=$1 AND mc.status IN ('DRAFT','IN_REVIEW') AND ($2::boolean OR mc.created_by <> $3)`,
+      [req.params.id, isAdmin, req.actor.id])).rows;
     for (const cl of claims) {
       await q(`UPDATE lcos.medical_claims SET status='APPROVED', reviewed_by=$2,
                  reviewed_at=now(), review_due_at=CURRENT_DATE + interval '12 months',

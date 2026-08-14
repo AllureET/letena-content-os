@@ -399,6 +399,78 @@ export default async function routes(app) {
     const r = await q(`SELECT * FROM lcos.v_coverage_gaps LIMIT 100`);
     return { items: r.rows };
   });
+
+  // Question volume per topic over time, for the Plan screen (Nate, 14 Aug
+  // 2026: "analyze our past questions maybe by week/by month etc. And we can
+  // get an understanding of how much of what content to make, then we can
+  // decide what topic"). Everything downstream of this decision already
+  // existed; what was missing was the decision itself having any evidence
+  // behind it. Until now demand was a single frozen number,
+  // question_count_30d, so you could not see that a topic doubled last month
+  // or has been fading since March.
+  //
+  // Counts CLASSIFIED questions only (a question with no topic yet cannot be
+  // attributed to one) and buckets on captured_at, the time the person
+  // actually asked, not when the classifier happened to get to it, so a
+  // backlog sweep does not create a fake spike on the day it ran.
+  app.get('/demand/trend', { preHandler: requirePerm('question.read') }, async (req) => {
+    // Whitelist, never interpolate: this value reaches date_trunc directly.
+    const bucket = req.query?.bucket === 'month' ? 'month' : 'week';
+    const periods = Math.min(Math.max(Number(req.query?.periods) || 12, 2), 52);
+    const r = await q(
+      `WITH buckets AS (
+         SELECT generate_series(
+           date_trunc($1, now()) - (($2::int - 1) || ' ' || $1)::interval,
+           date_trunc($1, now()),
+           ('1 ' || $1)::interval)::date AS bucket_start
+       ),
+       counts AS (
+         SELECT qc.topic_id,
+                date_trunc($1, aq.captured_at)::date AS bucket_start,
+                count(*)::int AS n
+         FROM lcos.audience_questions aq
+         JOIN lcos.question_classifications qc ON qc.question_id = aq.id
+         WHERE qc.topic_id IS NOT NULL
+           AND aq.captured_at >= date_trunc($1, now()) - (($2::int - 1) || ' ' || $1)::interval
+         GROUP BY qc.topic_id, 2
+       )
+       SELECT t.code AS topic_code, t.name_en AS topic_name, t.id AS topic_id,
+              b.bucket_start, COALESCE(c.n, 0) AS n
+       FROM lcos.topics t
+       CROSS JOIN buckets b
+       LEFT JOIN counts c ON c.topic_id = t.id AND c.bucket_start = b.bucket_start
+       WHERE t.is_active
+       ORDER BY t.sort_order, b.bucket_start`,
+      [bucket, periods]);
+
+    // Pivot to one row per topic with a dense series, so the client never has
+    // to reconstruct missing buckets (a topic with no questions in week 3
+    // must render a zero, not a gap, or the sparkline lies about the shape).
+    const byTopic = new Map();
+    for (const row of r.rows) {
+      if (!byTopic.has(row.topic_code)) {
+        byTopic.set(row.topic_code, { topic_code: row.topic_code, topic_name: row.topic_name,
+          topic_id: row.topic_id, series: [], total: 0 });
+      }
+      const t = byTopic.get(row.topic_code);
+      t.series.push({ bucket_start: row.bucket_start, n: row.n });
+      t.total += row.n;
+    }
+    const items = [...byTopic.values()].map((t) => {
+      const half = Math.floor(t.series.length / 2);
+      const older = t.series.slice(0, half).reduce((a, x) => a + x.n, 0);
+      const recent = t.series.slice(half).reduce((a, x) => a + x.n, 0);
+      return { ...t, current: t.series[t.series.length - 1]?.n ?? 0,
+        // Direction compares the recent half against the older half rather
+        // than last bucket against previous: a single quiet week should not
+        // read as a topic falling off.
+        direction: recent > older ? 'UP' : recent < older ? 'DOWN' : 'FLAT',
+        recent_half: recent, older_half: older };
+    }).sort((a, b) => b.total - a.total);
+
+    return { bucket, periods, buckets: [...new Set(r.rows.map(x => x.bucket_start))].sort(),
+      items };
+  });
   app.get('/demand/priority', { preHandler: requirePerm('question.read') }, async () => {
     const r = await q(
       `SELECT tps.*, t.code AS topic_code, t.name_en, kc.code AS card_code

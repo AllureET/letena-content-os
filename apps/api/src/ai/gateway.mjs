@@ -242,6 +242,8 @@ export const HOUSE_STYLE_RULES = `House writing rules. These apply to every piec
 - Never sign off like an assistant: no "I hope this helps!", no "Let me know if you have questions", nothing like it. This is not a chat reply, it is finished copy.
 - Never use antithesis ("it is not X, it is Y") as a rhetorical flourish. Only contrast two things when the contrast itself is the medically necessary clarification, and even then say it plainly rather than as a rhetorical pair.
 - Never use a rule-of-three phrase pattern ("safe, simple, and effective") as a stylistic flourish.
+- Never use engagement-bait phrasing. No "one simple trick", no "the one thing nobody tells you", no "you won't believe", no "doctors don't want you to know", no "here's the secret". A hook earns attention by being specific and true, not by borrowing the grammar of an advertisement. This is a health service and that phrasing costs it the trust it needs.
+- Never minimise or wave away the thing the reader is worried about. No "it's just a...", no "don't worry", no "simply", no "all you have to do is". She is asking because it matters to her. Explain how something works without implying she was silly to wonder.
 - Write plain human prose that matches the audience and the document type. Amharic is the primary language for Amharic copy, not a translation exercise: write the way people actually speak, not a stiff word-for-word rendering.`;
 
 // Resolves the effective tone preset's prompt instructions: an explicit

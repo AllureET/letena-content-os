@@ -54,33 +54,112 @@ const styleWarnHtml = (warnings) => (Array.isArray(warnings) && warnings.length)
 // knowledge card's code (views built before drill-down existed), so rows can
 // still link to the real card detail screen. Swallows a 403 quietly -- a
 // user without knowledge.read simply sees non-clickable rows there.
+// Sparkline: one series per topic, so no categorical palette and no legend
+// (the row label carries identity). History sits in a de-emphasised hue and
+// the current period takes the accent, which is the only thing colour is
+// doing here. Bars get a rounded data-end and a square baseline, separated
+// by 2px of surface rather than a stroke. An empty bucket draws a floor stub
+// rather than nothing, so a quiet week reads as zero instead of a gap.
+function sparkline(series, w = 132, h = 30) {
+  if (!series?.length) return '<span class="muted">—</span>';
+  const n = series.length;
+  const gap = 2;
+  const bw = Math.max(2, (w - gap * (n - 1)) / n);
+  const max = Math.max(1, ...series.map(d => d.n));
+  const bars = series.map((d, i) => {
+    const x = i * (bw + gap);
+    const bh = d.n > 0 ? Math.max(2, Math.round((d.n / max) * (h - 2))) : 1;
+    const y = h - bh;
+    const r = Math.min(4, bw / 2, bh);
+    const path = `M${x},${h} L${x},${y + r} Q${x},${y} ${x + r},${y} `
+      + `L${x + bw - r},${y} Q${x + bw},${y} ${x + bw},${y + r} L${x + bw},${h} Z`;
+    const isNow = i === n - 1;
+    const fill = d.n === 0 ? 'var(--line)' : isNow ? 'var(--plump-purple)' : '#C7C0DC';
+    return `<path d="${path}" fill="${fill}"><title>${esc(String(d.bucket_start).slice(0, 10))}: `
+      + `${d.n} question${d.n === 1 ? '' : 's'}</title></path>`;
+  }).join('');
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" class="spark">${bars}</svg>`;
+}
+
 async function cardCodeMap() {
   try { return new Map((await api('GET', '/knowledge/cards')).items.map(c => [c.code, c.id])); }
   catch { return new Map(); }
 }
 
 // ---------- navigation ----------
-const NAV = [
-  ['Overview', [['dashboard', 'Dashboard']]],
-  ['Audience intelligence', [
-    ['questions', 'Questions'], ['quarantine', 'Quarantine'],
-    ['clusters', 'Question clusters'], ['coverage', 'Coverage gaps']]],
-  ['Knowledge', [
-    ['cards', 'Knowledge library'], ['claims', 'Medical claims'],
-    ['sources', 'Medical sources'], ['terminology', 'Terminology'],
-    ['gaps', 'Knowledge gaps']]],
-  ['Content factory', [
-    ['families', 'Content families'], ['concepts', 'Creative concepts'],
-    ['scripts', 'Scripts'], ['reviews', 'Queue']]],
-  ['Production', [
-    ['production', 'Production queue'], ['assets', 'Asset library']]],
-  ['Distribution', [
-    ['calendar', 'Publishing calendar'], ['published', 'Published content'],
-    ['analytics', 'Analytics'], ['experiments', 'Experiments']]],
-  ['System', [
-    ['costs', 'Costs'], ['users', 'Users & roles'],
-    ['settings', 'Settings'], ['audit', 'Audit log']]],
+// Restructured 14 Aug 2026 (Nate: "I think some of these menu nav items would
+// serve better as tabs on one page. The menu has no flow or understanding").
+// Was 22 flat links across 7 groups named after schema sections (Audience
+// intelligence, Content factory, Distribution), which meant: everything
+// looked equally important whether you opened it hourly or never; three
+// levels of one object (family > concept > script) each held a top-level
+// slot though you only ever reach a concept from a script; the three
+// measurement screens were split across two groups; and two separate pairs
+// of screens shared a name. "Coverage gaps" (topics with demand and no
+// content) sat four items away from "Knowledge gaps" (facts a writer needed
+// and could not get approved), and "Queue" (human review) sat one group
+// above "Production queue" (renders in flight).
+//
+// Now 8 sections in pipeline order, each holding its screens as tabs.
+// Owner decision on the ordering (Nate, 14 Aug): a flat list in pipeline
+// order, NOT grouped by how often each is opened.
+//
+// Deliberately NOT a rewrite of any screen: every route id below is the
+// same route that existed before, so screens.* are untouched, the router is
+// untouched, and every existing link, bookmark and data-nav drill-down
+// still resolves exactly as it did. This is grouping and labelling only.
+const SECTIONS = [
+  ['today',      'Today',      [['dashboard', 'Today']]],
+  ['plan',       'Plan',       [['demand', 'Demand'], ['coverage', 'Gaps']]],
+  ['questions',  'Questions',  [['questions', 'Inbox'], ['clusters', 'Clusters'],
+                                ['quarantine', 'Quarantine']]],
+  ['knowledge',  'Knowledge',  [['cards', 'Cards'], ['claims', 'Claims'],
+                                ['sources', 'Sources'], ['terminology', 'Terminology'],
+                                ['gaps', 'Missing facts']]],
+  ['content',    'Content',    [['scripts', 'Scripts'], ['reviews', 'Review queue'],
+                                ['concepts', 'Concepts'], ['families', 'Families']]],
+  ['production', 'Production', [['production', 'Renders'], ['assets', 'Assets']]],
+  ['publishing', 'Publishing', [['calendar', 'Calendar'], ['published', 'Published']]],
+  ['insights',   'Insights',   [['analytics', 'Performance'], ['experiments', 'Experiments'],
+                                ['costs', 'Costs']]],
+  ['admin',      'Admin',      [['users', 'Users & roles'], ['settings', 'Settings'],
+                                ['audit', 'Audit log']]],
 ];
+
+// Detail screens are not tabs, but still belong to a section so the sidebar
+// keeps the right item lit while you are three clicks deep in a record.
+const DETAIL_SECTION = {
+  question: 'questions', card: 'knowledge', script: 'content', render: 'production',
+};
+
+// route id -> [sectionId, sectionLabel, tabs]
+const SECTION_OF = (() => {
+  const m = new Map();
+  for (const [id, label, tabs] of SECTIONS) {
+    for (const [route] of tabs) m.set(route, [id, label, tabs]);
+  }
+  return m;
+})();
+
+function sectionFor(route) {
+  if (SECTION_OF.has(route)) return SECTION_OF.get(route);
+  const parent = DETAIL_SECTION[route];
+  if (parent) return SECTIONS.filter(s => s[0] === parent).map(s => [s[0], s[1], s[2]])[0];
+  return null;
+}
+
+// Tab strip for the active section, rendered above every screen. Hidden for
+// single-screen sections (Today) and while inside a detail record, where the
+// screen already carries its own back link and the tabs would be lying about
+// where you are.
+function tabsFor(route) {
+  const sec = sectionFor(route);
+  if (!sec) return '';
+  const [, , tabs] = sec;
+  if (tabs.length < 2 || !SECTION_OF.has(route)) return '';
+  return `<div class="tabs">${tabs.map(([id, label]) =>
+    `<a href="#/${id}" class="tab ${id === route ? 'on' : ''}">${label}</a>`).join('')}</div>`;
+}
 
 function shell(active, content) {
   return `<div id="shell">
@@ -88,13 +167,16 @@ function shell(active, content) {
     <div id="navveil"></div>
     <nav id="side">
       <div class="mark">letena<b>.</b>os</div>
-      ${NAV.map(([grp, items]) => `<div class="grp">${grp}</div>` +
-        items.map(([id, label]) =>
-          `<a href="#/${id}" class="${active === id ? 'on' : ''}">${label}</a>`).join('')).join('')}
+      ${(() => {
+        const sec = sectionFor(active);
+        const activeSection = sec ? sec[0] : null;
+        return SECTIONS.map(([id, label, tabs]) =>
+          `<a href="#/${tabs[0][0]}" class="${id === activeSection ? 'on' : ''}">${label}</a>`).join('');
+      })()}
       <div class="grp">${esc(ME?.full_name ?? '')}</div>
       <a href="#" id="logout">Sign out</a>
     </nav>
-    <main id="main">${content}</main>
+    <main id="main">${tabsFor(active)}${content}</main>
   </div>`;
 }
 
@@ -272,6 +354,96 @@ const screens = {
         <td>${g.question_count_30d ?? 0}</td><td>${g.content_count_90d ?? 0}</td>
         <td>${pill(g.coverage_state)}</td><td><b>${Number(g.priority_score).toFixed(0)}</b></td></tr>`; }).join('')
       || '<tr><td colspan=7 class="empty">No gap rows yet. Ingest questions and recompute.</td></tr>'}
+      </table></div>`;
+  },
+
+  // Plan: what people are asking about over time, and start the content that
+  // answers it, in the same place. Nate, 14 Aug 2026: "analyze our past
+  // questions maybe by week/by month etc... then we can decide what topic,
+  // and you can generate a script based on a question from that topic" and,
+  // on finding the platform picker buried on the card page, "who cares if
+  // its on the knowledge library card, if its not going to help me generate
+  // a script in the way the system has it. Put it in the right place before
+  // i choose to generate a script."
+  //
+  // So the decision and the action are one screen: demand trend, the cards
+  // that answer each topic, and the platform picker at the moment of
+  // choosing, not two sections away.
+  async demand() {
+    const bucket = (location.hash.split('?')[1] || '').includes('month') ? 'month' : 'week';
+    const [trend, cards] = await Promise.all([
+      api('GET', `/demand/trend?bucket=${bucket}&periods=12`),
+      api('GET', '/knowledge/cards').catch(() => ({ items: [] })),
+    ]);
+    let outputTypes = [];
+    try { outputTypes = (await api('GET', '/content/output-types')).items; } catch {}
+
+    const cardsByTopic = new Map();
+    for (const c of cards.items ?? []) {
+      if (!cardsByTopic.has(c.topic_code)) cardsByTopic.set(c.topic_code, []);
+      cardsByTopic.get(c.topic_code).push(c);
+    }
+
+    const range = trend.buckets?.length
+      ? `${String(trend.buckets[0]).slice(0, 10)} to ${String(trend.buckets[trend.buckets.length - 1]).slice(0, 10)}`
+      : '';
+    const hasAny = (trend.items ?? []).some(t => t.total > 0);
+
+    const rows = (trend.items ?? []).map(t => {
+      const tcards = cardsByTopic.get(t.topic_code) ?? [];
+      const approved = tcards.filter(c => c.status === 'APPROVED');
+      const dir = t.direction === 'UP' ? '<span class="trend-up">rising</span>'
+        : t.direction === 'DOWN' ? '<span class="trend-down">falling</span>'
+        : '<span class="muted">steady</span>';
+      const gen = outputTypes.length && can('question.turn_into_content') && tcards.length
+        ? `<details class="genbox"><summary>Make content</summary>
+            <div class="genpanel">
+              <div class="muted" style="font-size:12px;margin-bottom:8px">
+                Pick the platforms you actually want. Only these get made.</div>
+              ${tcards.map(c => `<div class="gencard">
+                <div class="flex" style="margin-bottom:8px">
+                  <b class="mono">${esc(c.code)}</b>
+                  <span class="muted" style="font-size:12px">${esc(c.canonical_question_en ?? '')}</span>
+                  <div class="spacer"></div>${pill(c.status)}</div>
+                ${c.status !== 'APPROVED'
+                  ? '<div class="muted" style="font-size:12px">Not approved yet, so this needs the admin test-mode override in Settings to generate.</div>' : ''}
+                <div class="flex" style="flex-wrap:wrap;row-gap:8px">
+                  ${outputTypes.map(ot => `<label class="otpick">
+                    <input type="checkbox" class="gen-ot-${esc(c.id)}" value="${esc(ot.code)}">
+                    ${esc(ot.label)} <span class="muted">${esc(ot.platform ?? '')}</span></label>`).join('')}
+                </div>
+                <div style="margin-top:10px">
+                  <button class="primary" data-plangenerate="${esc(c.id)}">Generate selected</button></div>
+              </div>`).join('')}
+            </div></details>`
+        : tcards.length ? '' : '<span class="muted" style="font-size:12px">No card yet</span>';
+      return `<tr>
+        <td><b>${esc(t.topic_name)}</b><div class="muted mono" style="font-size:11px">${esc(t.topic_code)}</div></td>
+        <td>${sparkline(t.series)}</td>
+        <td class="num">${t.total}</td>
+        <td class="num">${t.current}</td>
+        <td>${dir}</td>
+        <td>${approved.length ? `${approved.length} approved`
+          : tcards.length ? `<span class="muted">${tcards.length} in review</span>`
+          : '<span class="muted">none</span>'}</td>
+        <td>${gen}</td></tr>`;
+    }).join('');
+
+    return `<h1>Plan</h1><div class="sub">What people are actually asking, and the content that answers it</div>
+      <div class="filterrow">
+        <div class="seg">
+          <a href="#/demand?week" class="${bucket === 'week' ? 'on' : ''}">By week</a>
+          <a href="#/demand?month" class="${bucket === 'month' ? 'on' : ''}">By month</a>
+        </div>
+        <span class="muted" style="font-size:12px">Last 12 ${bucket}s${range ? ` · ${esc(range)}` : ''}</span>
+      </div>
+      ${!hasAny ? `<div class="card"><b>No classified questions in this window yet.</b>
+        <div class="muted" style="font-size:13px;margin-top:4px">Questions only count here once they have been
+        classified to a topic. Run Classify pending on the Questions screen, then come back.</div></div>` : ''}
+      <div class="card"><table class="plantable">
+        <tr><th>Topic</th><th>Last 12 ${bucket}s</th><th class="num">Total</th><th class="num">This ${bucket}</th>
+          <th>Direction</th><th>Knowledge</th><th></th></tr>
+        ${rows || '<tr><td colspan="7" class="empty">No topics.</td></tr>'}
       </table></div>`;
   },
 
@@ -908,7 +1080,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') document.body.classList.remove('nav-open');
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
   if (!b) {
     // A real link (external platform URL, download, backlink) inside a
     // drill-down row must keep its native navigation; only fall through to
@@ -1056,6 +1228,19 @@ document.addEventListener('click', async (e) => {
       } else {
         toast('Published to ' + platform);
       }
+      return render();
+    }
+    if (b.dataset.plangenerate) {
+      const id = b.dataset.plangenerate;
+      const picked = Array.from(document.querySelectorAll('.gen-ot-' + CSS.escape(id) + ':checked'))
+        .map(x => x.value);
+      if (!picked.length) return toast('Tick at least one platform first.', 'warn');
+      b.disabled = true; b.textContent = `Generating ${picked.length}…`;
+      try {
+        const r = await api('POST', '/content/generate', { card_id: id, output_types: picked });
+        toast(`Made ${r.scripts?.length ?? 0} script${r.scripts?.length === 1 ? '' : 's'} for `
+          + `${picked.length} platform${picked.length === 1 ? '' : 's'}. Open Content to review.`);
+      } catch (e) { toast(e.message ?? 'Generation failed', 'warn'); }
       return render();
     }
     if (b.dataset.cardgenerate) {
@@ -1216,7 +1401,12 @@ async function render() {
     };
     return;
   }
-  const [route, arg] = (location.hash.replace(/^#\//, '') || 'dashboard').split('/');
+  // Strip any ?query before routing. The Plan screen carries its week/month
+  // choice in the hash (#/demand?month) so the view is linkable and survives
+  // a refresh; without this split the route would read as "demand?month",
+  // match no screen, and silently fall back to the dashboard.
+  const [path] = (location.hash.replace(/^#\//, '') || 'dashboard').split('?');
+  const [route, arg] = path.split('/');
   const fn = screens[route] ?? screens.dashboard;
   app.innerHTML = shell(route, '<div class="muted">Loading…</div>');
   try {

@@ -80,9 +80,32 @@ export default async function routes(app) {
       return reply.code(status).send(err(status, e.code ?? 'INTERNAL', e.message, { guard: e.guard }));
     }
   });
+  // Manual re-validation from the review screen. Found live 14 Aug 2026: a
+  // script that FAILs on its first pass (through the Turn Into Content
+  // pipeline, processGeneratedScript) never reaches routeReviews() -- that
+  // function only runs once, right after a first-time PASS, inside the
+  // generation pipeline itself. So a script fixed and re-validated by hand
+  // here would sit at status=VALIDATED forever with no review task and no
+  // way for a human to ever see it (SCR-35ACBC7C, the claim_validator
+  // precision fix). Mirror the pipeline's own behavior: the first time a
+  // script reaches PASS with no review_tasks row yet at all (regardless of
+  // how many failed attempts came before), route it, exactly like a
+  // freshly-generated script that passed immediately would be. Guarded on
+  // "no review_tasks row ever" rather than on script status, so this never
+  // fires twice for the same script and never re-routes one already in or
+  // past review.
   app.post('/content/scripts/:id/validate', { preHandler: requirePerm('script.write') }, async (req, reply) => {
     const result = await validateScript(req.params.id, { actor: req.actor });
     if (!result) return reply.code(404).send(err(404, 'NOT_FOUND', 'script'));
+    if (result.overall_result === 'PASS') {
+      const alreadyRouted = await one(
+        `SELECT id FROM lcos.review_tasks WHERE object_type='SCRIPT' AND object_id=$1 LIMIT 1`,
+        [req.params.id]);
+      if (!alreadyRouted) {
+        const s = await one(`SELECT risk_tier FROM lcos.scripts WHERE id=$1`, [req.params.id]);
+        await routeReviews(req.params.id, s.risk_tier);
+      }
+    }
     return result;
   });
   app.post('/content/scripts/:id/localize', { preHandler: requirePerm('script.write') }, async (req, reply) => {

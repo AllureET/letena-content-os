@@ -1,5 +1,48 @@
 # BUILD_STATE — Letena Content OS
 
+Authoritative resume point. Updated 2026-08-14, working directly against
+Nate's Mac checkout (/Users/natezewdu/Desktop/lcos, connected this session
+via the device bridge), branch main, HEAD 7103682, clean, tracking
+origin/main. The paragraph below dated 2026-08-12 was the previous
+resume point and is left in place as history, not current status.
+
+STABILITY + AUTOMATION FIXES SHIPPED 13-14 Aug, the day after the bulk-
+generation ship below, in commit order: batch-size choice (100/250/500)
+added to "Classify pending questions"; deploy.sh hardened three times over
+(real SSH error surfaced instead of a blanket "not configured", switched
+from root to lcossvc with a narrow sudo rule scoped to just restarting
+lcos-api, retries a transient Postgres auth blip on migrate instead of
+aborting the whole deploy after code already landed on disk); audit-log
+crash on bulk classify/cleanup/commission fixed. ROOT CAUSE FOUND for
+"every real AI call silently failing all night": Anthropic rejects the
+temperature param on this model, provider.mjs no longer sends it. The
+question_classifier prompt was given a schema-derived field guide injected
+at call time, fixing recurring SCHEMA_FAIL errors. The classifier now reads
+the full thread and the doctor's answer_text when a consult captured them,
+not just the opening message (Nate caught this live: "are you sure youre
+reading the back and forth and not just the original question"), and a new
+is_genuine_question flag (migration 0010) quarantines greetings and bare
+demographic replies ("Eshi", "Age 28 Addis Ababa") instead of feeding them
+into the demand clusters. The EMR SSO hand-off endpoint was being rejected
+by the global bearer-token check before its own signature check ever ran,
+now exempted. topic_priority_scores had a uniqueness rule that a NULL
+card/segment made into a no-op, letting duplicate rows pile up, fixed with
+NULLS NOT DISTINCT plus a one-time dedupe (migration 0011). And
+classify-pending now runs automatically every 5 minutes, so the backlog
+clears without anyone needing a browser tab open.
+
+Real gap found and flagged, NOT fixed yet: cron_lcos_export_inquiries.php
+on the EMR side guesses at table names (consult_message,
+clarification_threads, answers) that do not exist anywhere in the live
+emr_v2 codebase, so it silently falls back to exporting the opening message
+alone for every written/chat consult reaching LCOS today. The classifier
+can now use a full thread when it has one; almost none of today's live
+traffic actually supplies one. This is exactly the EMR full-inquiry
+exporter v2 work already on the next-tasks list below (needs the real
+unified_inbox join, not a guessed table name), and it is now the concrete
+reason single-message classification is still the common case in practice,
+not a data-availability problem on the LCOS side.
+
 BULK GENERATION SHIPPED 2026-08-12 (Nate decision: "I don't want to have to
 approve knowledge cards anymore... generate content automatically... human
 approval each step of the way, IE script, ie video"). Root cause of "why do
@@ -362,9 +405,14 @@ claims, reviewer) → analytics (honest nulls) → scores → demand recompute.
 
 ## Next tasks (post-pivot order; items 1-6 in THE PIVOT section come first)
 
-1. Knowledge cards basics library (pivot item 1) — the content blocker.
+1. DONE Knowledge cards basics library (pivot item 1) — was the content
+   blocker; bulk generation + the 13-14 Aug stability fixes above are what
+   actually made it usable end to end.
 2. English-first UI + drill-downs + ui-ux-pro-max pass (pivot items 2-4).
-3. EMR full-inquiry exporter v2 (pivot item 5).
+3. EMR full-inquiry exporter v2 (pivot item 5) — now higher priority than
+   it looks on this list: it is the fix for the guessed-table-names gap
+   flagged just above, which is currently the main reason the classifier
+   is starved of thread context on live traffic.
 4. WF12-style asset binding in the production router: search library for
    scene_plan asset_requirements and bind storage keys into the Creatomate
    payload (currently typography-only modifications ship)
@@ -382,13 +430,22 @@ claims, reviewer) → analytics (honest nulls) → scores → demand recompute.
 
 ## Migration status
 
-0001_init.sql + 0002_emr_integration.sql applied clean from zero. Runner
-records in public.schema_migrations. Forward-only.
+0001_init.sql through 0011_topic_priority_dedupe.sql, forward-only, runner
+records in public.schema_migrations. As of 14 Aug: 0001 full schema, 0002
+EMR integration, 0003 EMR topic slugs, 0004 full inquiries (thread/answer),
+0005 publishing mode, 0006 translations + voice lexicon, 0007 admin
+test-mode + output types, 0008 platform specs, 0009 tone presets, 0010
+classifier full-thread + is_genuine_question, 0011 topic_priority_scores
+dedupe. Applied live on lcos-1 through deploy.sh's migrate step.
 
 ## Test status
 
-`npm test` -> 102/102 green (last run this session, platform-specs increment).
-`npm run demo` -> 14/14 steps complete (includes the language-review gate).
+Last confirmed count was 102/102 green as of the platform-specs increment
+(12 Aug), before the 13-14 Aug stability fixes above. Not independently
+re-run as part of this update: neither this session's cloud sandbox nor the
+device-bridge connection to Nate's Mac has a reachable Postgres to test
+against. Whoever runs `npm test` next against a real DB should update this
+line with the actual current count.
 
 ## Run instructions
 
@@ -399,7 +456,13 @@ npm test && npm run demo && npm run api   # UI at :8080
 
 ## Continuation command
 
-Say: **"Continue building LCOS from BUILD_STATE.md — start with the next five
-tasks."** The repo is at `/home/claude/lcos` in the session workspace and the
-full copy is archived in the Claude project as lcos-repo snapshot; docs are in
-`claude/letena_content_os/`.
+Say: **"Continue building LCOS from BUILD_STATE.md — start with the next
+task."** The real, current repo is Nate's Mac checkout at
+`/Users/natezewdu/Desktop/lcos` (connect it via the device bridge, on
+branch main, remote origin -> github.com/AllureET/letena-content-os).
+There is also an orphaned, stale clone at `/home/claude/lcos` in a cloud
+session's own sandbox workspace with no git remote and no ssh binary
+available; it forked from an earlier point in this repo's history and
+diverged, do not use it as a source of truth or push from it, the Mac
+checkout above is authoritative. Docs are in `claude/letena_content_os/`
+in the Letena Ethiopia Claude project.

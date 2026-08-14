@@ -6,6 +6,10 @@ import { invokeAgent, embed } from '../ai/gateway.mjs';
 import { lintStyle } from '../ai/style_lint.mjs';
 import { validatorOverlay, overallResult, computeRiskTier } from '../../../../packages/scoring/src/index.mjs';
 import { formatOf, bodyTextOf } from '../formats.mjs';
+import { isAbortionAdjacent } from '../letena_canon.mjs';
+import { classifyEdit } from '../pipeline_rules.mjs';
+import { signGate, invalidateMedicalSignoff, signerRoleFor } from './pipeline.mjs';
+import { containsForbidden } from '../../../../packages/deid/src/index.mjs';
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -170,6 +174,19 @@ export default async function routes(app) {
       await audit(client, { actor: req.actor, action: `review.${decision.toLowerCase()}`,
         objectType: task.object_type, objectId: task.object_id, reason: req.body?.comment });
       return { ok: true, review_task_id: task.id, decision, recorded_in: table };
+    }).then(async (result) => {
+      // A human clinical approval of a script IS the medical_review gate
+      // signature (Run One): the same act, recorded in both the review
+      // table and the signed-gate ledger the publish transition checks.
+      // Outside the tx deliberately: a gate row is idempotent and losing it
+      // is recoverable by re-signing, where failing the review write is not.
+      if (result.ok && task.review_type === 'CLINICAL_SCRIPT' && task.object_type === 'SCRIPT'
+          && decision.startsWith('APPROVED')) {
+        await signGate(task.object_id, 'medical_review', { signedBy: req.actor.id,
+          note: `clinical review ${decision.toLowerCase()}`,
+          signedRole: signerRoleFor(req.actor, 'medical_review') });
+      }
+      return result;
     });
   });
 
@@ -210,6 +227,20 @@ export default async function routes(app) {
         await audit(client, { actor: req.actor, action: 'script.batch_approved',
           objectType: 'SCRIPT', objectId: s.id, objectCode: s.code });
       });
+      // Batch approval by someone holding the clinical permission signs the
+      // medical_review gate too, so Nate's one-click flow stays one click
+      // while the gate the publish transition checks is a real, signed
+      // record. An editorial-only approver does NOT sign it: their click
+      // approves the script status, and publish still waits for a clinical
+      // signature, because medical_review before publish has no exceptions.
+      if (req.actor.permissions.includes('script.approve_clinical')) {
+        await signGate(s.id, 'medical_review', { signedBy: req.actor.id, note: 'batch approval',
+          signedRole: signerRoleFor(req.actor, 'medical_review') });
+        if (s.needs_clinical_signoff) {
+          await signGate(s.id, 'clinical_signoff', { signedBy: req.actor.id, note: 'batch approval',
+            signedRole: signerRoleFor(req.actor, 'clinical_signoff') });
+        }
+      }
       approved++;
     }
     // Renders that succeeded but lack their final look also clear here.
@@ -244,11 +275,15 @@ export default async function routes(app) {
   // invokeAgent() -- turn-into-content here, and the output_types-based
   // POST /content/generate below.
   app.post('/content/turn-into-content', { preHandler: requirePerm('question.turn_into_content') }, async (req, reply) => {
-    const { question_id, languages = ['EN', 'AM'], concept_count = 2, tone_preset = null } = req.body ?? {};
+    const { question_id, languages = ['EN', 'AM'], concept_count = 2, tone_preset = null,
+      audience = 'WOMEN' } = req.body ?? {};
     if (!question_id) return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'question_id required'));
+    if (!AUDIENCES.includes(audience)) {
+      return reply.code(422).send(err(422, 'VALIDATION_ERROR', `audience must be one of ${AUDIENCES.join(', ')}`));
+    }
     try {
       const result = await turnIntoContent({ questionId: question_id, languages, conceptCount: concept_count,
-        actor: req.actor, tonePreset: tone_preset });
+        actor: req.actor, tonePreset: tone_preset, audience });
       return reply.code(202).send(result);
     } catch (e) {
       const status = e.status ?? 500;
@@ -271,14 +306,143 @@ export default async function routes(app) {
        FROM lcos.content_output_types WHERE is_active ORDER BY sort_order`);
     return { items: r.rows };
   });
+
+  // The unified format registry (migration 0019). One row per format Letena
+  // publishes anywhere; adding a format is a row, never a code change.
+  // Writes happen by migration, deliberately: headings and rules feed the
+  // writer prompt and the stage/gate machinery, so a change to them is a
+  // reviewed change, the same discipline as prompt versions.
+  app.get('/content/formats', { preHandler: requirePerm('concept.read') }, async () => {
+    const r = await q(
+      `SELECT code, label, kind, surface, platforms, language_mode, body_kind, video_family,
+              headings, rules, body_schema, stages_applicable, review_ladder, target_length,
+              hedging_allowed, wants_captions, ends_at_door, is_internal, sort_order, description,
+              comment_prompt_allowed, production_paths, cta_spec
+       FROM lcos.content_formats WHERE is_active ORDER BY sort_order`);
+    return { items: r.rows };
+  });
+
+  // Edit a script's body after generation. THIS IS THE EDIT PATH. Run One
+  // invalidated the medical sign-off on ANY body change; the owner refined
+  // it 14 Aug 2026: "if the edit is to a medical term, it should go back to
+  // medical review, if its to just the content then it should go through
+  // and the updated amharic should be used to retrain the descriptions for
+  // output". So the edit is CLASSIFIED, deterministically (classifyEdit in
+  // pipeline_rules.mjs): a change to any claim-mapped statement, number,
+  // time window, negation, hedge, dose or terminology term is MEDICAL and
+  // withdraws medical_review and clinical_signoff, resets validation, and
+  // returns the piece to medical review. A change to non-medical text only
+  // (a hook rewrite, a caption, pacing) passes and the sign-off stands, and
+  // any corrected Amharic in it is stored as an approved phrasing example
+  // that the localizer prompt learns from. Conservative at the boundary:
+  // when the classifier cannot tell, the edit is medical.
+  app.post('/content/scripts/:id/edit', { preHandler: requirePerm('script.write') }, async (req, reply) => {
+    const s = await one(`SELECT * FROM lcos.scripts WHERE id=$1`, [req.params.id]);
+    if (!s) return reply.code(404).send(err(404, 'NOT_FOUND', 'script'));
+    const v = await one(`SELECT * FROM lcos.script_versions WHERE script_id=$1 AND version=$2`,
+      [s.id, s.current_version]);
+    if (!v) return reply.code(422).send(err(422, 'GUARD_FAILED', 'script has no version to edit'));
+
+    const b = req.body ?? {};
+    // Only these fields are editable; anything else in the payload is
+    // ignored rather than stored, so a client cannot write fields the
+    // pipeline does not know how to validate.
+    const EDITABLE = ['hook', 'spoken_script', 'onscreen_text', 'scene_plan', 'carousel_slides',
+      'static_graphic', 'post_text', 'body', 'cta', 'caption', 'caption_short', 'caption_fbtg',
+      'caption_x', 'captions_by_platform', 'hashtags'];
+    const next = {};
+    for (const f of EDITABLE) next[f] = (f in b) ? b[f] : v[f];
+
+    const newBodyText = bodyTextOf(next);
+    if (!newBodyText) {
+      return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'the edit would leave the piece with no text at all'));
+    }
+    const oldBodyText = bodyTextOf(v);
+    const newHash = sha(newBodyText);
+    const changed = newHash !== v.content_sha256;
+    const fmtRow = await formatRowForScript(s.id);
+    const stayEnglish = await stayEnglishTerms();
+    const styleWarnings = lintStyle(newBodyText, { hedgingAllowed: !!fmtRow?.hedging_allowed,
+      commentPromptAllowed: fmtRow ? !!fmtRow.comment_prompt_allowed : true, stayEnglish });
+    // What kind of edit is this? Claim-mapped statements for the version
+    // being edited, plus the stay-English terminology, feed the classifier.
+    const claimStatements = (await q(
+      `SELECT statement FROM lcos.script_claims WHERE script_id=$1 AND script_version=$2`,
+      [s.id, s.current_version])).rows.map((r) => r.statement);
+    const editClass = changed
+      ? classifyEdit({ oldText: oldBodyText, newText: newBodyText, claimStatements,
+          terminologyTerms: stayEnglish })
+      : { medical: false, reasons: ['no textual change'] };
+
+    const nv = s.current_version + 1;
+    await q(
+      `INSERT INTO lcos.script_versions (script_id, version, hook, spoken_script, onscreen_text,
+         scene_plan, cta, caption, hashtags, platform_variants, estimated_duration_s, content_sha256,
+         created_by, tone_preset, style_warnings, format, carousel_slides, static_graphic, post_text,
+         body, caption_short, caption_fbtg, caption_x, captions_by_platform, authored_by, change_summary)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+               'AGENT_HUMAN_EDITED',$25)`,
+      [s.id, nv, next.hook, next.spoken_script ?? '', JSON.stringify(next.onscreen_text ?? []),
+       JSON.stringify(next.scene_plan ?? []), next.cta, next.caption ?? null,
+       next.hashtags ?? [], JSON.stringify(v.platform_variants ?? {}), v.estimated_duration_s,
+       newHash, req.actor.id, v.tone_preset, JSON.stringify(styleWarnings),
+       v.format ?? 'VIDEO', JSON.stringify(next.carousel_slides ?? []),
+       next.static_graphic ? JSON.stringify(next.static_graphic) : null, next.post_text ?? null,
+       JSON.stringify(next.body ?? {}), next.caption_short ?? null, next.caption_fbtg ?? null,
+       next.caption_x ?? null, JSON.stringify(next.captions_by_platform ?? {}),
+       req.body?.change_summary ?? 'human edit']);
+    // Carry the claim map forward so re-validation has a map to check. The
+    // editor is expected to re-run validation; the status reset below makes
+    // that unavoidable before approval.
+    await q(`INSERT INTO lcos.script_claims (script_id, script_version, claim_id, statement, location)
+             SELECT script_id, $2, claim_id, statement, location FROM lcos.script_claims
+             WHERE script_id=$1 AND script_version=$3`, [s.id, nv, s.current_version]);
+    await q(`UPDATE lcos.scripts SET current_version=$2, content_sha256=$3 WHERE id=$1`, [s.id, nv, newHash]);
+
+    let invalidated = false;
+    if (changed && editClass.medical) {
+      invalidated = await invalidateMedicalSignoff(s.id, {
+        actor: req.actor,
+        reason: `medical edit: ${editClass.reasons.join('; ')}` });
+    } else if (changed) {
+      // Non-medical edit: the sign-off stands, and the corrected Amharic
+      // feeds back. Every Ethiopic-script line that changed is stored as an
+      // approved phrasing example; the localizer prompt injects recent ones
+      // ("retrain the descriptions", owner, 14 Aug 2026; no fine-tuning).
+      const newAm = extractAmharicSegments(newBodyText);
+      const oldAm = new Set(extractAmharicSegments(oldBodyText));
+      for (const seg of newAm) {
+        if (!oldAm.has(seg)) {
+          await q(`INSERT INTO lcos.phrasing_examples (script_id, amharic_text, english_context, note, created_by)
+                   VALUES ($1,$2,$3,$4,$5)`,
+            [s.id, seg, (next.hook ?? '').slice(0, 300),
+             'human-corrected Amharic from a non-medical edit', req.actor.id]);
+        }
+      }
+    }
+    await audit(null, { actor: req.actor, action: 'script.edited', objectType: 'SCRIPT',
+      objectId: s.id, objectCode: s.code,
+      reason: !changed ? 'no textual change'
+        : editClass.medical ? `medical edit; sign-off invalidated (${editClass.reasons.join('; ')})`
+        : 'non-medical edit; sign-off stands; Amharic phrasing captured' });
+    return { script_id: s.id, version: nv, content_changed: changed,
+      edit_class: editClass.medical ? 'MEDICAL' : 'NON_MEDICAL', edit_reasons: editClass.reasons,
+      medical_signoff_invalidated: invalidated, style_warnings: styleWarnings };
+  });
   app.post('/content/generate', { preHandler: requirePerm('question.turn_into_content') }, async (req, reply) => {
-    const { card_id, concept_id, output_types, question_id, languages = ['EN', 'AM'], tone_preset = null } = req.body ?? {};
+    const { card_id, concept_id, output_types, formats, question_id, languages = ['EN', 'AM'],
+      tone_preset = null, audience = 'WOMEN', is_brand_tier = false } = req.body ?? {};
     if (!card_id && !concept_id) {
       return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'card_id (topic) or concept_id is required'));
     }
+    if (!AUDIENCES.includes(audience)) {
+      return reply.code(422).send(err(422, 'VALIDATION_ERROR', `audience must be one of ${AUDIENCES.join(', ')}`));
+    }
     try {
       const result = await generateContent({ cardId: card_id, conceptId: concept_id,
-        outputTypes: output_types, questionId: question_id, languages, actor: req.actor, tonePreset: tone_preset });
+        outputTypes: output_types, formatCodes: formats, questionId: question_id,
+        languages, actor: req.actor, tonePreset: tone_preset, audience,
+        isBrandTier: !!is_brand_tier });
       return reply.code(202).send(result);
     } catch (e) {
       const status = e.status ?? 500;
@@ -366,7 +530,7 @@ export async function resolveCardForGeneration(cardIdOrCode, actor) {
 
 // ============ pipeline ============
 
-export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], actor, tonePreset = null }) {
+export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], actor, tonePreset = null, audience = 'WOMEN' }) {
   const steps = [];
   const step = (name, status, extra = {}) => { steps.push({ step: name, status, ...extra }); };
   const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
@@ -434,11 +598,11 @@ export async function turnIntoContent({ questionId, languages = ['EN', 'AM'], ac
     const row = await one(
       `INSERT INTO lcos.content_concepts (code, family_id, video_family, title, hook_line, premise,
          treatment, perspective, characters, target_duration_s, claim_ids_referenced, cta_intent,
-         why_this_works, status)
-       VALUES ($1,$2,$3::lcos.video_family,$4,$5,$6,$7,$8,$9,$10,$11::uuid[],$12,$13,'SELECTED') RETURNING *`,
+         why_this_works, status, audience)
+       VALUES ($1,$2,$3::lcos.video_family,$4,$5,$6,$7,$8,$9,$10,$11::uuid[],$12,$13,'SELECTED',$14) RETURNING *`,
       [code('CC'), family.id, c.video_family, c.title, c.hook_line, c.premise, c.treatment,
        c.perspective ?? null, JSON.stringify(c.characters ?? []), c.target_duration_s,
-       c.claim_ids_referenced, c.cta_intent, c.why_this_works]);
+       c.claim_ids_referenced, c.cta_intent, c.why_this_works, audience]);
     conceptRows.push(row);
   }
   step('generate_concepts', 'SUCCEEDED', { count: conceptRows.length });
@@ -494,8 +658,9 @@ async function processGeneratedScript(s, family, languages, actor, step, tonePre
 // director step entirely so the caller gets exactly what they asked for.
 // tonePreset is optional on both paths, the same per-request override as
 // turn-into-content: falls back to the content.tone_preset setting.
-export async function generateContent({ cardId, conceptId, outputTypes, questionId, languages = ['EN', 'AM'],
-    actor, tonePreset = null }) {
+export async function generateContent({ cardId, conceptId, outputTypes, formatCodes = null,
+    questionId, languages = ['EN', 'AM'], actor, tonePreset = null, audience = 'WOMEN',
+    isBrandTier = false }) {
   const steps = [];
   const step = (name, status, extra = {}) => { steps.push({ step: name, status, ...extra }); };
   const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
@@ -517,8 +682,9 @@ export async function generateContent({ cardId, conceptId, outputTypes, question
       scripts: [scriptResult], steps };
   }
 
-  if (!Array.isArray(outputTypes) || !outputTypes.length) {
-    const e = new Error('output_types must be a non-empty array of content_output_types codes');
+  const wantsFormats = Array.isArray(formatCodes) && formatCodes.length > 0;
+  if (!wantsFormats && (!Array.isArray(outputTypes) || !outputTypes.length)) {
+    const e = new Error('formats (content_formats codes) or output_types (content_output_types codes) must be a non-empty array');
     e.status = 422; e.code = 'VALIDATION_ERROR'; throw e;
   }
   if (questionId) {
@@ -528,14 +694,35 @@ export async function generateContent({ cardId, conceptId, outputTypes, question
   const { card, cardVersion, claims, isTestContent } = await resolveCardForGeneration(cardId, actor);
   step('resolve_card', 'SUCCEEDED', { card_code: card.code, is_test_content: isTestContent });
 
-  const types = (await q(
-    `SELECT * FROM lcos.content_output_types WHERE code = ANY($1::text[]) AND is_active ORDER BY sort_order`,
-    [outputTypes])).rows;
-  const foundCodes = new Set(types.map(t => t.code));
-  const missing = outputTypes.filter(c => !foundCodes.has(c));
-  if (missing.length) {
-    const e = new Error(`unknown or inactive output_types: ${missing.join(', ')}`);
-    e.status = 422; e.code = 'VALIDATION_ERROR'; throw e;
+  // Two ways to name what to make. The format registry (content_formats,
+  // migration 0019) is the Run One path and the superset: one topic can
+  // become a Send-It, a Save-It and a library article in one call, each
+  // written to its own schema. output_types remains for existing callers
+  // and maps to the same downstream machinery via video_family.
+  let types;
+  if (wantsFormats) {
+    const rows = (await q(
+      `SELECT code, label, video_family, description, sort_order,
+              platforms[1] AS platform, target_length
+       FROM lcos.content_formats WHERE code = ANY($1::text[]) AND is_active ORDER BY sort_order`,
+      [formatCodes])).rows;
+    const foundCodes = new Set(rows.map(t => t.code));
+    const missing = formatCodes.filter(c => !foundCodes.has(c));
+    if (missing.length) {
+      const e = new Error(`unknown or inactive formats: ${missing.join(', ')}`);
+      e.status = 422; e.code = 'VALIDATION_ERROR'; throw e;
+    }
+    types = rows.map(r => ({ ...r, format_code: r.code }));
+  } else {
+    types = (await q(
+      `SELECT * FROM lcos.content_output_types WHERE code = ANY($1::text[]) AND is_active ORDER BY sort_order`,
+      [outputTypes])).rows.map(r => ({ ...r, format_code: null }));
+    const foundCodes = new Set(types.map(t => t.code));
+    const missing = outputTypes.filter(c => !foundCodes.has(c));
+    if (missing.length) {
+      const e = new Error(`unknown or inactive output_types: ${missing.join(', ')}`);
+      e.status = 422; e.code = 'VALIDATION_ERROR'; throw e;
+    }
   }
 
   const segment = await one(`SELECT * FROM lcos.audience_segments WHERE slug='general_public'`);
@@ -554,15 +741,22 @@ export async function generateContent({ cardId, conceptId, outputTypes, question
 
   const conceptRows = [];
   for (const t of types) {
+    // target_duration_s only means something for timed formats; the column
+    // has a CHECK of 6..600 so registry minute-scale targets are clamped.
+    let dur = 30;
+    const tl = t.target_length ?? null;
+    if (tl && tl.unit === 'seconds') dur = Number(tl.max ?? tl.options?.[0] ?? 30) || 30;
+    else if (tl && tl.unit === 'minutes') dur = Math.min(600, (Number(tl.max ?? tl.target ?? 1) || 1) * 60);
     const row = await one(
-      `INSERT INTO lcos.content_concepts (code, family_id, video_family, title, hook_line, premise,
-         treatment, claim_ids_referenced, target_duration_s, cta_intent, why_this_works, status)
-       VALUES ($1,$2,$3::lcos.video_family,$4,$5,$6,$7,$8::uuid[],$9,$10,$11,'SELECTED') RETURNING *`,
-      [code('CC'), family.id, t.video_family, `${t.label}: ${card.canonical_question_en.slice(0, 70)}`,
+      `INSERT INTO lcos.content_concepts (code, family_id, video_family, format_code, title, hook_line, premise,
+         treatment, claim_ids_referenced, target_duration_s, cta_intent, why_this_works, status, audience)
+       VALUES ($1,$2,$3::lcos.video_family,$4,$5,$6,$7,$8,$9::uuid[],$10,$11,$12,'SELECTED',$13) RETURNING *`,
+      [code('CC'), family.id, t.video_family, t.format_code,
+       `${t.label}: ${card.canonical_question_en.slice(0, 70)}`,
        card.canonical_question_en, t.description ?? `Direct answer using ${card.code}.`,
        `Format: ${t.label}${t.platform ? ` (${t.platform})` : ''}. ${t.description ?? ''}`.trim(),
-       claims.map(c => c.id), 30, 'private telegram consult',
-       `Targeted generation request for output type ${t.code}.`]);
+       claims.map(c => c.id), dur, 'private telegram consult',
+       `Targeted generation request for ${t.format_code ? 'format' : 'output type'} ${t.code}.`, audience]);
     conceptRows.push(row);
   }
   step('create_concepts', 'SUCCEEDED', { count: conceptRows.length, output_types: types.map(t => t.code) });
@@ -570,7 +764,7 @@ export async function generateContent({ cardId, conceptId, outputTypes, question
   const scripts = [];
   for (const concept of conceptRows) {
     const s = await generateScript({ concept, family, card, cardVersion, claims, actor,
-      isTestContent, tonePreset: effectiveTone });
+      isTestContent, tonePreset: effectiveTone, isBrandTier });
     scripts.push(await processGeneratedScript(s, family, languages, actor, step, effectiveTone));
   }
   step('queue_review', 'SUCCEEDED');
@@ -655,9 +849,101 @@ export async function bulkCommission({ limit = 10, outputTypes = null, actor }) 
   return { candidates_considered: candidates.length, commissioned: ok.length, total_pieces: totalPieces, results };
 }
 
+// The registry row that governs a script, resolved through its concept.
+// Null for legacy concepts created before format_code existed; every caller
+// treats null as "behave exactly as before Run One".
+export async function formatRowForScript(scriptId) {
+  return one(
+    `SELECT cf.* FROM lcos.scripts s
+     JOIN lcos.content_concepts cc ON cc.id = s.concept_id
+     JOIN lcos.content_formats cf ON cf.code = cc.format_code
+     WHERE s.id = $1`, [scriptId]);
+}
+
+// The audience registers a piece can be written to (owner, 14 Aug 2026:
+// "This is mainly women but also men... they ask a lot"). WOMEN stays the
+// default because it is who asks most.
+export const AUDIENCES = Object.freeze(['WOMEN', 'MEN', 'COUPLES', 'GENERAL']);
+
+// The stay-English terminology set (owner rule 12 Aug 2026, reconfirmed
+// 14 Aug): terms written in English inside Amharic copy, with the
+// avoid-listed Amharic renderings the deterministic lint flags. Injected
+// into every writer and localizer prompt for every format, not only video.
+export async function stayEnglishTerms() {
+  return (await q(
+    `SELECT term_en, avoid_am FROM lcos.terminology
+     WHERE keep_english AND status='APPROVED' ORDER BY term_en LIMIT 200`)).rows;
+}
+
+// Every Ethiopic-script run in a text, trimmed, deduplicated. Used to
+// capture corrected Amharic phrasing from a non-medical human edit.
+export function extractAmharicSegments(text) {
+  const matches = String(text ?? '').match(/[\u1200-\u137F][\u1200-\u137F\s\u1361-\u1368.,:;!?()0-9]*[\u1200-\u137F\u1362]?/g) ?? [];
+  return [...new Set(matches.map((m) => m.trim()).filter((m) => m.length >= 6))];
+}
+
+// Format-specific REQUIRED body fields (14 Aug 2026 corrections, item 5).
+// The zod schema keys on body kind and cannot see the format code, so the
+// per-format requirements are enforced here, deterministically. Failing one
+// throws: a quiz without its giveaway or an Ask Dr Letena without its
+// reworded question is not a thinner piece, it is not the format at all.
+//
+// ask_dr_letena additionally re-asserts de-identification over the quoted
+// question itself. The question already passed the system's de-id on
+// ingest and the writer is instructed to reword it, but this format READS
+// A REAL PATIENT QUESTION ALOUD, so a residual phone number, handle or
+// name pattern in the final quoted text is a hard stop, exactly as the AUA
+// anonymised rule requires: a question that cannot be fully de-identified
+// does not run.
+export function requireFormatBody(fmtRow, sc) {
+  const fail = (msg) => {
+    const e = new Error(msg); e.status = 422; e.code = 'FORMAT_BODY_INCOMPLETE'; throw e;
+  };
+  const codeName = fmtRow?.code;
+  if (!codeName) return;
+  if (codeName === 'ask_dr_letena') {
+    const qq = sc.body?.question_quoted;
+    if (!qq || !String(qq).trim()) fail('ask_dr_letena requires body.question_quoted: the de-identified, reworded user question read aloud');
+    if (containsForbidden(String(qq))) {
+      fail('ask_dr_letena: the quoted question still carries an identifying pattern after rewording. A question that cannot be fully de-identified does not run.');
+    }
+  }
+  if (codeName === 'quiz_reel' || codeName === 'quiz_carousel') {
+    const g = sc.body?.giveaway;
+    if (!g?.how_to_enter || !g?.deadline || !g?.winner_selection) {
+      fail(`${codeName} requires body.giveaway with how_to_enter, deadline and winner_selection (non-medical, never claim-mapped, no clinical promises)`);
+    }
+  }
+  if (codeName === 'aua_recap') {
+    if ((sc.body?.cutdown_briefs ?? []).length !== 4) {
+      fail('aua_recap requires body.cutdown_briefs with exactly four briefs');
+    }
+  }
+  if (codeName === 'whiteboard_explainer') {
+    const w = sc.body?.whiteboard;
+    const clips = w?.clips ?? [];
+    if (clips.length < 3 || clips.length > 4) fail('whiteboard_explainer requires body.whiteboard.clips: three to four clips');
+    if (!(w?.board_map ?? []).length) fail('whiteboard_explainer requires body.whiteboard.board_map: one row per board element');
+    for (const c of clips) {
+      if (!c.last_frame_anchor || !String(c.last_frame_anchor).trim()) {
+        fail('whiteboard_explainer: every clip needs a last_frame_anchor describing exactly what the board shows at its end');
+      }
+    }
+  }
+}
+
 export async function generateScript({ concept, family, card, cardVersion, claims, actor, seedUnsupported = false,
-    isTestContent = false, tonePreset = null }) {
+    isTestContent = false, tonePreset = null, isBrandTier = false }) {
   const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
+  // Registry-driven generation (Run One, 14 Aug 2026). When the concept
+  // carries a format_code, lcos.content_formats is the authority for what
+  // is being written: the body kind, the headings, the per-format rules,
+  // the target length, the language mode. video_family remains only the
+  // render-routing key. Legacy concepts (format_code null) keep the exact
+  // pre-Run-One behaviour, including the video_family -> body kind mapping.
+  const fmtRow = concept.format_code
+    ? await one(`SELECT * FROM lcos.content_formats WHERE code=$1 AND is_active`, [concept.format_code])
+    : null;
   // Platform context for the writer (14 Aug 2026, Nate: "the script is bland
   // and its terrible... research the top way to write scripts for each
   // individual social media platform"). A TikTok reel, an Instagram carousel
@@ -679,18 +965,42 @@ export async function generateScript({ concept, family, card, cardVersion, claim
   // the truth so it writes a real opening instead of echoing a form field.
   const hookLineIsPlaceholder =
     (concept.hook_line ?? '').trim() === (card.canonical_question_en ?? '').trim();
+  // What kind of thing this is, which decides which body the writer fills.
+  // Distinct from video_family (a render-routing key) and from platform
+  // (where it gets posted): a carousel and a static graphic are both
+  // Instagram, and neither is a video. The registry's body_kind wins when a
+  // format_code is present.
+  const bodyKind = fmtRow?.body_kind ?? formatOf(concept.video_family);
+  // NOTE the canonical Amharic blocks are deliberately NOT in this context:
+  // the bot block contains @LetenaEthBot, which the outbound PII assertion
+  // treats as a forbidden HANDLE and would kill every call. The blocks ride
+  // verbatim inside the script_writer prompt text (migration 0021), which
+  // the assertion does not scan. See apps/api/src/letena_canon.mjs.
+  // The stay-English terminology rides in EVERY writer call (item 2 of the
+  // 14 Aug corrections): term names only, which the PII assertion tolerates;
+  // the rule text lives in the prompt. cta_spec carries block NAMES, never
+  // block text (the door block's phone number and the bot handle would trip
+  // the outbound PII assertion; the blocks ride verbatim in the prompt).
+  const stayEnglish = await stayEnglishTerms();
+  const audience = AUDIENCES.includes(concept.audience) ? concept.audience : 'WOMEN';
   const out = await invokeAgent('script_writer', {
     hook_line: concept.hook_line, video_family: concept.video_family,
     hook_line_is_placeholder: hookLineIsPlaceholder,
     treatment: concept.treatment,
-    // What kind of thing this is, which decides which body the writer fills.
-    // Distinct from video_family (a render-routing key) and from platform
-    // (where it gets posted): a carousel and a static graphic are both
-    // Instagram, and neither is a video.
-    format: formatOf(concept.video_family),
-    platform: outputType?.platform ?? null,
-    output_format: outputType?.label ?? null,
-    format_note: outputType?.description ?? null,
+    format: bodyKind,
+    audience,
+    terminology_keep_english: stayEnglish.map((t) => t.term_en),
+    format_spec: fmtRow ? {
+      code: fmtRow.code, label: fmtRow.label, kind: fmtRow.kind, surface: fmtRow.surface,
+      platforms: fmtRow.platforms, language_mode: fmtRow.language_mode,
+      headings: fmtRow.headings, rules: fmtRow.rules, body_schema: fmtRow.body_schema,
+      target_length: fmtRow.target_length, wants_captions: fmtRow.wants_captions,
+      ends_at_door: fmtRow.ends_at_door, hedging_allowed: fmtRow.hedging_allowed,
+      cta: fmtRow.cta_spec, comment_prompt_allowed: fmtRow.comment_prompt_allowed,
+    } : null,
+    platform: outputType?.platform ?? fmtRow?.platforms?.[0] ?? null,
+    output_format: outputType?.label ?? fmtRow?.label ?? null,
+    format_note: outputType?.description ?? fmtRow?.description ?? null,
     target_duration_s: concept.target_duration_s ?? null,
     card: { code: card.code, canonical_question_en: card.canonical_question_en,
       approved_ctas: cardVersion.approved_ctas,
@@ -699,43 +1009,77 @@ export async function generateScript({ concept, family, card, cardVersion, claim
     __seed_unsupported: seedUnsupported || undefined,
   }, { objectType: 'CONCEPT', objectId: concept.id, workflowCode: 'WF07', tone_preset: effectiveTone });
 
+  // Abortion-adjacent detection, ported from letenav2 content_board.php.
+  // Substring detection over the piece's identity text OR the tier-4 topic
+  // signal; a client flag could add to this but can never clear it once
+  // detection fires. Stored on the script so the publish transition and the
+  // pipeline advance both see it without re-deriving.
+  const needsClinical = isAbortionAdjacent(
+    `${concept.title ?? ''} ${concept.hook_line ?? ''} ${card.canonical_question_en ?? ''}`)
+    || family.risk_tier === 'TIER_4';
+
   if (out.result === 'NEEDS_KNOWLEDGE') {
     const s = await one(
       `INSERT INTO lcos.scripts (code, concept_id, family_id, knowledge_card_version_id, language,
-         status, risk_tier, needs_knowledge_note, created_by, is_test_content)
-       VALUES ($1,$2,$3,$4,'EN','NEEDS_KNOWLEDGE',$5,$6,$7,$8) RETURNING *`,
+         status, risk_tier, needs_knowledge_note, created_by, is_test_content, stage, needs_clinical_signoff)
+       VALUES ($1,$2,$3,$4,'EN','NEEDS_KNOWLEDGE',$5,$6,$7,$8,'script',$9) RETURNING *`,
       [code('SCR'), concept.id, family.id, family.knowledge_card_version_id, family.risk_tier,
-       JSON.stringify(out.needs_knowledge), actor?.id ?? null, isTestContent]);
+       JSON.stringify(out.needs_knowledge), actor?.id ?? null, isTestContent, needsClinical]);
     return s;
   }
   const sc = out.script;
+  // Format-specific required bodies, checked in code because the zod schema
+  // keys on body KIND and cannot see the format code (14 Aug corrections).
+  // Fails closed: a missing required field is a generation failure, never a
+  // silently thinner piece.
+  requireFormatBody(fmtRow, sc);
   // Hash and lint the piece's ACTUAL body. Both used to read spoken_script,
   // which is empty for a carousel, a static graphic or a post now that each
   // fills its own body, so both would have been operating on a hook and a
   // CTA alone. bodyTextOf() is the single definition of "the text of this
-  // piece" and is the same one the validator and the localizer use.
+  // piece" and is the same one the validator and the localizer use. Since
+  // Run One it also covers the generic body and all three captions.
   const bodyText = bodyTextOf(sc);
   const bodyHash = sha(bodyText);
-  // Mechanical house-style lint over every generated English surface. Not
-  // exhaustive (see ai/style_lint.mjs); catches em dashes, hedge phrases and
-  // AI sign-offs so a human reviewer sees them rather than them slipping by.
-  const styleWarnings = lintStyle([bodyText, sc.caption].filter(Boolean).join('\n'));
+  // Mechanical house-style lint over every generated surface. Not
+  // exhaustive (see ai/style_lint.mjs); catches em dashes, filler hedges,
+  // AI sign-offs, disclosure-shaped comment prompts and transliterated
+  // stay-English terms so a human reviewer sees them rather than them
+  // slipping by. hedgingAllowed and commentPromptAllowed come from the
+  // registry: a push notification is REQUIRED to say might/may, and a quiz
+  // is ALLOWED to invite a non-disclosing comment.
+  const styleWarnings = lintStyle([bodyText, sc.caption].filter(Boolean).join('\n'),
+    { hedgingAllowed: !!fmtRow?.hedging_allowed,
+      commentPromptAllowed: fmtRow ? !!fmtRow.comment_prompt_allowed : true,
+      stayEnglish });
+  // New pieces start at the 'script' stage: generation IS the script step,
+  // and plan happened when the concept was selected or commissioned.
+  // The production path defaults per format: the FIRST entry of the
+  // registry row's production_paths (DIGITAL everywhere the owner's
+  // adapter pipeline applies, LIVE for aua_live, NONE for text and app
+  // surfaces). Legacy concepts with no registry row keep LIVE, which is
+  // the shoot+edit behaviour they were built on. Changeable through
+  // POST /pipeline/scripts/:id/production-path until production starts.
+  const productionPath = fmtRow?.production_paths?.[0] ?? 'LIVE';
   const s = await one(
     `INSERT INTO lcos.scripts (code, concept_id, family_id, knowledge_card_version_id, language,
-       status, risk_tier, current_version, validation_result, content_sha256, created_by, is_test_content)
-     VALUES ($1,$2,$3,$4,'EN','DRAFT',$5,1,'NOT_RUN',$6,$7,$8) RETURNING *`,
+       status, risk_tier, current_version, validation_result, content_sha256, created_by,
+       is_test_content, stage, needs_clinical_signoff, production_path, is_brand_tier)
+     VALUES ($1,$2,$3,$4,'EN','DRAFT',$5,1,'NOT_RUN',$6,$7,$8,'script',$9,$10,$11) RETURNING *`,
     [code('SCR'), concept.id, family.id, family.knowledge_card_version_id, family.risk_tier,
-     bodyHash, actor?.id ?? null, isTestContent]);
+     bodyHash, actor?.id ?? null, isTestContent, needsClinical, productionPath, isBrandTier]);
   await q(
     `INSERT INTO lcos.script_versions (script_id, version, hook, spoken_script, onscreen_text,
        scene_plan, cta, caption, hashtags, platform_variants, estimated_duration_s, content_sha256,
-       created_by, tone_preset, style_warnings, format, carousel_slides, static_graphic, post_text)
-     VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+       created_by, tone_preset, style_warnings, format, carousel_slides, static_graphic, post_text,
+       body, captions_by_platform)
+     VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
     [s.id, sc.hook, sc.spoken_script ?? '', JSON.stringify(sc.onscreen_text), JSON.stringify(sc.scene_plan),
      sc.cta, sc.caption ?? null, sc.hashtags ?? [], JSON.stringify(sc.platform_variants ?? {}),
      sc.estimated_duration_s, bodyHash, actor?.id ?? null, effectiveTone, JSON.stringify(styleWarnings),
-     sc.format ?? 'VIDEO', JSON.stringify(sc.carousel_slides ?? []),
-     sc.static_graphic ? JSON.stringify(sc.static_graphic) : null, sc.post_text ?? null]);
+     sc.format ?? bodyKind ?? 'VIDEO', JSON.stringify(sc.carousel_slides ?? []),
+     sc.static_graphic ? JSON.stringify(sc.static_graphic) : null, sc.post_text ?? null,
+     JSON.stringify(sc.body ?? {}), JSON.stringify(sc.captions ?? {})]);
   for (const m of sc.claim_map) {
     await q(`INSERT INTO lcos.script_claims (script_id, script_version, claim_id, statement, location)
              VALUES ($1,1,$2,$3,$4)`, [s.id, m.claim_id, m.statement, m.location]);
@@ -829,14 +1173,25 @@ export async function localizeScript(scriptId, { actor, tonePreset = null }) {
   const cardVersion = await one(`SELECT * FROM lcos.knowledge_card_versions WHERE id=$1`,
     [family.knowledge_card_version_id]);
   const terminology = (await q(
-    `SELECT term_en, preferred_am, avoid_am FROM lcos.terminology WHERE status='APPROVED' LIMIT 200`)).rows;
+    `SELECT term_en, preferred_am, avoid_am, keep_english FROM lcos.terminology WHERE status='APPROVED' LIMIT 200`)).rows;
   const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
+  const concept = await one(
+    `SELECT cc.audience FROM lcos.content_concepts cc WHERE cc.id=$1`, [s.concept_id]);
+  // Recent human-corrected Amharic phrasing (from non-medical edits, item
+  // 12.1 of the 14 Aug corrections) rides into every localizer call as
+  // approved phrasing examples. This is the "retrain the descriptions"
+  // loop; there is no model fine-tuning.
+  const phrasingExamples = (await q(
+    `SELECT amharic_text FROM lcos.phrasing_examples ORDER BY created_at DESC LIMIT 10`)).rows
+    .map((r) => r.amharic_text);
 
   const loc = await invokeAgent('amharic_localizer', {
     english: { hook: v.hook, spoken_script: v.spoken_script || bodyTextOf(v), cta: v.cta,
       caption: v.caption, format: v.format ?? 'VIDEO' },
     canonical_answer_am: cardVersion.canonical_answer_am,
     terminology, register: 'GENERAL',
+    audience: concept?.audience ?? 'WOMEN',
+    human_corrected_examples: phrasingExamples,
   }, { objectType: 'SCRIPT', objectId: s.id, workflowCode: 'WF09', tone_preset: effectiveTone });
 
   if (loc.result === 'HUMAN_LANGUAGE_REVIEW') {
@@ -895,10 +1250,11 @@ export async function routeReviews(scriptId, riskTier) {
   // Separate, dedicated kill switch for the clinical-sign-off gate itself
   // (Settings -> admin toggle), independent of publishing.mode. Added 14 Aug
   // 2026 to unblock testing the rest of the pipeline without a doctor in the
-  // loop; the plan is to turn this back on once that's verified, so it is
-  // its own setting rather than folded into publishing.mode's existing auto
-  // levels, which govern a broader set of behavior (language review too).
-  const clinicalReviewEnabled = Boolean(await setting('review.clinical_review_enabled', false));
+  // loop. SWITCHED BACK ON the same day by the unified-content-machine
+  // build (migration 0021), per the kickoff brief. The code-side fallback
+  // is now true as well, so a database missing the settings row fails SAFE:
+  // clinical review happens unless someone explicitly turned it off.
+  const clinicalReviewEnabled = Boolean(await setting('review.clinical_review_enabled', true));
   const clinicalGateOff = isClinicalTier && !clinicalReviewEnabled;
   const autoOk = modeAutoOk || clinicalGateOff;
   if (autoOk && s.validation_result === 'PASS' && s.created_by) {

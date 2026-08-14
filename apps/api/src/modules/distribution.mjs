@@ -5,6 +5,7 @@ import { q, one, tx, audit, requirePerm, err } from '../core.mjs';
 import { publishers, collectors, storage } from '../adapters/index.mjs';
 import { getPlatformSpec, evaluateContent } from './platform_specs.mjs';
 import { reachScore, educationScore, serviceScore, compositeScore } from '../../../../packages/scoring/src/index.mjs';
+import { publishRule } from '../pipeline_rules.mjs';
 
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
@@ -231,6 +232,20 @@ export async function executePublish(jobId, actor) {
     await q(`UPDATE lcos.publishing_jobs SET status='CANCELLED', error_code='KNOWLEDGE_INVALIDATED' WHERE id=$1`, [job.id]);
     return { error: `knowledge card ${card.code} is ${card.status}; publish cancelled`,
       status: 422, code: 'GUARD_FAILED', guard: 'cardStillApproved' };
+  }
+  // The signed-gate side condition at the publish transition (Run One,
+  // 14 Aug 2026): medical_review must be signed for every piece, and
+  // clinical_signoff too when the piece is abortion-adjacent. The job is
+  // NOT cancelled on refusal, unlike the card check above: an unsigned gate
+  // is a pending human action, so the job stays SCHEDULED and publishes
+  // normally once the signature exists. An edit to the script after review
+  // deletes these rows (invalidateMedicalSignoff), so a stale sign-off can
+  // never carry a changed piece through here.
+  const signedGates = new Set((await q(
+    `SELECT gate FROM lcos.script_gates WHERE script_id=$1`, [script.id])).rows.map(r => r.gate));
+  const gateCheck = publishRule(script, signedGates);
+  if (!gateCheck.ok) {
+    return { error: gateCheck.reason, status: 422, code: 'GUARD_FAILED', guard: gateCheck.guard };
   }
   await q(`UPDATE lcos.publishing_jobs SET status='PUBLISHING', attempts=attempts+1 WHERE id=$1`, [job.id]);
   try {

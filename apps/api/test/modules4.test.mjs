@@ -64,9 +64,15 @@ test('asset binding: a matching active library asset lands in the render payload
     mime_type: 'video/mp4', content_base64: Buffer.from('broll').toString('base64'),
     tags: ['city:addis', 'emotion:calm', 'time:evening'] });
   assert.equal(up.statusCode, 201, up.body);
-  // Take an approved script from the earlier suites and run a fresh job
+  // Take an approved VIDEO script from the earlier suites and run a fresh
+  // job. The format filter matters since Run One: the registry tests also
+  // approve POST/ARTICLE scripts, which have no scene plan and therefore
+  // never bind assets, and "latest approved" could land on one of those.
   const script = await one(
-    `SELECT id FROM lcos.scripts WHERE status='APPROVED' ORDER BY created_at DESC LIMIT 1`);
+    `SELECT s.id FROM lcos.scripts s
+     JOIN lcos.script_versions sv ON sv.script_id=s.id AND sv.version=s.current_version
+     WHERE s.status='APPROVED' AND sv.format='VIDEO'
+     ORDER BY s.created_at DESC LIMIT 1`);
   if (!script) return; // e2e suite provides one when run together
   const job = (await call('POST', '/api/v1/production/jobs', tokens.producer,
     { script_id: script.id })).json();
@@ -79,7 +85,13 @@ test('asset binding: a matching active library asset lands in the render payload
 });
 
 test('experiment conclude auto-attaches the primary metric from performance', async () => {
-  const pc = await one(`SELECT id FROM lcos.published_content ORDER BY published_at DESC LIMIT 1`);
+  // Needs a published piece that actually has performance rows attached
+  // (the e2e video); Run One's registry tests publish a Telegram post that
+  // never collects analytics, and "latest published" could land on it.
+  const pc = await one(
+    `SELECT pc.id FROM lcos.published_content pc
+     JOIN lcos.content_performance cp ON cp.published_content_id=pc.id
+     ORDER BY pc.published_at DESC LIMIT 1`);
   if (!pc) return;
   const e = (await call('POST', '/api/v1/experiments', tokens.content, {
     title: 'metric attach test', hypothesis: 'x', variable_tested: 'HOOK',

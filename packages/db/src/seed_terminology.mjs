@@ -20,21 +20,27 @@ async function main() {
     const keepEnglish = e.policy === 'KEEP_ENGLISH';
     const preferred = keepEnglish ? e.term_en : (e.am ?? e.term_en);
     const avoid = keepEnglish && e.am_equivalent_avoid ? [e.am_equivalent_avoid] : [];
+    // KEEP_ENGLISH rows land APPROVED with keep_english=true: the owner
+    // decided this rule (12 Aug 2026, reconfirmed 14 Aug: "that should be
+    // respected"), so it is in force, not pending language-team review.
+    // The Amharic-native rows stay IN_REVIEW for the language team.
     await q(
       `INSERT INTO lcos.terminology (term_en, preferred_am, avoid_am, avoid_reason,
-         notes, register, status)
-       VALUES ($1, $2, $3, $4, $5, 'MIXED', 'IN_REVIEW')
+         notes, register, status, keep_english)
+       VALUES ($1, $2, $3, $4, $5, 'MIXED', $6, $7)
        ON CONFLICT (term_en, register) DO UPDATE SET
          preferred_am = EXCLUDED.preferred_am, avoid_am = EXCLUDED.avoid_am,
          avoid_reason = EXCLUDED.avoid_reason, notes = EXCLUDED.notes,
-         status = CASE WHEN lcos.terminology.status='APPROVED'
+         keep_english = EXCLUDED.keep_english,
+         status = CASE WHEN EXCLUDED.keep_english THEN 'APPROVED'::lcos.lifecycle_status
+                       WHEN lcos.terminology.status='APPROVED'
                        THEN lcos.terminology.status ELSE 'IN_REVIEW'::lcos.lifecycle_status END`,
       [e.term_en, preferred, avoid,
        keepEnglish ? 'Owner rule 12 Aug 2026: clinical/brand terms stay in English inside Amharic copy' : null,
-       e.note ?? null]);
+       e.note ?? null, keepEnglish ? 'APPROVED' : 'IN_REVIEW', keepEnglish]);
     n++;
   }
-  console.log(`terminology: ${n} entries upserted, IN_REVIEW for the language team`);
+  console.log(`terminology: ${n} entries upserted (stay-English set APPROVED per the 12 Aug owner rule; Amharic-native rows IN_REVIEW for the language team)`);
   await pool.end();
 }
 

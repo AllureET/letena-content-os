@@ -16,6 +16,7 @@ import assets from './modules/assets.mjs';
 import experiments from './modules/experiments.mjs';
 import voice from './modules/voice.mjs';
 import platformSpecs from './modules/platform_specs.mjs';
+import pipeline from './modules/pipeline.mjs';
 
 export async function buildServer() {
   const app = Fastify({ logger: process.env.NODE_ENV !== 'test',
@@ -107,6 +108,7 @@ export async function buildServer() {
     await v1.register(experiments);
     await v1.register(voice);
     await v1.register(platformSpecs);
+    await v1.register(pipeline);
 
     // TOTP enrolment (any authenticated user, own account only)
     v1.post('/auth/totp/enroll', async (req) => {

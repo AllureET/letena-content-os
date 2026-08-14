@@ -75,6 +75,13 @@ export class MockAIProvider extends BaseProvider {
     }
     if (conf < 0.35) { card = null; conf = 0; }
     return {
+      // is_genuine_question became required in migration 0010, but this mock
+      // was never taught about it, which broke every MOCK classification
+      // (and everything downstream of one) the moment 0010 applied. Found
+      // 14 Aug 2026 while re-running the suite against a fresh database for
+      // the Run One build. The mock's fixtures are all real questions, so
+      // true is the honest deterministic answer.
+      is_genuine_question: true,
       topic_code: topic, subtopic: repeatEC ? 'repeat EC use' : null,
       intent: fertilityFear ? 'REASSURANCE_SEEKING' : 'FACT_SEEKING',
       is_myth: fertilityFear && topic === 'EC',
@@ -135,6 +142,15 @@ export class MockAIProvider extends BaseProvider {
     ] };
   }
 
+  // Format-aware mock writer (Run One, 14 Aug 2026). The mock fills the body
+  // the requested format actually needs, the same contract the real writer
+  // prompt (script_writer 1.3.0) and the zod superRefine enforce, so tests
+  // exercise every registry body kind with zero credentials. Claim
+  // statements reuse the claim text so the mock claim_validator's real
+  // containment check passes. __seed_unsupported plants an unsupported
+  // statement INSIDE the format's own body (a slide, a section, a push
+  // body), which is exactly the near-miss this system exists to catch: a
+  // claim in a non-video body must be validated as hard as a spoken one.
   agent_script_writer(ctx) {
     const claims = ctx.claims || [];
     if (!claims.length) {
@@ -142,18 +158,137 @@ export class MockAIProvider extends BaseProvider {
         missing_facts: [{ fact_needed: 'Any approved claim on this topic', why: 'Claim set is empty' }],
         blocking_reason: 'No approved claims supplied' } };
     }
+    const format = ctx.format ?? 'VIDEO';
     const cta = ctx.card?.approved_ctas?.[0] ?? 'Message Letena on Telegram.';
     const s1 = claims[0].claim_text_en;
     const s2 = claims[1]?.claim_text_en ?? s1;
-    // Optional seeded defect for governance tests: an unsupported statement.
-    const spoken = ctx.__seed_unsupported
-      ? `${s1} It is 99% effective for everyone. ${cta}`
-      : `${ctx.hook_line ?? 'You asked. Here is the answer.'} ${s1} ${s2} ${cta}`;
-    return { result: 'OK', script: {
-      hook: ctx.hook_line ?? 'You asked. Here is the answer.',
+    const hook = ctx.hook_line ?? 'You asked. Here is the answer.';
+    const BAD = 'It is 99% effective for everyone.';
+    const seeded = !!ctx.__seed_unsupported;
+    const locations = { VIDEO: 'SPOKEN', AUDIO: 'SPOKEN', CAROUSEL: 'SLIDE', STATIC: 'ONSCREEN',
+      POST: 'POST', ARTICLE: 'SECTION', MICROCOPY: 'ITEM', PUSH: 'FIELD', LIVE: 'SEGMENT' };
+    const loc = locations[format] ?? 'SPOKEN';
+    const claimMap = [
+      ...(seeded ? [{ statement: BAD, claim_id: claims[0].id, location: loc }] : []),
+      { statement: s1, claim_id: claims[0].id, location: loc },
+      ...(claims[1] ? [{ statement: s2, claim_id: claims[1].id, location: loc }] : []),
+    ];
+    // Captions keyed by platform (14 Aug 2026 corrections): one caption per
+    // platform in the format's platforms array, like the real writer.
+    const capPlatforms = ctx.format_spec?.platforms?.length ? ctx.format_spec.platforms : ['TIKTOK'];
+    const captions = ctx.format_spec?.wants_captions
+      ? Object.fromEntries(capPlatforms.map((pl) => [pl,
+          pl === 'TWITTER' ? hook.slice(0, 100) : `${hook.slice(0, 60)} | Letena ${cta}`.slice(0, 500)]))
+      : null;
+    // Format-specific extra body fields (14 Aug 2026 corrections), keyed on
+    // the registry format code, mirroring what requireFormatBody() demands:
+    // the quiz giveaway (digit-free so the NUMBER_ALTERED overlay stays
+    // quiet), the Ask Dr Letena reworded question, the recap's four
+    // cutdowns, and the whiteboard structure.
+    const fcode = ctx.format_spec?.code ?? null;
+    const extraBody = {};
+    if (fcode === 'ask_dr_letena') {
+      extraBody.question_quoted = 'A reworded question from real patient traffic, with every identifying detail removed.';
+    }
+    if (fcode === 'quiz_reel' || fcode === 'quiz_carousel') {
+      extraBody.quiz = { question: hook.slice(0, 280), answer: s1.slice(0, 380), explanation: s2.slice(0, 580) };
+      extraBody.giveaway = { how_to_enter: 'Follow Letena and answer the quiz in the comments.',
+        deadline: 'Sunday evening', winner_selection: 'A random pick from the correct answers.' };
+    }
+    if (fcode === 'aua_recap') {
+      extraBody.cutdown_briefs = ['The core answer, twenty seconds', 'The myth corrected',
+        'The best reworded question', 'The door'];
+    }
+    if (fcode === 'whiteboard_explainer') {
+      extraBody.whiteboard = {
+        character_brief: 'Stylized animated presenter beside a whiteboard, pointer stick, warm approachable features, vertical composition.',
+        board_style_brief: 'Colorized board style reference: same content and layout, rendered in the animation style.',
+        board_map: [
+          { element: 'The question', column: 'left', icon: 'question mark' },
+          { element: 'The fact', column: 'left', icon: 'check mark' },
+          { element: 'The door', column: 'left', icon: 'phone' },
+        ],
+        clips: [
+          { index: 1, dialogue: hook.slice(0, 1100), last_frame_anchor: 'Board shows only the question, stick resting at its underline, rest blank.',
+            beats: [{ at_s: 0, appears: 'the question', speech: hook.slice(0, 380) }] },
+          { index: 2, dialogue: s1.slice(0, 1100), last_frame_anchor: 'Board shows the question and the fact, unchanged elsewhere, stick at the fact.',
+            beats: [{ at_s: 1, appears: 'the fact', speech: s1.slice(0, 380) }] },
+          { index: 3, dialogue: cta.slice(0, 1100), last_frame_anchor: 'Board complete: question, fact and the door line, stick resting near the door line.',
+            beats: [{ at_s: 1, appears: 'the door', speech: cta.slice(0, 380) }] },
+        ],
+        pronunciation_notes: ['Every stay-English clinical term is spoken as written in English.'],
+      };
+    }
+    const base = { format, hook, cta, hashtags: ['letena', 'health'],
+      platform_variants: {}, estimated_duration_s: 0, claim_map: claimMap, captions,
+      caption: `${hook.slice(0, 80)} | Letena` };
+
+    if (format === 'CAROUSEL') {
+      return { result: 'OK', script: { ...base, body: extraBody, carousel_slides: [
+        { index: 1, title: hook.slice(0, 80), body: 'Save this for when you need it.' },
+        { index: 2, title: 'The fact', body: seeded ? BAD : s1.slice(0, 280) },
+        ...(claims[1] ? [{ index: 3, title: 'One more thing', body: s2.slice(0, 280) }] : []),
+        { index: 4, title: 'Talk to us privately', body: cta.slice(0, 280) },
+      ] } };
+    }
+    if (format === 'STATIC') {
+      return { result: 'OK', script: { ...base,
+        static_graphic: { headline: hook.slice(0, 88),
+          body: (seeded ? BAD : s1).slice(0, 290), footer: cta.slice(0, 110) } } };
+    }
+    if (format === 'POST') {
+      return { result: 'OK', script: { ...base,
+        post_text: `${hook}\n\n${seeded ? BAD + ' ' : ''}${s1}\n\n${s2}\n\n${cta}` } };
+    }
+    if (format === 'ARTICLE') {
+      return { result: 'OK', script: { ...base, body: {
+        intro: hook.slice(0, 300),
+        sections: [
+          { heading: 'What it is', body: seeded ? BAD : s1 },
+          ...(claims[1] ? [{ heading: 'How it works', body: s2 }] : []),
+          { heading: 'When to talk to a doctor', body: cta },
+        ] } } };
+    }
+    if (format === 'MICROCOPY') {
+      // Keys stay digit-free on purpose: bodyTextOf() walks every string
+      // leaf including keys, and the deterministic overlay flags any digit
+      // that appears in no approved claim (NUMBER_ALTERED). A key like
+      // item_1 would fail validation on its own "1".
+      return { result: 'OK', script: { ...base, body: { items: [
+        { key: 'item_a', text_en: seeded ? BAD : s1.slice(0, 900), text_am: 'የተረጋገጠ መልስ።', note: 'mock parallel original' },
+        ...(claims[1] ? [{ key: 'item_b', text_en: s2.slice(0, 900), text_am: 'ሁለተኛ መልስ።', note: null }] : []),
+      ] } } };
+    }
+    if (format === 'PUSH') {
+      return { result: 'OK', script: { ...base, body: { push: {
+        title: 'A note from Abeba', body: (seeded ? BAD : s1).slice(0, 97),
+        deep_link: 'abeba://today' } } } };
+    }
+    if (format === 'AUDIO') {
+      return { result: 'OK', script: { ...base, estimated_duration_s: 30,
+        spoken_script: `${hook} ${seeded ? BAD + ' ' : ''}${s1} ${cta}` } };
+    }
+    if (format === 'LIVE') {
+      return { result: 'OK', script: { ...base, body: {
+        segments: [
+          { index: 1, title: 'Welcome and ground rules', minutes: 3, description: 'Open the room, name the topic plainly.' },
+          { index: 2, title: 'The core answer', minutes: 8, description: seeded ? BAD : s1 },
+          { index: 3, title: 'Questions, anonymized', minutes: 12, description: s2 },
+          { index: 4, title: 'The door', minutes: 4, description: cta },
+        ],
+        pinned_message: `${s1.slice(0, 200)} ${cta}`.slice(0, 900),
+        // Digit-free for the same NUMBER_ALTERED reason as microcopy keys.
+        cutdown_briefs: ['The core answer, twenty seconds', 'The myth corrected', 'The door', 'The best question'],
+      } } };
+    }
+    // VIDEO, the default.
+    const spoken = seeded
+      ? `${s1} ${BAD} ${cta}`
+      : `${hook} ${s1} ${s2} ${cta}`;
+    return { result: 'OK', script: { ...base, body: extraBody,
       spoken_script: spoken,
       onscreen_text: [
-        { at_second: 0, text: (ctx.hook_line ?? '').slice(0, 88) || 'Your question, answered', emphasis: 'STRONG' },
+        { at_second: 0, text: hook.slice(0, 88) || 'Your question, answered', emphasis: 'STRONG' },
         { at_second: 4, text: s1.slice(0, 88), emphasis: 'NORMAL' },
       ],
       scene_plan: [
@@ -164,16 +299,8 @@ export class MockAIProvider extends BaseProvider {
         { index: 3, start_s: 22, end_s: 30, visual_brief: 'CTA end card with Telegram handle',
           asset_requirement: { kind: 'TYPOGRAPHY_ONLY', tags: [] } },
       ],
-      cta, caption: `${(ctx.hook_line ?? '').slice(0, 80)} | Letena`,
-      hashtags: ['letena', 'health'],
-      platform_variants: { TIKTOK: { hook_variant: (ctx.hook_line ?? '').slice(0, 90) } },
+      platform_variants: { TIKTOK: { hook_variant: hook.slice(0, 90) } },
       estimated_duration_s: 30,
-      claim_map: [
-        ...(ctx.__seed_unsupported ? [{ statement: 'It is 99% effective for everyone.',
-          claim_id: claims[0].id, location: 'SPOKEN' }] : []),
-        { statement: s1, claim_id: claims[0].id, location: 'SPOKEN' },
-        ...(claims[1] ? [{ statement: s2, claim_id: claims[1].id, location: 'SPOKEN' }] : []),
-      ],
     } };
   }
 

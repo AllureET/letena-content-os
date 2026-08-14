@@ -373,7 +373,7 @@ export const machines = {
               throw new GuardError('cardIsApproved', 'The knowledge card is no longer approved.');
             }
           }],
-        apply: approveScript },
+        apply: approveScriptClinical },
       'CLINICAL_REVIEW>DRAFT': { perm: 'script.approve_clinical', guards: [G.hasReason('changesNeedReason')] },
       'CLINICAL_REVIEW>REJECTED': { perm: 'script.approve_clinical', guards: [G.hasReason('rejectNeedsReason')],
         apply: async ({ object, ctx, client }) => {
@@ -392,6 +392,21 @@ async function approveScript({ object, ctx, client }) {
   await client.query(
     `UPDATE lcos.scripts SET approved_by=$2, approved_at=now(), approved_version=current_version
      WHERE id=$1`, [object.id, ctx.actor.id]);
+}
+// The clinical approval transition also signs the medical_review gate (Run
+// One, 14 Aug 2026): the doctor's CLINICAL_REVIEW>APPROVED decision IS the
+// medical review, so the signed-gate ledger the publish transition checks
+// records the same act instead of demanding a second click for it. The
+// editorial and language approval paths deliberately do NOT sign it: their
+// permission is not clinical, and medical_review before publish has no
+// exceptions, so content approved on those paths still waits for a
+// clinical signature before it can go out.
+async function approveScriptClinical({ object, ctx, client }) {
+  await approveScript({ object, ctx, client });
+  await client.query(
+    `INSERT INTO lcos.script_gates (script_id, gate, signed_by, note)
+     VALUES ($1,'medical_review',$2,'clinical approval transition')
+     ON CONFLICT (script_id, gate) DO NOTHING`, [object.id, ctx.actor.id]);
 }
 
 export async function transition(machineName, objectId, to, ctx) {

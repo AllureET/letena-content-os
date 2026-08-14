@@ -33,6 +33,14 @@ before(async () => {
   await q(`UPDATE lcos.content_families SET origin_question_id=NULL
            WHERE origin_question_id IN (SELECT id FROM lcos.audience_questions WHERE source_hash LIKE 'test-%')`);
   await q(`DELETE FROM lcos.audience_questions WHERE source_hash LIKE 'test-%'`);
+  // This suite is the acceptance test of the FULL human review journey
+  // (doctor approves, language editor approves, publish), so it runs with
+  // the clinical review gate ON. The deployed default is OFF while the
+  // owner tests the pipeline (0023, "Yes cause were testing"); the after()
+  // hook restores whatever value the database held.
+  const clin = await call('PUT', '/api/v1/platform/settings', tokens.admin,
+    { key: 'review.clinical_review_enabled', value: true });
+  assert.equal(clin.statusCode, 200, clin.body);
   // Published rows accumulate across runs and flip the score-confidence
   // heuristic from LOW (few peers) to FULL; each run starts from a clean slate.
   await q(`DELETE FROM lcos.content_scores`);
@@ -40,7 +48,11 @@ before(async () => {
   await q(`UPDATE lcos.experiment_variants SET published_content_id=NULL`);
   await q(`DELETE FROM lcos.published_content`);
 });
-after(async () => { await app.close(); await pool.end(); });
+after(async () => {
+  await call('PUT', '/api/v1/platform/settings', tokens.admin,
+    { key: 'review.clinical_review_enabled', value: false });
+  await app.close(); await pool.end();
+});
 
 // ---------------------------------------------------------------- pipeline
 let questionId, familyId, scriptIds = [], renderId, publishedId;

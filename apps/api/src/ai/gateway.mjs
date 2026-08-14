@@ -58,20 +58,27 @@ const S = {
     cta_intent: z.string(), why_this_works: z.string(),
     needs_knowledge: z.object({ missing_fact: z.string(), why_needed: z.string() }).nullable(),
   })).min(1).max(8) }),
-  // Format-aware output (14 Aug 2026). One writer, one claim map, one
-  // validator path, but the body shape follows what the piece actually is.
-  // The video fields are no longer unconditionally required, because a
-  // Telegram post has no scene plan and a static graphic has no duration;
-  // the superRefine below then requires whichever body the declared format
-  // needs, so "optional" never degrades into "the model may return nothing".
-  // claim_map stays required at min(1) for every format: whatever text is
-  // produced still has to trace to approved claims, so claim_validator and
-  // the deterministic overlay work identically on a carousel and a reel.
+  // Format-aware output (14 Aug 2026, widened for the Run One format
+  // registry the same day). One writer, one claim map, one validator path,
+  // but the body shape follows what the piece actually is. The nine body
+  // kinds mirror BODY_KINDS in apps/api/src/formats.mjs and the registry's
+  // content_formats.body_kind. The video fields are not unconditionally
+  // required, because a Telegram post has no scene plan and a push
+  // notification has no duration; the superRefine below then requires
+  // whichever body the declared format needs, so "optional" never degrades
+  // into "the model may return nothing". claim_map stays required at min(1)
+  // for every format: whatever text is produced still has to trace to
+  // approved claims, so claim_validator and the deterministic overlay work
+  // identically on a carousel, a push notification and a reel. The new
+  // kinds write into the generic `body` object, which bodyTextOf() walks
+  // string-leaf by string-leaf, so nothing written there can escape the
+  // hash, the lint, the validator or the localizer.
   script_writer: z.discriminatedUnion('result', [
     z.object({ result: z.literal('OK'), script: z.object({
-      format: z.enum(['VIDEO','CAROUSEL','STATIC','POST']).optional().default('VIDEO'),
-      hook: z.string().max(120),
-      spoken_script: z.string().max(3000).optional().default(''),
+      format: z.enum(['VIDEO','CAROUSEL','STATIC','POST','ARTICLE','MICROCOPY','PUSH','AUDIO','LIVE'])
+        .optional().default('VIDEO'),
+      hook: z.string().max(160),
+      spoken_script: z.string().max(6000).optional().default(''),
       onscreen_text: z.array(z.object({ at_second: z.number(), text: z.string().max(90),
         emphasis: z.enum(['NORMAL','STRONG','WARNING']).optional() })).optional().default([]),
       scene_plan: z.array(z.object({ index: z.number().int(), start_s: z.number(), end_s: z.number(),
@@ -84,13 +91,64 @@ const S = {
       static_graphic: z.object({ headline: z.string().max(90), body: z.string().max(300),
         footer: z.string().max(120).nullable().optional() }).nullable().optional(),
       // POST: the text that gets posted, written to be read rather than heard.
-      post_text: z.string().max(2000).optional().default(''),
+      post_text: z.string().max(4000).optional().default(''),
+      // The generic body for the registry kinds. Only the parts the format
+      // needs are filled; the superRefine enforces which.
+      body: z.object({
+        intro: z.string().max(600).optional(),
+        sections: z.array(z.object({ heading: z.string().max(160),
+          body: z.string().max(4000) })).optional(),
+        items: z.array(z.object({ key: z.string().max(120).nullable().optional(),
+          text_en: z.string().max(1000), text_am: z.string().max(1000).nullable().optional(),
+          note: z.string().max(300).nullable().optional() })).optional(),
+        push: z.object({ title: z.string().max(40), body: z.string().max(100),
+          deep_link: z.string().max(200) }).optional(),
+        segments: z.array(z.object({ index: z.number().int(), title: z.string().max(160),
+          minutes: z.number(), description: z.string().max(2000) })).optional(),
+        pinned_message: z.string().max(1000).optional(),
+        cutdown_briefs: z.array(z.string().max(600)).optional(),
+        // Format-specific fields, 14 Aug 2026 corrections. zod strips
+        // unknown keys, so anything the writer needs to return MUST be
+        // declared here or it silently vanishes before bodyTextOf ever
+        // sees it. Which fields a format REQUIRES is enforced in
+        // requireFormatBody() (modules/content.mjs), because the zod
+        // schema keys on body kind and cannot see the format code.
+        checklist: z.array(z.string().max(300)).optional(),
+        question_quoted: z.string().max(600).optional(),
+        quiz: z.object({ question: z.string().max(300),
+          options: z.array(z.string().max(120)).optional(),
+          answer: z.string().max(400),
+          explanation: z.string().max(600).optional() }).optional(),
+        giveaway: z.object({ how_to_enter: z.string().max(400),
+          deadline: z.string().max(120),
+          winner_selection: z.string().max(300) }).optional(),
+        whiteboard: z.object({
+          character_brief: z.string().max(1200).optional(),
+          board_style_brief: z.string().max(1200).optional(),
+          board_map: z.array(z.object({ element: z.string().max(160),
+            column: z.string().max(40).optional(),
+            icon: z.string().max(160).nullable().optional() })).optional(),
+          clips: z.array(z.object({ index: z.number().int(),
+            dialogue: z.string().max(1200),
+            last_frame_anchor: z.string().max(1200),
+            beats: z.array(z.object({ at_s: z.number(),
+              appears: z.string().max(300),
+              speech: z.string().max(400) })).optional().default([]) })).optional(),
+          pronunciation_notes: z.array(z.string().max(300)).optional(),
+        }).optional(),
+      }).optional().default({}),
+      // Captions keyed by PLATFORM (14 Aug 2026: the letenav2 trio missed
+      // TikTok, Instagram and LinkedIn). The writer fills one caption per
+      // platform in FORMAT_SPEC.platforms; every value is claim-validated
+      // via bodyTextOf(). Null when the format does not want captions.
+      captions: z.record(z.string().max(3000)).nullable().optional(),
       cta: z.string(), caption: z.string().optional(), hashtags: z.array(z.string()).optional().default([]),
       platform_variants: z.record(z.any()).optional().default({}),
       estimated_duration_s: z.number().optional().default(0),
       claim_map: z.array(z.object({ statement: z.string(), claim_id: z.string(),
         claim_code: z.string().optional(),
-        location: z.enum(['HOOK','SPOKEN','ONSCREEN','CTA','CAPTION','SLIDE','POST']),
+        location: z.enum(['HOOK','SPOKEN','ONSCREEN','CTA','CAPTION','SLIDE','POST',
+          'SECTION','ITEM','SEGMENT','FIELD']),
         paraphrase_note: z.string().nullable().optional() })).min(1),
     }).superRefine((v, ctx) => {
       const need = (cond, path, message) => {
@@ -105,6 +163,23 @@ const S = {
       } else if (v.format === 'POST') {
         need(v.post_text.trim().length > 0, 'post_text',
           'a post needs post_text: the text that actually gets posted');
+      } else if (v.format === 'ARTICLE') {
+        need((v.body.sections ?? []).length >= 1, 'body',
+          'an article needs body.sections, each with a heading and a body');
+      } else if (v.format === 'MICROCOPY') {
+        need((v.body.items ?? []).length >= 1, 'body',
+          'microcopy needs body.items, each with text_en and text_am');
+      } else if (v.format === 'PUSH') {
+        need(!!v.body.push?.title && !!v.body.push?.body, 'body',
+          'a push notification needs body.push with title and body');
+        need((v.body.push?.deep_link ?? '').startsWith('abeba://'), 'body',
+          'push deep_link must start with abeba://');
+      } else if (v.format === 'AUDIO') {
+        need(v.spoken_script.trim().length > 0, 'spoken_script',
+          'an audio spot needs spoken_script, written to be heard once');
+      } else if (v.format === 'LIVE') {
+        need((v.body.segments ?? []).length >= 1, 'body',
+          'a live run of show needs body.segments');
       } else {
         need(v.spoken_script.trim().length > 0, 'spoken_script',
           'a video needs spoken_script');
@@ -282,13 +357,15 @@ export class AgentError extends Error {
 export const HOUSE_STYLE_RULES = `House writing rules. These apply to every piece of English or Amharic copy you write, regardless of the tone and voice instructions below. No exceptions.
 - Never use an em dash (—).
 - Never use a "not this, but that" contrastive construction.
-- Never hedge with filler like "might", "could potentially", "it's possible that" when you mean something plainly. State what is true.
+- Hedging that adds nothing is banned: "it's important to note", "may potentially", "it's generally recommended", "some experts suggest", "this could possibly", "results may vary" as filler, and any softening of a fact an approved claim states plainly. When a claim says something is true, say it is true. Keep the hedge that carries real clinical uncertainty, stated exactly as the approved claim states it: if a claim says a symptom can indicate something, write can, not does; cycle predictions say might or may because there the uncertainty is real. The test: if removing the hedge would make the sentence say something the approved claim does not support, the hedge is load-bearing and stays; otherwise it is filler and goes.
 - Never use a parenthetical aside.
 - Never sign off like an assistant: no "I hope this helps!", no "Let me know if you have questions", nothing like it. This is not a chat reply, it is finished copy.
 - Never use antithesis ("it is not X, it is Y") as a rhetorical flourish. Only contrast two things when the contrast itself is the medically necessary clarification, and even then say it plainly rather than as a rhetorical pair.
 - Never use a rule-of-three phrase pattern ("safe, simple, and effective") as a stylistic flourish.
 - Never use engagement-bait phrasing. No "one simple trick", no "the one thing nobody tells you", no "you won't believe", no "doctors don't want you to know", no "here's the secret". A hook earns attention by being specific and true, not by borrowing the grammar of an advertisement. This is a health service and that phrasing costs it the trust it needs.
 - Never minimise or wave away the thing the reader is worried about. No "it's just a...", no "don't worry", no "simply", no "all you have to do is". She is asking because it matters to her. Explain how something works without implying she was silly to wonder.
+- Never ask anyone to disclose something private in public. Do not invite people to share a symptom, a diagnosis, an experience or a question about their own body in comments; on sexual and reproductive health that is a disclosure the reader cannot take back. Asking for a non-disclosing response is fine and often good where the format allows comment prompts: an opinion, a vote, a myth people have heard, a request for a topic, a quiz answer, a tag-a-friend. The private message remains the route for anything personal.
+- Never stack exclamation marks, and never use more than one exclamation in a piece. Calm is the register.
 - Write plain human prose that matches the audience and the document type. Amharic is the primary language for Amharic copy, not a translation exercise: write the way people actually speak, not a stiff word-for-word rendering.`;
 
 // Resolves the effective tone preset's prompt instructions: an explicit

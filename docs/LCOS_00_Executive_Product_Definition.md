@@ -57,7 +57,7 @@ LCOS attacks all three: demand intelligence solves (1), the knowledge card layer
 | `developer` | Natnael Zerihun, Allure IT | Operates the system. Cannot approve clinical or language content. | System Settings, Audit Log, Observability |
 | `admin` | Nate Zewdu | Users, roles, budgets, cost dashboards | All, plus Users and Roles |
 
-Design constraint that overrides convenience: Rudy is the daily operator and is not a developer. If a routine action requires opening n8n, the design is wrong. Clinicians approve in a queue that looks like an inbox. Nobody outside the developer role sees a workflow canvas.
+Design constraint that overrides convenience: Girum, the content lead, is the daily operator of the content system and is not a developer (owner correction, 14 Aug 2026; Rudy is the intake coordinator and lives in the EMR). He cares about what to make, whether it is any good, and getting it out. If a routine action requires opening n8n, the design is wrong. Clinicians approve in a queue that looks like an inbox. Nobody outside the developer role sees a workflow canvas.
 
 ### 6. The loop
 
@@ -160,4 +160,4 @@ Pilot runs across weeks 17 to 20 and gates the move from 20 cards to 100.
 | Clinicians become the bottleneck again | Claim-level reuse, tiered review, sampling instead of full review at Tier 2, batched approval queue with keyboard workflow. |
 | Cost per video is unknown until too late | Cost fields on every workflow event from R3. Cost dashboard in R4. |
 | Platform API access denied or revoked | Publishing designed as prepare-then-hand-off, so a manual upload path always exists. TikTok in particular starts as upload-for-review. |
-| The system is built and nobody uses it | Rudy's Turn Into Content button and the coverage gap board are R2 and R3 scope, not later. Adoption depends on them. |
+| The system is built and nobody uses it | The Turn Into Content button and the coverage gap board are R2 and R3 scope, not later. Adoption depends on them, and on the daily flow working for Girum, the content lead. |

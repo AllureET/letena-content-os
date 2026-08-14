@@ -1,10 +1,135 @@
 # BUILD_STATE — Letena Content OS
 
-Authoritative resume point. Updated 2026-08-14, working directly against
-Nate's Mac checkout (/Users/natezewdu/Desktop/lcos, connected this session
-via the device bridge), branch main, HEAD 7103682, clean, tracking
-origin/main. The paragraph below dated 2026-08-12 was the previous
-resume point and is left in place as history, not current status.
+Authoritative resume point. Updated 2026-08-14 (Run Two), working directly
+against Nate's Mac checkout (/Users/natezewdu/Desktop/lcos, device bridge),
+branch main. The sections below this one are the earlier resume points,
+left as history.
+
+UNIFIED CONTENT MACHINE, RUN TWO (Part 1 corrections), 14 Aug 2026. Owner
+feedback applied to Run One, verified against a real Postgres 16 + pgvector
+instance: migrations 0001-0023 apply cleanly from scratch and the suite
+passes 221/221 with MOCK AI (test env note: delete or MOCK the
+cred.LCOS_AI_PROVIDER settings row that 0014 seeds as ANTHROPIC, or every
+agent call tries the real API).
+- Migration 0022: registry corrections. 42 active formats (was 36):
+  aua_clip split into aua_live / aua_promo / aua_recap (concept references
+  migrated, dangling code deleted); NEW ask_dr_letena (doctor reads a
+  de-identified REWORDED user question aloud; a question that cannot be
+  fully de-identified does not run, enforced in requireFormatBody via
+  containsForbidden), quiz_reel + quiz_carousel (claim-mapped answers,
+  required non-medical body.giveaway), whiteboard_explainer (animated
+  whiteboard: board map, 3-4 clips each with a last-frame anchor, gaze /
+  glow / stick-target / voice-firewall rules in the format rules; DIGITAL
+  only). Columns: content_formats.cta_spec (canonical block NAMES so the
+  door phone number is never retyped; every non-internal format's
+  assembled CTA carries a real contact route: call + DM, abeba:// deep
+  link, or letena.et), comment_prompt_allowed, production_paths (first
+  entry = default); scripts.production_path (DIGITAL default / LIVE /
+  NONE) + is_brand_tier (brand_tier was never a format: it was a quota
+  tier, now a flag on any piece, awaiting owner confirmation);
+  content_concepts.audience (WOMEN default / MEN / COUPLES / GENERAL);
+  script_gates.signed_role (admin signatures outside the declared role
+  record admin_override); script_versions.captions_by_platform (legacy
+  trio migrated in); terminology.keep_english with the 26-term
+  stay-English set seeded APPROVED (owner rule 12 Aug); phrasing_examples
+  (human-corrected Amharic from non-medical edits, injected into the
+  localizer prompt: this is what "retrain the descriptions" means, no
+  fine-tuning). New 'produce' stage: DIGITAL path replaces shoot+edit
+  with produce; effectiveStages() in pipeline_rules.mjs filters per piece;
+  POST /pipeline/scripts/:id/production-path changes it until production
+  starts.
+- Migration 0023: LETENA_DEFAULT voice pulled back to the clinician
+  (doctor first, friendly and approachable second, not a peer, not a
+  lecturer; audience includes men). script_writer 1.4.0: EMR escalation
+  line REMOVED from the governance block (owner: "refers to the EMR");
+  precise hedging rule (filler banned, load-bearing hedges kept);
+  self-disclosure comment rule replacing the blanket ban; stay-English
+  terminology for every format; per-platform caption rules (TikTok,
+  Instagram, Facebook, Telegram, X, LinkedIn, YouTube); CTA-from-blocks
+  instructions; new format body guidance. amharic_localizer 1.2.0: same
+  terminology rule, audience register, human-corrected examples.
+  review.clinical_review_enabled back to FALSE (owner: "Yes cause were
+  testing"). PUBLISH STILL REQUIRES A SIGNED medical_review GATE FOR
+  EVERY FORMAT, toggle or no toggle. >>> THE TOGGLE MUST GO BACK ON
+  BEFORE REAL PUBLISHING. <<<
+- Code: role-driven gates (GATE_SIGNERS in modules/pipeline.mjs: content
+  lead signs content, doctors sign medical review, MEDICAL DIRECTOR signs
+  clinical_signoff, producer signs production, social lead signs publish;
+  admin is the recorded override); a flagged (abortion-adjacent) piece now
+  BLOCKS at medical_review until clinical_signoff is signed, publish check
+  kept as backstop; classifyEdit() (pipeline_rules.mjs) splits human edits
+  into MEDICAL (any claim-mapped statement, number, time window, negation,
+  hedge, dose or terminology term changed -> sign-off withdrawn, back to
+  review; conservative at the boundary) and NON_MEDICAL (sign-off stands,
+  changed Amharic captured into phrasing_examples); style_lint.mjs:
+  filler-hedge list, comment self-disclosure lint, lintStayEnglish
+  (deterministic transliteration catch, e.g. Amharic-script "condom");
+  bodyTextOf walks captions_by_platform; MOCK writer fills every new
+  format body. Daily user corrected to Girum (content lead), not Rudy.
+- Tests: apps/api/test/part1_corrections.test.mjs (23 tests) plus updated
+  formats_registry and e2e (e2e runs with the clinical toggle ON for the
+  human-journey acceptance, restores OFF after).
+- STILL PENDING: foundations_episode carries a best-guess schema; replace
+  when the owner shares the Foundations universe document and scripts.
+
+UNIFIED CONTENT MACHINE, RUN ONE, SHIPPED 14 Aug 2026 (owner decision:
+merge letenav2 content + LCOS into one machine; this run is the
+foundation). What landed, all committed-ready on disk and verified against
+a real Postgres 16 + pgvector instance where migrations 0001-0021 apply
+cleanly and the full test suite passes 192/192 with MOCK AI:
+- Migration 0019: lcos.content_formats, the data-driven format registry.
+  36 formats across five surfaces (social video, static/card, text and
+  long form, the Abeba app, programme/institutional), each row carrying
+  headings, rules, body_kind, body_schema, stages_applicable,
+  review_ladder, target_length, language_mode, hedging_allowed,
+  wants_captions, ends_at_door. Adding a format is an INSERT. A CHECK
+  makes it impossible to seed a format without medical_review in its
+  stages. brand_tier deliberately not carried over (it was a quota tier,
+  and the quota system is dropped by owner order). library_explainer got a
+  real ARTICLE schema; animated_news became a real format.
+- Migration 0020: script_versions.body jsonb (generic body for ARTICLE /
+  MICROCOPY / PUSH / AUDIO / LIVE kinds) + the three-caption columns;
+  script_claims.location widened (the old CHECK would have crashed the
+  first honest SLIDE claim insert, latent since 0018); concepts carry
+  format_code; scripts carry stage + needs_clinical_signoff; script_gates
+  (the letenav2 signed-gate ledger, idempotent per piece+gate).
+- Migration 0021: review.clinical_review_enabled flipped back ON (and the
+  code default in routeReviews is now true, so a missing row fails safe);
+  script_writer 1.3.0 (all nine body kinds, FORMAT_SPEC contract, verbatim
+  clinical governance gates, three-caption rules, canonical Amharic blocks
+  byte-for-byte IN THE PROMPT TEXT because the bot block's @LetenaEthBot
+  would trip the outbound PII assertion if it rode in context);
+  amharic_localizer 1.1.0 (feminine second person default, format aware).
+- Code: apps/api/src/letena_canon.mjs (canonical blocks extracted
+  programmatically from letenav2, byte-identical, plus governance text and
+  the abortion-adjacent detector); formats.mjs bodyTextOf now walks every
+  string leaf of the generic body AND all captions (captions were never
+  claim-validated before; the fbtg caption teaches by design, so that was
+  a real hole); pipeline_rules.mjs (pure publishRule + STAGES);
+  modules/pipeline.mjs (board, gate signing, stage advance with
+  not-applicable skipping, invalidateMedicalSignoff); content.mjs
+  registry-driven generation (POST /content/generate accepts formats:[],
+  GET /content/formats) and POST /content/scripts/:id/edit, which
+  invalidates the medical sign-off when body text changes (letenav2
+  defect: an edited medical_ok piece stayed medical_ok); distribution
+  executePublish now refuses without a signed medical_review gate (and
+  clinical_signoff when abortion-adjacent), without cancelling the job;
+  core.mjs CLINICAL_REVIEW>APPROVED signs the medical gate as part of the
+  same act. MOCK provider writes every body kind and got two real fixes
+  (missing is_genuine_question since 0010 broke every MOCK classification;
+  claim_map shorthand bug). seed.mjs prompt insert now survives a fresh
+  install where migrations ran first.
+- Tests: apps/api/test/formats_registry.test.mjs, 55 tests: one per format
+  proving the right body shape, an unsupported claim ON A CAROUSEL SLIDE
+  failing validation, publish blocked without the signed medical gate end
+  to end through a real render + publish attempt, the edit reset, stage
+  skipping, NEEDS_KNOWLEDGE as success, and a drift test pinning the
+  canonical Amharic blocks in the active prompt byte-for-byte.
+NOT in this run (later runs): the seven-step guided flow UI, production
+cost preview, live progress tracker. BEHAVIOUR CHANGES to brief the team
+on: clinical review is back on; publish now requires a signed medical
+review for EVERY format and tier; editing reviewed content withdraws the
+sign-off and forces re-review.
 
 STABILITY + AUTOMATION FIXES SHIPPED 13-14 Aug, the day after the bulk-
 generation ship below, in commit order: batch-size choice (100/250/500)

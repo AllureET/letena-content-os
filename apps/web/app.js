@@ -1008,12 +1008,12 @@ const screens = {
     const clinicalOn = Boolean(r.items.find(s => s.key === 'review.clinical_review_enabled')?.value ?? false);
     const clinicalHtml = isAdmin() ? `<div class="card" style="border:1px solid ${clinicalOn ? 'var(--line)' : 'var(--risk-high)'};${clinicalOn ? '' : 'background:var(--risk-high-bg)'}">
       <div class="eyebrow" style="color:${clinicalOn ? 'var(--plump-purple)' : 'var(--risk-high)'}">Clinical review gate</div>
-      <div class="sub" style="margin-bottom:10px">Whether a TIER 3/TIER 4 script that passes claim validation stops for a doctor's clinical sign-off, or auto-approves straight through with nobody reviewing it.</div>
-      ${clinicalOn ? '' : `<div class="flex" style="margin-bottom:10px"><span class="pill" style="color:#fff;background:var(--risk-high)"><span class="d"></span>CLINICAL REVIEW IS OFF &mdash; Tier 3/4 scripts auto-approve with no doctor sign-off</span></div>`}
+      <div class="sub" style="margin-bottom:10px">Whether a TIER 3/TIER 4 script that passes claim validation stops for a doctor's clinical sign-off during the pipeline, or runs straight through so the pipeline can be tested. Either way, NOTHING publishes without a signed medical review gate: publish requires it for every format, with no exception, regardless of this toggle.</div>
+      ${clinicalOn ? '' : `<div class="flex" style="margin-bottom:10px"><span class="pill" style="color:#fff;background:var(--risk-high)"><span class="d"></span>CLINICAL REVIEW IS OFF (testing) &mdash; Tier 3/4 scripts do not stop for a doctor during the pipeline. Publish still requires a signed medical review gate. Turn this back ON before real publishing.</span></div>`}
       <div class="flex">
         <select id="clinical-select" style="max-width:360px">
-          <option value="false" ${clinicalOn ? '' : 'selected'}>Off (testing the rest of the pipeline; scripts auto-approve)</option>
-          <option value="true" ${clinicalOn ? 'selected' : ''}>On (default: Tier 3/4 scripts require a doctor's sign-off)</option>
+          <option value="false" ${clinicalOn ? '' : 'selected'}>Off (testing: scripts do not stop for a doctor; publish still needs the signed medical gate)</option>
+          <option value="true" ${clinicalOn ? 'selected' : ''}>On (Tier 3/4 scripts stop for a doctor's sign-off before advancing)</option>
         </select>
         <button class="${clinicalOn ? 'primary' : 'danger'}" id="clinical-save">Save</button>
       </div></div>` : '';
@@ -1195,7 +1195,7 @@ document.addEventListener('click', async (e) => {
     if (b.id === 'clinical-save') {
       const value = $('#clinical-select').value === 'true';
       await api('PUT', '/platform/settings', { key: 'review.clinical_review_enabled', value });
-      toast(value ? 'Clinical review is back on. Tier 3/4 scripts will require a doctor\'s sign-off again.' : 'Clinical review is OFF. Tier 3/4 scripts will auto-approve with no doctor reviewing them.',
+      toast(value ? 'Clinical review is back on. Tier 3/4 scripts will require a doctor\'s sign-off again.' : 'Clinical review is OFF for testing. Scripts will not stop for a doctor, and publish still requires a signed medical review gate. Turn it back on before real publishing.',
         value ? false : 'warn');
       return render();
     }

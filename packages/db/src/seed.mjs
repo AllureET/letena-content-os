@@ -155,9 +155,19 @@ async function main() {
   }
 
   for (const [key, agent, system] of PROMPTS) {
+    // Bare ON CONFLICT DO NOTHING, not (prompt_key, version): on a fresh
+    // database where migrations run BEFORE seed (the documented install
+    // order), migrations 0010/0013/0016/0018/0021 have already inserted
+    // newer ACTIVE versions of several of these prompts, and inserting
+    // 1.0.0 with is_active=true then violates the one-active-per-key
+    // partial unique index, not the (key, version) constraint this used to
+    // name. Found 14 Aug 2026 standing up a clean instance for the Run One
+    // build; until then seed had only ever run before those migrations
+    // existed. Skipping is correct either way: a prompt row that conflicts
+    // with anything already present must never overwrite it.
     await q(`INSERT INTO lcos.ai_prompts (prompt_key, version, agent_name, system_prompt, user_template, output_schema, default_model, is_active)
              VALUES ($1,'1.0.0',$2,$3,'{{context_json}}','{}','configured', true)
-             ON CONFLICT (prompt_key, version) DO NOTHING`, [key, agent, system]);
+             ON CONFLICT DO NOTHING`, [key, agent, system]);
   }
 
   if (DEMO) await seedDemo(admin.id);

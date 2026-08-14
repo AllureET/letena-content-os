@@ -54,6 +54,38 @@ const styleWarnHtml = (warnings) => (Array.isArray(warnings) && warnings.length)
 // knowledge card's code (views built before drill-down existed), so rows can
 // still link to the real card detail screen. Swallows a 403 quietly -- a
 // user without knowledge.read simply sees non-clickable rows there.
+// A piece is not always a video. Show the body it actually has: slides for a
+// carousel, a headline and supporting line for a static graphic, post text
+// for a Telegram post. Before 0018 every script carried a spoken_script and
+// the page said "Spoken:" over it regardless of what was going to be made.
+const FMT_LABEL = { VIDEO: 'Video script', CAROUSEL: 'Carousel slides',
+  STATIC: 'Static graphic', POST: 'Post text' };
+function fmtLabel(f) { return FMT_LABEL[f] ?? 'Script'; }
+
+function scriptBody(v) {
+  if (!v) return '';
+  const f = v.format ?? 'VIDEO';
+  if (f === 'CAROUSEL') {
+    const slides = Array.isArray(v.carousel_slides) ? v.carousel_slides : [];
+    if (!slides.length) return '<span class="muted">No slides.</span>';
+    return slides.map((sl, i) => `<div class="slide"><div class="slide-n">${i + 1}</div>
+      <div><b>${esc(sl.title ?? '')}</b><div>${esc(sl.body ?? '')}</div></div></div>`).join('');
+  }
+  if (f === 'STATIC') {
+    const g = v.static_graphic;
+    if (!g) return '<span class="muted">No graphic copy.</span>';
+    return `<div class="statichead">${esc(g.headline ?? '')}</div>
+      <div>${esc(g.body ?? '')}</div>
+      ${g.footer ? `<div class="muted" style="margin-top:6px">${esc(g.footer)}</div>` : ''}`;
+  }
+  if (f === 'POST') {
+    return v.post_text
+      ? `<div class="posttext">${esc(v.post_text)}</div>`
+      : '<span class="muted">No post text.</span>';
+  }
+  return `<b>Spoken:</b><br>${esc(v.spoken_script ?? '')}`;
+}
+
 // Sparkline: one series per topic, so no categorical palette and no legend
 // (the row label carries identity). History sits in a de-emphasised hue and
 // the current period takes the accent, which is the only thing colour is
@@ -619,8 +651,8 @@ const screens = {
         <span class="muted">${esc(s.language)} · v${s.current_version}</span></div>
       ${styleWarnHtml(v?.style_warnings)}
       <div class="grid2">
-        <div class="card"><div class="eyebrow">Script</div>
-          <div class="kv"><b>Hook:</b> ${esc(v?.hook)}<br><br><b>Spoken:</b><br>${esc(v?.spoken_script)}
+        <div class="card"><div class="eyebrow">${esc(fmtLabel(v?.format))}</div>
+          <div class="kv"><b>Hook:</b> ${esc(v?.hook)}<br><br>${scriptBody(v)}
           <br><br><b>CTA:</b> ${esc(v?.cta)}</div></div>
         <div class="card"><div class="eyebrow">Amharic ${s.translation ? `· drift ${Number(s.translation.drift_score).toFixed(3)}` : ''}</div>
           ${s.translation ? `<div class="amharic">${esc(s.translation.translated_text)}</div>

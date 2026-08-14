@@ -58,20 +58,58 @@ const S = {
     cta_intent: z.string(), why_this_works: z.string(),
     needs_knowledge: z.object({ missing_fact: z.string(), why_needed: z.string() }).nullable(),
   })).min(1).max(8) }),
+  // Format-aware output (14 Aug 2026). One writer, one claim map, one
+  // validator path, but the body shape follows what the piece actually is.
+  // The video fields are no longer unconditionally required, because a
+  // Telegram post has no scene plan and a static graphic has no duration;
+  // the superRefine below then requires whichever body the declared format
+  // needs, so "optional" never degrades into "the model may return nothing".
+  // claim_map stays required at min(1) for every format: whatever text is
+  // produced still has to trace to approved claims, so claim_validator and
+  // the deterministic overlay work identically on a carousel and a reel.
   script_writer: z.discriminatedUnion('result', [
     z.object({ result: z.literal('OK'), script: z.object({
-      hook: z.string().max(120), spoken_script: z.string().max(3000),
+      format: z.enum(['VIDEO','CAROUSEL','STATIC','POST']).optional().default('VIDEO'),
+      hook: z.string().max(120),
+      spoken_script: z.string().max(3000).optional().default(''),
       onscreen_text: z.array(z.object({ at_second: z.number(), text: z.string().max(90),
-        emphasis: z.enum(['NORMAL','STRONG','WARNING']).optional() })),
+        emphasis: z.enum(['NORMAL','STRONG','WARNING']).optional() })).optional().default([]),
       scene_plan: z.array(z.object({ index: z.number().int(), start_s: z.number(), end_s: z.number(),
         visual_brief: z.string(), asset_requirement: z.object({ kind: z.string(),
-          tags: z.array(z.string()), must_be_ethiopian: z.boolean().optional() }) })).min(1),
+          tags: z.array(z.string()), must_be_ethiopian: z.boolean().optional() }) })).optional().default([]),
+      // CAROUSEL: real slides, not caption cues timed to video seconds.
+      carousel_slides: z.array(z.object({ index: z.number().int(), title: z.string().max(90),
+        body: z.string().max(300) })).optional().default([]),
+      // STATIC: one image, so one headline and one supporting line.
+      static_graphic: z.object({ headline: z.string().max(90), body: z.string().max(300),
+        footer: z.string().max(120).nullable().optional() }).nullable().optional(),
+      // POST: the text that gets posted, written to be read rather than heard.
+      post_text: z.string().max(2000).optional().default(''),
       cta: z.string(), caption: z.string().optional(), hashtags: z.array(z.string()).optional().default([]),
       platform_variants: z.record(z.any()).optional().default({}),
-      estimated_duration_s: z.number(),
+      estimated_duration_s: z.number().optional().default(0),
       claim_map: z.array(z.object({ statement: z.string(), claim_id: z.string(),
-        claim_code: z.string().optional(), location: z.enum(['HOOK','SPOKEN','ONSCREEN','CTA','CAPTION']),
+        claim_code: z.string().optional(),
+        location: z.enum(['HOOK','SPOKEN','ONSCREEN','CTA','CAPTION','SLIDE','POST']),
         paraphrase_note: z.string().nullable().optional() })).min(1),
+    }).superRefine((v, ctx) => {
+      const need = (cond, path, message) => {
+        if (!cond) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [path], message });
+      };
+      if (v.format === 'CAROUSEL') {
+        need(v.carousel_slides.length >= 2, 'carousel_slides',
+          'a carousel needs at least 2 slides, each with a title and body');
+      } else if (v.format === 'STATIC') {
+        need(!!v.static_graphic?.headline, 'static_graphic',
+          'a static graphic needs static_graphic.headline and static_graphic.body');
+      } else if (v.format === 'POST') {
+        need(v.post_text.trim().length > 0, 'post_text',
+          'a post needs post_text: the text that actually gets posted');
+      } else {
+        need(v.spoken_script.trim().length > 0, 'spoken_script',
+          'a video needs spoken_script');
+        need(v.scene_plan.length >= 1, 'scene_plan', 'a video needs at least one scene');
+      }
     }) }),
     z.object({ result: z.literal('NEEDS_KNOWLEDGE'), needs_knowledge: z.object({
       missing_facts: z.array(z.object({ fact_needed: z.string(), why: z.string(),
@@ -157,6 +195,12 @@ function unwrapZod(def) {
     if (def.typeName === 'ZodOptional') { optional = true; def = def.innerType._def; continue; }
     if (def.typeName === 'ZodNullable') { nullable = true; def = def.innerType._def; continue; }
     if (def.typeName === 'ZodDefault') { hasDefault = true; defaultValue = def.defaultValue(); def = def.innerType._def; continue; }
+    // A .superRefine()/.refine() wrapper (ZodEffects) is a validation rule,
+    // not a shape. Unwrap it or the field guide describes the wrapper and
+    // the model is handed no field list at all, which is the exact
+    // SCHEMA_FAIL this guide exists to prevent (13 Aug 2026). Added when
+    // script_writer's body became format-conditional and gained a refine.
+    if (def.typeName === 'ZodEffects') { def = def.schema._def; continue; }
     break;
   }
   return { def, optional, nullable, hasDefault, defaultValue };
@@ -183,7 +227,7 @@ function describeZodType(def, indent, depth) {
     case 'ZodEnum': return { headline: `one of ${def.values.map(v => JSON.stringify(v)).join(' | ')}` };
     case 'ZodLiteral': return { headline: `literally ${JSON.stringify(def.value)}` };
     case 'ZodArray': {
-      const itemDef = def.type._def;
+      const itemDef = unwrapZod(def.type._def).def;
       if (itemDef.typeName === 'ZodObject') {
         return { headline: 'array of objects, each with:',
           nested: describeZodObjectFields(itemDef, indent + '    ', depth + 1) };
@@ -192,11 +236,12 @@ function describeZodType(def, indent, depth) {
     }
     case 'ZodObject': return { headline: 'object with:',
       nested: describeZodObjectFields(def, indent + '    ', depth + 1) };
+    case 'ZodEffects': return describeZodType(def.schema._def, indent, depth);
     case 'ZodRecord': return { headline: 'free-form object' };
     case 'ZodAny': return { headline: 'any JSON value' };
     case 'ZodUnion': return { headline: 'one of several types' };
     case 'ZodDiscriminatedUnion': {
-      const opts = def.options.map(o => describeZodObjectFields(o._def, indent + '    ', depth + 1))
+      const opts = def.options.map(o => describeZodObjectFields(unwrapZod(o._def).def, indent + '    ', depth + 1))
         .join(`\n${indent}  OR:\n`);
       return { headline: `one of several shapes depending on "${def.discriminator}":`,
         nested: `${indent}  ${opts}` };

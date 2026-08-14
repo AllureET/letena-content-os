@@ -5,6 +5,7 @@ import { q, one, tx, audit, requirePerm, err, transition, setting } from '../cor
 import { invokeAgent, embed } from '../ai/gateway.mjs';
 import { lintStyle } from '../ai/style_lint.mjs';
 import { validatorOverlay, overallResult, computeRiskTier } from '../../../../packages/scoring/src/index.mjs';
+import { formatOf, bodyTextOf } from '../formats.mjs';
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -682,6 +683,11 @@ export async function generateScript({ concept, family, card, cardVersion, claim
     hook_line: concept.hook_line, video_family: concept.video_family,
     hook_line_is_placeholder: hookLineIsPlaceholder,
     treatment: concept.treatment,
+    // What kind of thing this is, which decides which body the writer fills.
+    // Distinct from video_family (a render-routing key) and from platform
+    // (where it gets posted): a carousel and a static graphic are both
+    // Instagram, and neither is a video.
+    format: formatOf(concept.video_family),
     platform: outputType?.platform ?? null,
     output_format: outputType?.label ?? null,
     format_note: outputType?.description ?? null,
@@ -703,11 +709,17 @@ export async function generateScript({ concept, family, card, cardVersion, claim
     return s;
   }
   const sc = out.script;
-  const bodyHash = sha(sc.spoken_script + sc.hook + sc.cta);
+  // Hash and lint the piece's ACTUAL body. Both used to read spoken_script,
+  // which is empty for a carousel, a static graphic or a post now that each
+  // fills its own body, so both would have been operating on a hook and a
+  // CTA alone. bodyTextOf() is the single definition of "the text of this
+  // piece" and is the same one the validator and the localizer use.
+  const bodyText = bodyTextOf(sc);
+  const bodyHash = sha(bodyText);
   // Mechanical house-style lint over every generated English surface. Not
   // exhaustive (see ai/style_lint.mjs); catches em dashes, hedge phrases and
   // AI sign-offs so a human reviewer sees them rather than them slipping by.
-  const styleWarnings = lintStyle([sc.hook, sc.spoken_script, sc.cta, sc.caption].filter(Boolean).join('\n'));
+  const styleWarnings = lintStyle([bodyText, sc.caption].filter(Boolean).join('\n'));
   const s = await one(
     `INSERT INTO lcos.scripts (code, concept_id, family_id, knowledge_card_version_id, language,
        status, risk_tier, current_version, validation_result, content_sha256, created_by, is_test_content)
@@ -717,11 +729,13 @@ export async function generateScript({ concept, family, card, cardVersion, claim
   await q(
     `INSERT INTO lcos.script_versions (script_id, version, hook, spoken_script, onscreen_text,
        scene_plan, cta, caption, hashtags, platform_variants, estimated_duration_s, content_sha256,
-       created_by, tone_preset, style_warnings)
-     VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-    [s.id, sc.hook, sc.spoken_script, JSON.stringify(sc.onscreen_text), JSON.stringify(sc.scene_plan),
+       created_by, tone_preset, style_warnings, format, carousel_slides, static_graphic, post_text)
+     VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+    [s.id, sc.hook, sc.spoken_script ?? '', JSON.stringify(sc.onscreen_text), JSON.stringify(sc.scene_plan),
      sc.cta, sc.caption ?? null, sc.hashtags ?? [], JSON.stringify(sc.platform_variants ?? {}),
-     sc.estimated_duration_s, bodyHash, actor?.id ?? null, effectiveTone, JSON.stringify(styleWarnings)]);
+     sc.estimated_duration_s, bodyHash, actor?.id ?? null, effectiveTone, JSON.stringify(styleWarnings),
+     sc.format ?? 'VIDEO', JSON.stringify(sc.carousel_slides ?? []),
+     sc.static_graphic ? JSON.stringify(sc.static_graphic) : null, sc.post_text ?? null]);
   for (const m of sc.claim_map) {
     await q(`INSERT INTO lcos.script_claims (script_id, script_version, claim_id, statement, location)
              VALUES ($1,1,$2,$3,$4)`, [s.id, m.claim_id, m.statement, m.location]);
@@ -757,7 +771,7 @@ export async function validateScript(scriptId, { actor }) {
   let agentOut;
   try {
     agentOut = await invokeAgent('claim_validator', {
-      script_text: `${v.hook} ${v.spoken_script} ${v.cta}`,
+      script_text: bodyTextOf(v),
       claim_map: claimMap.map(m => ({ statement: m.statement, claim_id: m.claim_id, location: m.location })),
       claims, prohibited_claims: cardVersion.prohibited_claims,
       risk_tier: s.risk_tier,
@@ -773,7 +787,7 @@ export async function validateScript(scriptId, { actor }) {
 
   // Deterministic overlay: can only ADD findings.
   const overlay = validatorOverlay({
-    scriptText: `${v.hook} ${v.spoken_script} ${v.cta}`,
+    scriptText: bodyTextOf(v),
     claims, card: cardVersion, riskTier: s.risk_tier, cta: v.cta });
   const findings = [...agentOut.findings, ...overlay];
   const result = overallResult(agentOut.statements, findings);
@@ -819,7 +833,8 @@ export async function localizeScript(scriptId, { actor, tonePreset = null }) {
   const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
 
   const loc = await invokeAgent('amharic_localizer', {
-    english: { hook: v.hook, spoken_script: v.spoken_script, cta: v.cta, caption: v.caption },
+    english: { hook: v.hook, spoken_script: v.spoken_script || bodyTextOf(v), cta: v.cta,
+      caption: v.caption, format: v.format ?? 'VIDEO' },
     canonical_answer_am: cardVersion.canonical_answer_am,
     terminology, register: 'GENERAL',
   }, { objectType: 'SCRIPT', objectId: s.id, workflowCode: 'WF09', tone_preset: effectiveTone });
@@ -832,11 +847,11 @@ export async function localizeScript(scriptId, { actor, tonePreset = null }) {
   // Blind back-translation: separate agent, does not receive the English.
   const back = await invokeAgent('back_translator', { amharic_text: loc.spoken_amharic },
     { objectType: 'SCRIPT', objectId: s.id, workflowCode: 'WF09' });
-  const [srcVec, backVec] = await Promise.all([embed(v.spoken_script), embed(back.english)]);
+  const [srcVec, backVec] = await Promise.all([embed(v.spoken_script || bodyTextOf(v)), embed(back.english)]);
   const drift = 1 - cosine(srcVec, backVec);
 
   const qa = await invokeAgent('language_qa', {
-    amharic: loc.spoken_amharic, english_source: v.spoken_script,
+    amharic: loc.spoken_amharic, english_source: v.spoken_script || bodyTextOf(v),
     back_translation: back.english, terminology,
   }, { objectType: 'SCRIPT', objectId: s.id, workflowCode: 'WF10' });
 

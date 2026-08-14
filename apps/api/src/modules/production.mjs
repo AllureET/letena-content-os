@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import { q, one, audit, requirePerm, err, setting } from '../core.mjs';
 import { creatomate, heygen, kling, tts, gemini, canva, storage } from '../adapters/index.mjs';
+import { formatOf, hasAudio } from '../formats.mjs';
 import { embed, toVectorLiteral } from '../ai/gateway.mjs';
 
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -9,6 +10,12 @@ const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 // Format -> engine routing. Kling/Gemini generate b-roll assets, never the
 // final render; Canva handles carousel/static; Creatomate assembles video;
 // HeyGen only for the presenter family and never at TIER_4.
+// Pre-0018 scripts have no post_text, so fall back to what a post would have
+// been assembled from before the format work.
+function bodyFallbackForPost(v) {
+  return [v.hook, v.spoken_script, v.cta].filter(Boolean).join('\n\n');
+}
+
 const ROUTE = {
   V01_QUESTION_EXPLAINER: { engine: 'CREATOMATE', template: 'LETENA_QA_30S_V1' },
   V02_CHAT_STORY: { engine: 'CREATOMATE', template: 'LETENA_CHAT_35S_V1' },
@@ -98,7 +105,12 @@ export async function createProductionJob(script, actor) {
   const template = route.template
     ? await one(`SELECT * FROM lcos.video_templates WHERE code=$1 AND status='APPROVED'`, [route.template]) : null;
   const aiVoiceTiers = await setting('voice.ai_allowed_tiers', ['TIER_1', 'TIER_2']);
-  const voice = script.language === 'AM' && !aiVoiceTiers.includes(script.risk_tier) ? 'HUMAN' : 'AI_TTS';
+  // A carousel, a static graphic and a Telegram post are read, not heard.
+  // Until 14 Aug 2026 nothing asked, so all three were routed AI_TTS and
+  // every one of them spent a real ElevenLabs generation on audio that no
+  // surface would ever play.
+  const voice = !hasAudio(concept.video_family) ? 'NONE'
+    : script.language === 'AM' && !aiVoiceTiers.includes(script.risk_tier) ? 'HUMAN' : 'AI_TTS';
   const job = await one(
     `INSERT INTO lcos.production_jobs (code, script_id, family_id, template_id, engine, status,
        routing_reason, voice_source, requested_by)
@@ -156,10 +168,35 @@ export async function runProductionJob(jobId, actor) {
     if (job.engine === 'HEYGEN') {
       result = await heygen.submit({ script: v.spoken_script, audioUrl: voiceKey ? storage.url(voiceKey) : null,
         renderId: render.id });
-    } else if (['C01_CAROUSEL', 'C02_STATIC_GRAPHIC'].includes(concept.video_family)) {
-      result = await canva.createDesign({ title: v.hook,
-        pages: (v.onscreen_text ?? []).map(t => ({ text: t.text })), designId: render.id });
+    } else if (formatOf(concept.video_family) === 'CAROUSEL') {
+      // Slides now come from carousel_slides, written as slides. They used to
+      // be built from onscreen_text, which the writer produces as captions
+      // timed to appear at specific seconds of a video, so a carousel was
+      // assembled out of video timing cues.
+      const slides = Array.isArray(v.carousel_slides) ? v.carousel_slides : [];
+      const pages = slides.length
+        ? slides.map(sl => ({ text: [sl.title, sl.body].filter(Boolean).join('\n\n') }))
+        : (v.onscreen_text ?? []).map(t => ({ text: t.text }));  // pre-0018 scripts
+      result = await canva.createDesign({ title: v.hook, pages, designId: render.id });
       result.external_render_id = `canva-${render.id.slice(0, 8)}`;
+    } else if (formatOf(concept.video_family) === 'STATIC') {
+      // One image, so one page. This ran the carousel path and turned a
+      // single graphic into a multi-page design.
+      const g = v.static_graphic ?? null;
+      const text = g ? [g.headline, g.body, g.footer].filter(Boolean).join('\n\n')
+        : [v.hook, v.onscreen_text?.[0]?.text].filter(Boolean).join('\n\n');
+      result = await canva.createDesign({ title: g?.headline ?? v.hook,
+        pages: [{ text }], designId: render.id });
+      result.external_render_id = `canva-${render.id.slice(0, 8)}`;
+    } else if (formatOf(concept.video_family) === 'POST') {
+      // A text post has nothing to render. It had no branch at all, so it
+      // fell through to Creatomate and a plain Telegram post was submitted
+      // to a video rendering service with a null template. The finished
+      // artifact IS the text, so the job completes here and the text goes to
+      // the publish queue.
+      result = { status: 'SUCCEEDED', storage_key: null,
+        external_render_id: `post-${render.id.slice(0, 8)}`,
+        post_text: v.post_text ?? bodyFallbackForPost(v) };
     } else {
       const modifications = {
         Question_Text: v.hook, Answer_Text: v.onscreen_text?.[1]?.text ?? v.onscreen_text?.[0]?.text ?? '',

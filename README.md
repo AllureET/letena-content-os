@@ -99,7 +99,7 @@ Key properties, all covered by tests (`apps/api/test/e2e.pilot.test.mjs`):
 
 ## AI and adapter modes
 
-`LCOS_AI_PROVIDER=MOCK|OPENAI|ANTHROPIC` — the mock is deterministic and does
+`LCOS_AI_PROVIDER=MOCK|ANTHROPIC` — the mock is deterministic and does
 real containment checking in the claim validator, so governance tests are
 meaningful offline. `LCOS_ADAPTER_MODE=MOCK|LIVE` — mock renders write
 placeholder files; live mode uses Creatomate, HeyGen, Kling (generative b-roll,
@@ -126,6 +126,6 @@ node --test apps/api/test/        # e2e + governance
 ## Production notes
 
 Set real secrets in `.env` (never commit), put Caddy or nginx with TLS in
-front, switch `LCOS_ADAPTER_MODE=LIVE` and `LCOS_AI_PROVIDER=OPENAI` or
-`ANTHROPIC`, keep `pg_dump` nightly + PITR, and see `BUILD_STATE.md` for
+front, switch `LCOS_ADAPTER_MODE=LIVE` and `LCOS_AI_PROVIDER=ANTHROPIC`,
+keep `pg_dump` nightly + PITR, and see `BUILD_STATE.md` for
 what remains before production sign-off.

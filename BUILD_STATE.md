@@ -297,8 +297,10 @@ Remaining owner asks captured 12 Aug (in flight):
 6. Publish-path niceties: OneDrive/accessible store for manual-channel
    packages (Nate: "maybe even storing it on our one drive").
 
-What only Nate can do: enter ANTHROPIC_API_KEY (+ OPENAI_API_KEY for
-embeddings) on Settings → API keys; then content generation goes real.
+What only Nate can do: enter ANTHROPIC_API_KEY on Settings → API keys; then
+content generation goes real. (OpenAI support was removed 14 Aug 2026 --
+the org has no OpenAI key -- so real embeddings still run on the mock
+trigram fallback; only Anthropic-backed generation goes real.)
 
 ## Current phase
 
@@ -347,8 +349,10 @@ hardening (rate limits, headers, TOTP). Pivot increment (above) live.
   machines with named guards (cards, claims, scripts)
 - Agent gateway: prompt loading from ai_prompts, PII assertion (BLOCKED_PII),
   zod validation with one repair retry, ai_invocations recording
-- Providers: Mock (deterministic), OpenAI, Anthropic; mock trigram embeddings
-  making pgvector search/clustering work offline
+- Providers: Mock (deterministic), Anthropic (OpenAI support removed 14 Aug
+  2026, no OpenAI key exists); mock trigram embeddings making pgvector
+  search/clustering work offline (no provider here has real embeddings
+  since AnthropicProvider has no embed() of its own)
 - Modules: knowledge, demand (ingest/classify/cluster/priority/coverage),
   content (families/concepts/scripts/validate/localize/reviews/TIC),
   production (router/jobs/renders via adapters), distribution

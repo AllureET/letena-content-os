@@ -1,12 +1,13 @@
 // AI provider abstraction. generateStructured(), embed(). Providers: MOCK
-// (deterministic, runs the whole system with no credentials), OPENAI,
-// ANTHROPIC. Selection: env LCOS_AI_PROVIDER or per-agent override.
+// (deterministic, runs the whole system with no credentials) or ANTHROPIC.
+// Selection: env LCOS_AI_PROVIDER or per-agent override. OpenAI support was
+// removed 14 Aug 2026 (Nate: "I dont have openai at all") -- the org has no
+// OpenAI key and never will; ANTHROPIC is the only real, paid provider now.
 import { trigramContainment } from '../../../../packages/scoring/src/index.mjs';
 import { cred } from '../creds.mjs';
 
 export function getProvider(name = cred('LCOS_AI_PROVIDER') || 'MOCK') {
   const n = name.toUpperCase();
-  if (n === 'OPENAI') return new OpenAIProvider();
   if (n === 'ANTHROPIC') return new AnthropicProvider();
   return new MockAIProvider();
 }
@@ -250,43 +251,6 @@ export class MockAIProvider extends BaseProvider {
   }
 
   agent_content_recommender(ctx) { return this.agent_editorial_analyst(ctx); }
-}
-
-// ---------- OpenAI ----------
-export class OpenAIProvider extends BaseProvider {
-  name = 'OPENAI';
-  model = cred('OPENAI_MODEL') || 'gpt-4o';
-  async generateStructured({ agent, system, user, schemaName, jsonSchema, temperature = 0.2, maxTokens = 4000 }) {
-    const key = cred('OPENAI_API_KEY');
-    if (!key) throw new Error('OPENAI_API_KEY not set (use LCOS_AI_PROVIDER=MOCK for demo mode)');
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify({
-        model: this.model, temperature, max_tokens: maxTokens,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-        response_format: jsonSchema
-          ? { type: 'json_schema', json_schema: { name: schemaName || agent, strict: false, schema: jsonSchema } }
-          : { type: 'json_object' },
-      }),
-    });
-    if (!res.ok) throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    const data = await res.json();
-    const u = data.usage || {};
-    return { output: JSON.parse(data.choices[0].message.content),
-      usage: { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens,
-        cost_usd: ((u.prompt_tokens ?? 0) * 2.5 + (u.completion_tokens ?? 0) * 10) / 1e6 } };
-  }
-  async embed(text) {
-    const key = cred('OPENAI_API_KEY');
-    if (!key) return mockEmbed(text);
-    const res = await fetch('https://api.openai.com/v1/embeddings', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model: 'text-embedding-3-small', input: text.slice(0, 8000) }),
-    });
-    if (!res.ok) throw new Error(`OpenAI embed ${res.status}`);
-    return (await res.json()).data[0].embedding;
-  }
 }
 
 // ---------- Anthropic ----------

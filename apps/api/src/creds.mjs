@@ -11,14 +11,10 @@ import { q } from './core.mjs';
 
 export const CRED_REGISTRY = [
   { key: 'LCOS_AI_PROVIDER', label: 'AI provider', group: 'AI generation', secret: false,
-    hint: 'MOCK, ANTHROPIC or OPENAI. MOCK runs the whole pipeline with fake outputs at zero cost.' },
+    hint: 'MOCK or ANTHROPIC. MOCK runs the whole pipeline with fake outputs at zero cost. OpenAI support was removed 14 Aug 2026, the org has no OpenAI key.' },
   { key: 'ANTHROPIC_API_KEY', label: 'Anthropic API key', group: 'AI generation', secret: true,
     hint: 'Used when the AI provider is ANTHROPIC.' },
   { key: 'ANTHROPIC_MODEL', label: 'Anthropic model', group: 'AI generation', secret: false,
-    hint: 'Leave blank for the default.' },
-  { key: 'OPENAI_API_KEY', label: 'OpenAI API key', group: 'AI generation', secret: true,
-    hint: 'Used when the AI provider is OPENAI. Also enables real embeddings.' },
-  { key: 'OPENAI_MODEL', label: 'OpenAI model', group: 'AI generation', secret: false,
     hint: 'Leave blank for the default.' },
   { key: 'LCOS_ADAPTER_MODE', label: 'Production adapters mode', group: 'Production services', secret: false,
     hint: 'MOCK or PRODUCTION. PRODUCTION calls the real render, voice and image services below.' },

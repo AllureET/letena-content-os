@@ -58,7 +58,7 @@ Version 1.0 | 11 August 2026
                             ▼  outbound only
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ ZONE C: EXTERNAL SERVICES                                                    │
-│  OpenAI / Anthropic  ·  embeddings  ·  Creatomate  ·  HeyGen  ·  ElevenLabs  │
+│  Anthropic  ·  embeddings  ·  Creatomate  ·  HeyGen  ·  ElevenLabs           │
 │  Meta Graph API  ·  TikTok Content Posting  ·  YouTube Data v3  ·  Telegram  │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -107,7 +107,7 @@ A thin service inside the API process (separate module, separate route prefix) t
 - Enforces provider-side structured output (JSON schema mode) and validates the response with Zod. One repair retry on schema failure, then hard fail.
 - Asserts no forbidden pattern is present in the outbound payload (phone shapes, `@handle`, `matter_id`, long digit strings).
 - Records tokens, latency, model, prompt version and computed cost into `ai_invocations`.
-- Provider abstraction: `openai`, `anthropic`, `local`. Selected per agent in `settings`, overridable per invocation.
+- Provider abstraction: `anthropic`, `local` (mock). OpenAI support was removed 14 Aug 2026 -- the org has no OpenAI key. Selected via the `LCOS_AI_PROVIDER` credential, overridable per invocation.
 
 #### 4.3 De-identification Service
 Runs as a module in the API, invoked synchronously at ingest.

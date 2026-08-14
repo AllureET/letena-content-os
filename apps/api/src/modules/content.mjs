@@ -657,10 +657,37 @@ export async function bulkCommission({ limit = 10, outputTypes = null, actor }) 
 export async function generateScript({ concept, family, card, cardVersion, claims, actor, seedUnsupported = false,
     isTestContent = false, tonePreset = null }) {
   const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
+  // Platform context for the writer (14 Aug 2026, Nate: "the script is bland
+  // and its terrible... research the top way to write scripts for each
+  // individual social media platform"). A TikTok reel, an Instagram carousel
+  // and a Telegram post are three different crafts, and until now the writer
+  // was told none of them: it only ever saw video_family, an internal
+  // taxonomy code that carries no craft guidance. content_output_types
+  // already holds the real platform and format per video_family, so read it
+  // rather than inventing a second mapping.
+  const outputType = await one(
+    `SELECT code, label, platform, description FROM lcos.content_output_types
+     WHERE video_family=$1::lcos.video_family AND is_active ORDER BY sort_order LIMIT 1`,
+    [concept.video_family]);
+  // generateContent()'s output-type path creates concepts WITHOUT running
+  // creative_director: it stubs hook_line with the card's canonical question
+  // verbatim as a placeholder. The writer had no way to know that, so it
+  // treated a placeholder as approved creative direction and shipped the
+  // literal question as the hook ("How do condoms prevent pregnancy?" was
+  // both the hook and the 0-second on-screen text on SCR-97A5F22A). Tell it
+  // the truth so it writes a real opening instead of echoing a form field.
+  const hookLineIsPlaceholder =
+    (concept.hook_line ?? '').trim() === (card.canonical_question_en ?? '').trim();
   const out = await invokeAgent('script_writer', {
     hook_line: concept.hook_line, video_family: concept.video_family,
+    hook_line_is_placeholder: hookLineIsPlaceholder,
     treatment: concept.treatment,
-    card: { code: card.code, approved_ctas: cardVersion.approved_ctas,
+    platform: outputType?.platform ?? null,
+    output_format: outputType?.label ?? null,
+    format_note: outputType?.description ?? null,
+    target_duration_s: concept.target_duration_s ?? null,
+    card: { code: card.code, canonical_question_en: card.canonical_question_en,
+      approved_ctas: cardVersion.approved_ctas,
       prohibited_claims: cardVersion.prohibited_claims },
     claims: claims.map(c => ({ id: c.id, code: c.code, claim_text_en: c.claim_text_en, certainty: c.certainty })),
     __seed_unsupported: seedUnsupported || undefined,

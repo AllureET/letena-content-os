@@ -454,7 +454,9 @@ const screens = {
           ${s.translation ? `<div class="amharic">${esc(s.translation.translated_text)}</div>
             <div class="eyebrow" style="margin-top:12px">Blind back-translation</div>
             <div class="muted">${esc(s.translation.back_translation)}</div>`
-          : '<span class="muted">No Amharic version yet.</span>'}</div>
+          : `<span class="muted">No Amharic version yet.${s.language === 'EN' && can('script.write')
+              ? ' Amharic is written by the localizer, normally in the same run that generates the script. This one was generated English-only, so use <b>Write Amharic version</b> below to run it now.'
+              : ''}</span>`}</div>
       </div>
       <div class="card"><div class="eyebrow">Claim map: every medical statement and its authority</div>
         ${s.claim_map.map(m => `<div class="claimrow ${['UNSUPPORTED','CONTRADICTED','AMBIGUOUS'].includes(m.verdict) ? 'bad' : ''}">
@@ -479,6 +481,8 @@ const screens = {
           `<button data-scripttx="${s.id}|${['TIER_3','TIER_4'].includes(s.risk_tier) ? 'CLINICAL_REVIEW' : 'APPROVED'}">Advance state</button>` : ''}
         ${['DRAFT','VALIDATION_FAILED'].includes(s.status) && can('script.write') ?
           `<button data-scriptvalidate="${s.id}">Re-run validation</button>` : ''}
+        ${!s.translation && s.language === 'EN' && can('script.write') ?
+          `<button data-scriptlocalize="${s.id}">Write Amharic version</button>` : ''}
         ${s.status === 'VALIDATION_FAILED' && can('script.write') ?
           `<button data-scripttx="${s.id}|DRAFT">Back to draft</button>` : ''}
         ${s.status === 'APPROVED' && can('production.request') ? `<button class="primary" data-produce="${s.id}">Send to production</button>` : ''}
@@ -904,7 +908,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') document.body.classList.remove('nav-open');
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
   if (!b) {
     // A real link (external platform URL, download, backlink) inside a
     // drill-down row must keep its native navigation; only fall through to
@@ -1102,6 +1106,23 @@ document.addEventListener('click', async (e) => {
     if (b.dataset.scripttx) {
       const [id, to] = b.dataset.scripttx.split('|');
       await api('POST', `/content/scripts/${id}/transition`, { to }); toast(`Script → ${to}`); return render();
+    }
+    if (b.dataset.scriptlocalize) {
+      // Amharic is normally written inside the generation pipeline
+      // (processGeneratedScript -> localizeScript, when AM is among the
+      // requested languages). A script generated English-only had no way to
+      // get one afterwards, even though the endpoint existed. Nate, 14 Aug
+      // 2026: "why does the script say no amharic version yet? Do you do
+      // that after? If so, when/where?"
+      b.disabled = true; b.textContent = 'Writing Amharic…';
+      try {
+        const r = await api('POST', `/content/scripts/${b.dataset.scriptlocalize}/localize`, {});
+        toast(r.result === 'HUMAN_LANGUAGE_REVIEW'
+          ? `Sent to the language editor: ${r.reason ?? 'the localizer was not confident enough to pass it through'}`
+          : `Amharic written. Drift ${r.drift_score}, QA ${r.qa_verdict}${r.routed_to_human ? ', routed to the language editor' : ''}.`,
+          r.result === 'HUMAN_LANGUAGE_REVIEW' ? 'warn' : false);
+      } catch (e) { toast(e.message ?? 'Localization failed', 'warn'); }
+      return render();
     }
     if (b.dataset.scriptvalidate) {
       b.disabled = true; b.textContent = 'Validating…';

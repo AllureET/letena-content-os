@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Letena Content OS</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Crimson+Pro:wght@600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Crimson+Pro:wght@600&family=Noto+Sans+Ethiopic:wght@400;600&display=swap" rel="stylesheet">
 <style>
 /* Letena EMR design system (letena_emr_aligned tokens) */
 :root{
@@ -165,6 +165,60 @@ td.empty{color:var(--ink-mute);text-align:center;padding:26px 12px}
 .bubble .who{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-mute);font-weight:600;margin-bottom:3px}
 .bubble.doctor .who{color:var(--jelly-bean)}
 .card.answer{border-color:var(--jelly-bean);border-left:4px solid var(--jelly-bean)}
+/* ---- Part 2 guided flow (14 Aug 2026) ---- */
+/* Amharic renders correctly everywhere: Ethiopic-capable stack, generous
+   line height, no clipping. Amharic is the primary language of this system
+   and must not look like an afterthought in its own tool. */
+.amharic,textarea.amharic,mark{font-family:'Noto Sans Ethiopic','Abyssinica SIL','Nyala','Kefa',var(--font-ui)}
+/* the approval sequence stepper */
+.flowbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 16px;padding:10px 14px;
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md)}
+.fstep{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink-mute);white-space:nowrap}
+.fstep .fdot{width:9px;height:9px;border-radius:50%;background:var(--line);flex:0 0 9px}
+.fstep.done{color:var(--risk-routine)} .fstep.done .fdot{background:var(--risk-routine)}
+.fstep.now{color:var(--ink);font-weight:600} .fstep.now .fdot{background:var(--marigold);box-shadow:0 0 0 3px var(--risk-mod-bg)}
+.farrow{color:var(--line);font-size:12px}
+/* the board */
+.board{display:flex;gap:12px;overflow-x:auto;align-items:flex-start;padding-bottom:10px}
+.bcol{flex:0 0 250px;background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r-md);padding:10px}
+.bhead{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-2);font-weight:600;margin-bottom:8px}
+.bitem{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:9px 10px;margin-bottom:8px;cursor:pointer}
+.bitem:hover{border-color:var(--jelly-bean)}
+.bitem.blocked{border-left:3px solid var(--risk-mod)}
+/* the asset grid */
+.agrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+.acard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
+.acard.pending{border-style:dashed;border-color:var(--risk-mod)}
+.ath{width:100%;height:120px;object-fit:cover;display:block;background:var(--canvas)}
+.ath.none{display:flex;align-items:center;justify-content:center;color:var(--ink-mute);font-size:11px;letter-spacing:.06em}
+.ath.audio{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;font-size:22px;color:var(--plump-purple)}
+.ath.audio audio{width:92%;height:28px}
+.ainfo{padding:8px 10px 10px}
+/* spend meters */
+.meter{height:8px;background:var(--line-soft);border-radius:999px;overflow:hidden;margin-top:4px}
+.meter-fill{height:100%;background:var(--risk-routine);border-radius:999px;transition:width .3s ease}
+.meter-fill.warn{background:var(--risk-mod)} .meter-fill.full{background:var(--risk-high)}
+/* subtitle preset samples: Amharic, styled like the burned-in result */
+.subgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.subopt{display:flex;gap:8px;align-items:flex-start;border:1px solid var(--line);border-radius:var(--r-sm);
+  padding:10px;font-weight:400;margin:0;cursor:pointer}
+.subopt:has(input:checked){border-color:var(--plump-purple);background:var(--st-review-bg)}
+.subopt input{width:auto;margin-top:3px}
+.ss{display:inline-block;font-size:14px;line-height:1.7;font-family:'Noto Sans Ethiopic','Abyssinica SIL',var(--font-ui)}
+.ss.wordhl{background:#111;color:#fff;padding:3px 8px;border-radius:6px}
+.ss.wordhl .hl{background:var(--marigold);color:#111;border-radius:4px;padding:0 3px}
+.ss.popon{background:#111;color:#fff;padding:3px 8px;border-radius:6px}
+.ss.boxed{background:#111;color:#fff;padding:3px 8px;outline:3px solid #111}
+.ss.clean{color:#111;text-shadow:0 1px 2px rgba(0,0,0,.25);font-weight:600}
+/* scene binding choices in the production plan */
+.sceneopt{display:flex;flex-direction:column;gap:4px;width:120px;border:1px solid var(--line);
+  border-radius:var(--r-sm);padding:6px;font-weight:400;margin:0;cursor:pointer}
+.sceneopt:has(input:checked){border-color:var(--plump-purple);background:var(--st-review-bg)}
+.sceneopt input{width:auto}
+.sceneopt .ath{height:64px;border-radius:4px}
+/* Amharic three-way review */
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+mark{background:var(--risk-mod-bg);color:var(--risk-mod);border-radius:3px;padding:0 2px}
 /* mobile topbar + drawer veil (hidden on desktop) */
 #mtop{display:none}
 #navveil{display:none}
@@ -189,12 +243,18 @@ td.empty{color:var(--ink-mute);text-align:center;padding:26px 12px}
   #login{margin:10vh 16px}
   input,select,textarea{font-size:16px}
   .bubble{max-width:92%}
+  /* Part 2: the board scrolls sideways by column on a phone; the Amharic
+     three-way stacks; asset cards shrink to two-up. */
+  .bcol{flex:0 0 82vw}
+  .grid3{grid-template-columns:1fr}
+  .agrid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+  .flowbar{overflow-x:auto;flex-wrap:nowrap}
 }
 </style>
 </head>
 <body>
 <div id="app"></div>
 <div id="toast"></div>
-<script type="module" src="/app.js?v=8"></script>
+<script type="module" src="/app.js?v=9"></script>
 </body>
 </html>

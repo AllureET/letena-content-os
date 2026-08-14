@@ -104,6 +104,44 @@ export const kling = {
   },
 };
 
+// ---------- generative video: Google Veo (same Gemini key) ----------
+// Part 2, 14 Aug 2026: the owner's Foundations drama companion specifies
+// Veo through AI Studio, and Veo rides the SAME Gemini key Letena is
+// already getting, so the system has two candidate video engines and no
+// reason to hard-wire either. Identical interface to kling, deliberately:
+// the engine is a slot (videoEngine() below), and swapping is the
+// production.video_engine setting or a per-format/per-piece override,
+// never a code change. The first real test once keys exist (one clip
+// through each engine, first-plus-last-frame conditioning and lip-sync on
+// Amharic audio) decides the default per format; until then neither engine
+// is presented as better.
+export const veo = {
+  async textToVideo({ prompt, negativePrompt, assetId }) {
+    if (MOCK()) {
+      const key = `assets/generated/${assetId}/broll-veo.mp4`;
+      await storage.put(key, Buffer.from(`MOCK-VEO ${prompt.slice(0, 120)}`));
+      return { status: 'SUCCEEDED', storage_key: key, provider_job_id: `mock-veo-${assetId.slice(0, 8)}`, cost_usd: 0 };
+    }
+    // Veo via the Gemini API: models/veo-*:predictLongRunning, then poll the
+    // operation. Skeleton until the first real engine test runs.
+    throw new Error('Veo production adapter requires GEMINI_API_KEY and the engine test (skeleton)');
+  },
+  async imageToVideo({ prompt, negativePrompt, referenceImageKey, assetId }) {
+    if (MOCK()) {
+      const key = `assets/generated/${assetId}/character-broll-veo.mp4`;
+      await storage.put(key, Buffer.from(`MOCK-VEO-I2V ref=${referenceImageKey} ${prompt.slice(0, 100)}`));
+      return { status: 'SUCCEEDED', storage_key: key, provider_job_id: `mock-veo-i2v-${assetId.slice(0, 8)}`, cost_usd: 0 };
+    }
+    throw new Error('Veo image_to_video production adapter requires GEMINI_API_KEY and the engine test (skeleton)');
+  },
+};
+
+// The video engine slot. Everything that generates video asks this, so the
+// vendor is one configuration read, never a hard-wired import.
+export function videoEngine(name) {
+  return String(name ?? '').toUpperCase() === 'VEO' ? veo : kling;
+}
+
 // ---------- voice: Azure Speech (PRIMARY for Amharic) ----------
 // Azure has real Amharic neural voices: am-ET-MekdesNeural (female),
 // am-ET-AmehaNeural (male). Tier rules still apply (settings
@@ -198,6 +236,36 @@ export const gemini = {
     const key = `assets/generated/${assetId}/image.png`;
     await storage.put(key, Buffer.from(b64, 'base64'));
     return { status: 'SUCCEEDED', storage_key: key };
+  },
+  // Amharic speech-to-text for aua_recap (Part 2, 14 Aug 2026). The result
+  // is MACHINE TRANSCRIPTION OF AMHARIC, which is unreliable in every
+  // engine, and it carries medical statements a doctor said out loud, so
+  // the caller (transcripts module) never marks it CONFIRMED: a human
+  // confirms it on screen before anything generates from it.
+  async transcribeAudio({ audioBase64, mimeType = 'audio/mpeg', transcriptId }) {
+    if (MOCK()) {
+      return { status: 'SUCCEEDED', cost_usd: 0, segments: [
+        { start_s: 0, end_s: 14, speaker: 'doctor',
+          text: 'ሰላም። ዛሬ ስለ ድንገተኛ የእርግዝና መከላከያ እንነጋገራለን። Postpill ከግንኙነት በኋላ በ72 ሰዓት ውስጥ ከተወሰደ እርግዝናን መከላከል ይችላል።' },
+        { start_s: 14, end_s: 26, speaker: 'doctor',
+          text: 'ብዙ ጊዜ የሚነሳ ጥያቄ፦ Postpill ወደፊት መውለድን ይከለክላል ወይ? አይከለክልም።' },
+      ] };
+    }
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${need('GEMINI_API_KEY')}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [
+        { text: 'Transcribe this Amharic recording. Return strict JSON: an array of {start_s, end_s, speaker, text}. speaker is "doctor" or "guest". Keep clinical/brand terms (Postpill, Condom, HIV, IUD) in Latin script exactly as spoken.' },
+        { inlineData: { mimeType, data: audioBase64 } },
+      ] }] }),
+    });
+    if (!res.ok) throw new Error(`gemini transcribe ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const d = await res.json();
+    const text = d.candidates?.[0]?.content?.parts?.map(p => p.text).join('') ?? '[]';
+    const jsonText = text.replace(/^```json?\s*/i, '').replace(/```\s*$/, '');
+    let segments;
+    try { segments = JSON.parse(jsonText); } catch { segments = [{ start_s: 0, end_s: null, speaker: 'doctor', text }]; }
+    return { status: 'SUCCEEDED', segments, cost_usd: null };
   },
 };
 

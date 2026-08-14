@@ -221,9 +221,18 @@ test('every registry format generates its own body shape, and its claims are in 
   // formats through the HTTP path would trip it mid-loop.
   const adminUser = await one(`SELECT id FROM lcos.users WHERE email='admin@letena.local'`);
   const actor = { id: adminUser.id, roles: ['admin'], permissions: [] };
+  // aua_recap generates from a live's transcript and refuses without a
+  // CONFIRMED one (Part 2, 14 Aug 2026), so the loop carries a fixture.
+  const fixtureTranscript = await one(
+    `INSERT INTO lcos.live_transcripts (code, title, source, segments, status, confirmed_at)
+     VALUES ('LT-FMTLOOP', 'formats loop fixture live', 'PASTED',
+       '[{"start_s":0,"end_s":10,"speaker":"doctor","text":"Postpill works within 72 hours."}]',
+       'CONFIRMED', now())
+     ON CONFLICT (code) DO UPDATE SET status='CONFIRMED' RETURNING id`);
   for (const f of formats) {
     await t.test(`format ${f.code} (${f.body_kind})`, async () => {
-      const out = await generateContent({ cardId, formatCodes: [f.code], languages: ['EN'], actor });
+      const out = await generateContent({ cardId, formatCodes: [f.code], languages: ['EN'], actor,
+        transcriptId: f.code === 'aua_recap' ? fixtureTranscript.id : null });
       assert.equal(out.scripts.length, 1);
       const scriptId = out.scripts[0].script_id ?? out.scripts[0].id;
       const s = await one(`SELECT * FROM lcos.scripts WHERE id=$1`, [scriptId]);

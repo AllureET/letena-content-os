@@ -140,6 +140,10 @@ export function authPlugin(app) {
     // it. Fixed 14 Aug 2026: this hook was rejecting it with "missing
     // token" before the route ever ran, which is the entire SSO 401 bug.
     if (['/api/v1/auth/login', '/api/v1/auth/sso', '/healthz', '/', '/app.js'].includes(path)) return;
+    // Media previews load through <img>/<video>/<audio> tags, which cannot
+    // send an Authorization header, so the media route verifies its own
+    // ?token= JWT (same secret, same expiry) instead of this hook.
+    if (path.startsWith('/api/v1/media/')) return;
     // Ingest is auth-optional at the hook: HMAC callers carry no bearer token
     // and are verified inside the route; bearer callers still get an actor.
     const authOptional = path === '/api/v1/ingest/questions';

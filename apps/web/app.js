@@ -118,6 +118,120 @@ async function cardCodeMap() {
   catch { return new Map(); }
 }
 
+// ---------- Part 2 guided-flow helpers (14 Aug 2026) ----------
+// Media previews: the storage adapter's file:// URLs cannot load in a
+// browser, so previews stream through the authenticated media route. The
+// token rides as a query parameter because <img>/<video> cannot send an
+// Authorization header.
+const mediaUrl = (key) => key ? `/api/v1/media/${key.split('/').map(encodeURIComponent).join('/')}?token=${encodeURIComponent(TOKEN)}` : null;
+
+// A thumbnail for any asset kind: a still shows, a video plays on hover,
+// audio gets a player, anything else gets a labelled tile. Nobody browses a
+// reference library as a list of codes.
+function assetThumb(a) {
+  const u = mediaUrl(a.storage_key);
+  const mt = a.mime_type ?? '';
+  if (!u) return `<div class="ath none">${esc(a.kind)}</div>`;
+  if (mt.startsWith('image/')) return `<img class="ath" src="${esc(u)}" alt="${esc(a.title)}" loading="lazy">`;
+  if (mt.startsWith('video/')) return `<video class="ath" src="${esc(u)}" muted loop playsinline preload="metadata"
+    onmouseover="this.play().catch(()=>{})" onmouseout="this.pause()"></video>`;
+  if (mt.startsWith('audio/')) return `<div class="ath audio">&#9835;<audio controls preload="none" src="${esc(u)}"></audio></div>`;
+  return `<div class="ath none">${esc(a.kind)}</div>`;
+}
+
+// Who signs each gate, in words. Roles only, resolved at runtime server
+// side; these are labels for roles, never people.
+const GATE_ROLE_LABEL = {
+  plan: 'the content lead', script: 'the content lead',
+  medical_review: 'a Letena doctor', clinical_signoff: 'the medical director',
+  produce: 'the producer', shoot: 'the producer', edit: 'the producer',
+  approve: 'the content lead', publish: 'the social lead',
+  repurpose: 'the content lead', measure: 'the content lead',
+};
+
+// The approval sequence, made visible (owner: walked through it, told what
+// is about to happen, kept updated "like a delivery app"). Six steps from
+// English to production; each resolves to done / current / todo from the
+// script's own state so Girum never has to ask what happens next.
+function flowStepper(s) {
+  const gates = new Set((s.gates ?? []).map(g => g.gate));
+  const t = s.translation;
+  const langApproved = t && t.status === 'APPROVED';
+  const medicalDone = gates.has('medical_review') && (!s.needs_clinical_signoff || gates.has('clinical_signoff'));
+  const steps = [
+    ['English written', !!s.version, 'The writer fills the body this format actually has.'],
+    ['Content approval', gates.has('script') || s.status === 'APPROVED' || medicalDone,
+      'The content lead reads the English: right piece, right hook, right CTA.'],
+    [s.needs_clinical_signoff ? 'Medical review + clinical sign-off' : 'Medical review', medicalDone,
+      s.needs_clinical_signoff
+        ? 'A Letena doctor signs the English, AND the medical director signs the clinical sign-off: this piece is abortion-adjacent and cannot advance without both.'
+        : 'A Letena doctor signs the English. Catches a wrong claim before any Amharic exists.'],
+    ['Amharic written', !!t, 'Written from the approved English, then blind back-translated and drift scored.'],
+    ['Language approval', langApproved,
+      'The language editor reads the Amharic beside the English and the back-translation. This is where a meaning shift introduced in translation gets caught.'],
+    ['Final approve, then production', s.status === 'APPROVED' && langApproved,
+      'Then the production plan shows its steps and costs before anything is spent.'],
+  ];
+  let currentSeen = false;
+  return `<div class="flowbar">${steps.map(([label, done, why]) => {
+    const state = done ? 'done' : currentSeen ? 'todo' : (currentSeen = true, 'now');
+    return `<div class="fstep ${state}" title="${esc(why)}"><span class="fdot"></span>${esc(label)}</div>`;
+  }).join('<span class="farrow">&rarr;</span>')}</div>`;
+}
+
+// Drift, in words rather than a bare number. Thresholds mirror the
+// translation.drift_threshold setting (0.12 routes to a human).
+function driftWords(score) {
+  const d = Number(score);
+  if (d <= 0.05) return ['very close', 'The back-translation almost restates the English. Meaning is intact.'];
+  if (d <= 0.12) return ['acceptable', 'Small wording differences. Read the highlighted spots before approving.'];
+  return ['high drift', 'The back-translation diverges from the English. A meaning shift may be hiding in the highlights. Do not approve without checking them.'];
+}
+
+// Word-level divergence between the English source and the blind
+// back-translation: exactly where a meaning shift hides. Cheap set diff,
+// deliberately: it OVER-marks (inflections read as differences), which errs
+// toward the reviewer looking twice rather than a shifted phrase passing
+// unmarked.
+function diffMark(source, target) {
+  const norm = (w) => w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const src = new Set(String(source ?? '').split(/\s+/).map(norm).filter(Boolean));
+  return String(target ?? '').split(/(\s+)/).map(tok => {
+    const n = norm(tok);
+    if (!n || /^\s+$/.test(tok)) return esc(tok);
+    return src.has(n) ? esc(tok) : `<mark>${esc(tok)}</mark>`;
+  }).join('');
+}
+
+// One-shot notices that must survive a re-render: the edit classification
+// sentence shown at the moment of saving, per script.
+const FLASH = new Map();
+function takeFlash(key) { const v = FLASH.get(key); FLASH.delete(key); return v; }
+
+// The Make screen's selections survive re-renders within the session.
+const MAKE = { cardId: null, formats: new Set(), audience: 'WOMEN', path: 'DIGITAL',
+  transcriptId: null, running: false };
+
+// The production progress poll: one timer, cleared on every route change.
+let POLL = null;
+
+// The English text of a version, assembled client-side for the Amharic
+// side-by-side. Mirrors the server's bodyTextOf() closely enough to read
+// against; the server remains the authority for validation.
+function versionEnglishText(v) {
+  if (!v) return '';
+  const parts = [v.hook, v.spoken_script, v.post_text];
+  for (const sl of v.carousel_slides ?? []) parts.push(sl?.title, sl?.body);
+  const g = v.static_graphic; if (g) parts.push(g.headline, g.body, g.footer);
+  const walk = (n) => { if (n == null) return;
+    if (typeof n === 'string') parts.push(n);
+    else if (Array.isArray(n)) n.forEach(walk);
+    else if (typeof n === 'object') Object.values(n).forEach(walk); };
+  walk(v.body);
+  parts.push(v.cta);
+  return parts.filter(x => typeof x === 'string' && x.trim()).join(' ');
+}
+
 // ---------- navigation ----------
 // Restructured 14 Aug 2026 (Nate: "I think some of these menu nav items would
 // serve better as tabs on one page. The menu has no flow or understanding").
@@ -141,16 +255,17 @@ async function cardCodeMap() {
 // untouched, and every existing link, bookmark and data-nav drill-down
 // still resolves exactly as it did. This is grouping and labelling only.
 const SECTIONS = [
-  ['today',      'Today',      [['dashboard', 'Today']]],
-  ['plan',       'Plan',       [['demand', 'Demand'], ['coverage', 'Gaps']]],
+  ['today',      'Today',      [['dashboard', 'Today'], ['board', 'Board']]],
+  ['plan',       'Plan',       [['demand', 'Demand'], ['make', 'Make content'], ['coverage', 'Gaps']]],
   ['questions',  'Questions',  [['questions', 'Inbox'], ['clusters', 'Clusters'],
                                 ['quarantine', 'Quarantine']]],
   ['knowledge',  'Knowledge',  [['cards', 'Cards'], ['claims', 'Claims'],
                                 ['sources', 'Sources'], ['terminology', 'Terminology'],
                                 ['gaps', 'Missing facts']]],
   ['content',    'Content',    [['scripts', 'Scripts'], ['reviews', 'Review queue'],
+                                ['transcripts', 'Transcripts'],
                                 ['concepts', 'Concepts'], ['families', 'Families']]],
-  ['production', 'Production', [['production', 'Renders'], ['assets', 'Assets']]],
+  ['production', 'Production', [['production', 'Progress'], ['assets', 'Assets']]],
   ['publishing', 'Publishing', [['calendar', 'Calendar'], ['published', 'Published']]],
   ['insights',   'Insights',   [['analytics', 'Performance'], ['experiments', 'Experiments'],
                                 ['costs', 'Costs']]],
@@ -162,6 +277,7 @@ const SECTIONS = [
 // keeps the right item lit while you are three clicks deep in a record.
 const DETAIL_SECTION = {
   question: 'questions', card: 'knowledge', script: 'content', render: 'production',
+  amharic: 'content', produce: 'production', transcript: 'content',
 };
 
 // route id -> [sectionId, sectionLabel, tabs]
@@ -640,56 +756,190 @@ const screens = {
       </tr>`).join('')}</table></div>`;
   },
 
+  // Step 3 of the guided flow, the step Girum hits every single time.
+  // Rebuilt for Part 2 (14 Aug 2026): the approval sequence on screen, the
+  // body the format actually has editable in place, single-piece steerable
+  // regeneration, the claim map beside the copy, style lint inline, and a
+  // plain sentence at the moment of saving about what the edit just did.
   async script(id) {
     const s = await api('GET', `/content/scripts/${id}`);
     const v = s.version;
+    let gateInfo = { mine: [], admin_override: false };
+    try { gateInfo = await api('GET', '/pipeline/gate-signers'); } catch {}
+    const gates = new Set((s.gates ?? []).map(g => g.gate));
+    const flash = takeFlash(id);
+    const fmtLabelTxt = s.format_info?.label ?? fmtLabel(v?.format);
+
+    // ---- the editor: every text field of the body this format actually has ----
+    const inp = (idAttr, val, label, textarea = false, maxlen = '') => `
+      <label>${esc(label)}</label>` + (textarea
+      ? `<textarea id="${idAttr}" ${maxlen ? `maxlength="${maxlen}"` : ''}>${esc(val ?? '')}</textarea>`
+      : `<input id="${idAttr}" value="${esc(val ?? '')}" ${maxlen ? `maxlength="${maxlen}"` : ''}>`);
+    const fmt = v?.format ?? 'VIDEO';
+    let bodyEditor = '';
+    if (fmt === 'CAROUSEL') {
+      bodyEditor = (v.carousel_slides ?? []).map((sl, i) => `
+        <div class="slide"><div class="slide-n">${i + 1}</div><div style="flex:1">
+          ${inp(`ed-sl-${i}-title`, sl.title, `Slide ${i + 1} title`)}
+          ${inp(`ed-sl-${i}-body`, sl.body, `Slide ${i + 1} body`, true)}
+        </div></div>`).join('');
+    } else if (fmt === 'STATIC') {
+      const g = v.static_graphic ?? {};
+      bodyEditor = inp('ed-g-headline', g.headline, 'Headline (it does the whole job alone)')
+        + inp('ed-g-body', g.body, 'Body, one or two sentences', true)
+        + inp('ed-g-footer', g.footer, 'Footer');
+    } else if (fmt === 'POST') {
+      bodyEditor = inp('ed-post', v.post_text, 'Post text', true);
+    } else if (fmt === 'ARTICLE') {
+      const b = v.body ?? {};
+      bodyEditor = inp('ed-b-intro', b.intro, 'Intro (one or two sentences)', true)
+        + (b.sections ?? []).map((sec, i) => `
+          ${inp(`ed-sec-${i}-heading`, sec.heading, `Section ${i + 1} heading`)}
+          ${inp(`ed-sec-${i}-body`, sec.body, `Section ${i + 1} body`, true)}`).join('');
+    } else if (fmt === 'MICROCOPY') {
+      bodyEditor = ((v.body?.items) ?? []).map((it, i) => `
+        <div class="claimrow">${it.key ? `<span class="mono muted">${esc(it.key)}</span>` : ''}
+          ${inp(`ed-it-${i}-en`, it.text_en, 'English', true)}
+          <label>Amharic</label><textarea id="ed-it-${i}-am" class="amharic">${esc(it.text_am ?? '')}</textarea>
+        </div>`).join('');
+    } else if (fmt === 'PUSH') {
+      const pnote = v.body?.push ?? {};
+      bodyEditor = inp('ed-p-title', pnote.title, 'Title (40 chars max, no emoji)', false, 40)
+        + inp('ed-p-body', pnote.body, 'Body (100 chars max, one sentence, might/may)', false, 100)
+        + inp('ed-p-link', pnote.deep_link, 'Deep link (abeba://...)');
+    } else if (fmt === 'LIVE') {
+      const b = v.body ?? {};
+      bodyEditor = (b.segments ?? []).map((seg, i) => `
+        ${inp(`ed-seg-${i}-title`, seg.title, `Segment ${seg.index ?? i + 1} title (${seg.minutes ?? '?'} min)`)}
+        ${inp(`ed-seg-${i}-desc`, seg.description, 'What happens in it', true)}`).join('')
+        + inp('ed-pinned', b.pinned_message, 'Pinned message', true)
+        + (b.cutdown_briefs ?? []).map((c, i) => inp(`ed-cut-${i}`, c, `Cutdown brief ${i + 1}`)).join('');
+    } else { // VIDEO and AUDIO
+      bodyEditor = inp('ed-spoken', v?.spoken_script, 'Spoken script', true);
+    }
+    // Structured extras a few formats carry (a quoted question, a quiz, a
+    // giveaway). Edited as JSON rather than silently uneditable.
+    const KNOWN = ['intro', 'sections', 'items', 'push', 'segments', 'pinned_message', 'cutdown_briefs'];
+    const extras = Object.fromEntries(Object.entries(v?.body ?? {}).filter(([k]) => !KNOWN.includes(k)));
+    const extrasEditor = Object.keys(extras).length
+      ? `<label>Structured fields (${esc(Object.keys(extras).join(', '))}) as JSON. Regenerating is usually better than hand-editing these.</label>
+         <textarea id="ed-body-extra" class="mono" style="min-height:120px">${esc(JSON.stringify(extras, null, 2))}</textarea>`
+      : '';
+
+    const editorHtml = can('script.write') && v ? `
+      <div class="card"><div class="eyebrow">${esc(fmtLabelTxt)} · edit in place</div>
+        ${inp('ed-hook', v.hook, 'Hook')}
+        ${bodyEditor}
+        ${extrasEditor}
+        ${inp('ed-cta', v.cta, 'CTA (ends at the door; the phone number comes from the canonical block, never retyped)', true)}
+        <div class="flex" style="margin-top:10px">
+          <button class="primary" data-scriptedit="${s.id}">Save changes</button>
+          <span class="muted" style="font-size:12px">A change to a medical statement, number, time window or term sends this back to medical review. A hook or caption change does not. You are told which, the moment you save.</span>
+        </div>
+      </div>
+      <div class="card"><div class="eyebrow">Not right? Regenerate this one piece</div>
+        <div class="flex">
+          <input id="rg-direction" placeholder="steer it: shorter · different angle · less clinical · more direct · warmer" style="flex:1">
+          <button data-regen="${s.id}">Regenerate</button>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:6px">Only this piece is rewritten, as a new version. The rest of the run is untouched. A regenerated body goes back through validation and medical review.</div>
+      </div>` : `<div class="card"><div class="eyebrow">${esc(fmtLabelTxt)}</div>
+        <div class="kv"><b>Hook:</b> ${esc(v?.hook)}<br><br>${scriptBody(v)}<br><br><b>CTA:</b> ${esc(v?.cta)}</div></div>`;
+
+    // ---- what happens next, computed from the same rules the server enforces ----
+    const eff = (s.format_info?.stages_applicable ?? ['plan','script','medical_review','produce','shoot','edit','approve','publish','repurpose','measure'])
+      .filter(st => s.production_path === 'DIGITAL' ? !['shoot','edit'].includes(st)
+        : s.production_path === 'NONE' ? !['produce','shoot','edit'].includes(st)
+        : st !== 'produce');
+    const stageIdx = eff.indexOf(s.stage);
+    const nextStage = stageIdx >= 0 ? eff[stageIdx + 1] : null;
+    let nextText, canTryAdvance = false;
+    if (!nextStage) nextText = 'This piece is at its final stage.';
+    else if (s.stage === 'medical_review' && s.validation_result !== 'PASS') {
+      nextText = `Claim validation is ${s.validation_result ?? 'NOT_RUN'} and must PASS before a doctor can sign. Re-run validation below.`;
+    } else if (s.stage === 'medical_review' && s.needs_clinical_signoff && !gates.has('clinical_signoff')) {
+      nextText = 'Abortion-adjacent: the clinical sign-off (the medical director) must be signed before this can leave medical review.';
+      canTryAdvance = gateInfo.mine.includes('clinical_signoff') || gateInfo.admin_override;
+    } else if (!gates.has(s.stage)) {
+      const mine = gateInfo.mine.includes(s.stage);
+      nextText = mine
+        ? `The ${s.stage.replace(/_/g, ' ')} gate is yours to sign: advancing signs it.`
+        : `Waiting on ${GATE_ROLE_LABEL[s.stage] ?? 'the right role'} to sign the ${s.stage.replace(/_/g, ' ')} gate.${gateInfo.admin_override ? ' You can advance as an admin override; it is recorded as one.' : ''}`;
+      canTryAdvance = mine || gateInfo.admin_override;
+    } else { nextText = `Ready to move to ${nextStage.replace(/_/g, ' ')}.`; canTryAdvance = true; }
+
+    const gatesHtml = `<div class="card"><div class="eyebrow">Where this piece is</div>
+      <div class="flex" style="margin-bottom:8px">${eff.map(st => {
+        const signed = gates.has(st);
+        const here = st === s.stage;
+        return `<span class="pill ${signed ? 'p-APPROVED' : here ? 'p-IN_REVIEW' : 'p-DRAFT'}"
+          title="${esc(signed ? 'gate signed' : `signed by ${GATE_ROLE_LABEL[st] ?? ''}`)}"><span class="d"></span>${esc(st.replace(/_/g, ' '))}</span>`;
+      }).join('')}
+      ${s.needs_clinical_signoff ? `<span class="pill ${gates.has('clinical_signoff') ? 'p-APPROVED' : 'p-TIER_4'}"><span class="d"></span>clinical sign-off</span>` : ''}</div>
+      ${(s.gates ?? []).length ? `<div class="muted" style="font-size:12px;margin-bottom:6px">Signed: ${(s.gates ?? []).map(g =>
+        `${esc(g.gate.replace(/_/g, ' '))} by ${esc(g.signed_role === 'admin_override' ? 'admin (override)' : GATE_ROLE_LABEL[g.gate] ?? g.signed_role ?? '')} ${dt(g.signed_at)}`).join(' · ')}</div>` : ''}
+      <div style="font-size:13px;margin-bottom:8px"><b>Next:</b> ${esc(nextText)}</div>
+      ${canTryAdvance && nextStage && can('script.write') ? `<button class="primary" data-advance="${s.id}">Advance to ${esc(nextStage.replace(/_/g, ' '))}${gateInfo.mine.includes(s.stage) || gates.has(s.stage) ? '' : ' (admin override)'}</button>` : ''}
+      ${s.production_path !== 'NONE' && ['produce', 'shoot'].includes(nextStage ?? '') || s.status === 'APPROVED' && s.production_path !== 'NONE'
+        ? ` <a class="btn" href="#/produce/${esc(s.id)}">See the production plan and cost</a>` : ''}
+    </div>`;
+
+    const amBox = s.translation ? `
+      <div class="card"><div class="eyebrow">Amharic · drift ${Number(s.translation.drift_score).toFixed(3)} (${esc(driftWords(s.translation.drift_score)[0])})</div>
+        <div class="amharic" style="max-height:130px;overflow:hidden">${esc(s.translation.translated_text.slice(0, 260))}${s.translation.translated_text.length > 260 ? '…' : ''}</div>
+        <div style="margin-top:10px"><a class="btn" href="#/amharic/${esc(s.id)}">Open the side-by-side Amharic review</a></div>
+      </div>` : `
+      <div class="card"><div class="eyebrow">Amharic</div>
+        <span class="muted">Not written yet. Amharic is written from the approved English${s.language === 'EN' && can('script.write')
+          ? ', or run it now:' : '.'}</span>
+        ${s.language === 'EN' && can('script.write') ? `<div style="margin-top:8px"><button data-scriptlocalize="${s.id}">Write Amharic version</button></div>` : ''}
+      </div>`;
+
     return `<a class="backlink" href="#/scripts">&larr; All scripts</a>
-      <div class="eyebrow">Script review</div>
-      <h1 class="mono">${esc(s.code)}</h1>
+      <div class="eyebrow">Piece</div>
+      <h1 class="mono">${esc(s.code)} <span style="font-weight:400;font-size:14px">· ${esc(fmtLabelTxt)}</span></h1>
       <div class="sub flex">${pill(s.status)} ${pill(s.risk_tier)}
         ${pill(s.validation_result === 'PASS' ? 'PASS' : s.validation_result === 'FAIL' ? 'FAIL' : null)}
-        <span class="muted">${esc(s.language)} · v${s.current_version}</span></div>
+        ${s.is_test_content ? '<span class="pill p-TIER_4"><span class="d"></span>TEST CONTENT</span>' : ''}
+        <span class="muted">${esc(s.language)} · v${s.current_version} · ${esc(String(s.production_path ?? 'LIVE').toLowerCase())} production</span></div>
+      ${flash ? `<div class="card" style="border-left:4px solid ${flash.kind === 'medical' ? 'var(--risk-mod)' : 'var(--risk-routine)'}"><b>${esc(flash.title)}</b><div style="font-size:13px;margin-top:4px">${esc(flash.text)}</div></div>` : ''}
+      ${flowStepper(s)}
       ${styleWarnHtml(v?.style_warnings)}
       <div class="grid2">
-        <div class="card"><div class="eyebrow">${esc(fmtLabel(v?.format))}</div>
-          <div class="kv"><b>Hook:</b> ${esc(v?.hook)}<br><br>${scriptBody(v)}
-          <br><br><b>CTA:</b> ${esc(v?.cta)}</div></div>
-        <div class="card"><div class="eyebrow">Amharic ${s.translation ? `· drift ${Number(s.translation.drift_score).toFixed(3)}` : ''}</div>
-          ${s.translation ? `<div class="amharic">${esc(s.translation.translated_text)}</div>
-            <div class="eyebrow" style="margin-top:12px">Blind back-translation</div>
-            <div class="muted">${esc(s.translation.back_translation)}</div>`
-          : `<span class="muted">No Amharic version yet.${s.language === 'EN' && can('script.write')
-              ? ' Amharic is written by the localizer, normally in the same run that generates the script. This one was generated English-only, so use <b>Write Amharic version</b> below to run it now.'
-              : ''}</span>`}</div>
+        <div>${editorHtml}</div>
+        <div>
+          <div class="card"><div class="eyebrow">Claim map: which sentence rests on which approved claim</div>
+            ${s.claim_map.map(m => `<div class="claimrow ${['UNSUPPORTED','CONTRADICTED','AMBIGUOUS'].includes(m.verdict) ? 'bad' : ''}">
+              <div>${esc(m.statement)}</div>
+              <div class="flex" style="margin-top:4px"><span class="mono muted">${esc(m.claim_code)}</span>
+                ${m.verdict ? pill(m.verdict === 'SUPPORTED' ? 'PASS' : m.verdict === 'PARTIALLY_SUPPORTED' ? 'IN_REVIEW' : 'FAIL') : ''}
+                <span class="muted" style="font-size:11.5px">${esc(m.claim_text_en)}</span></div>
+            </div>`).join('') || '<span class="muted">No claim map. This is the safety story of the system; a piece with medical content and no map should not advance.</span>'}</div>
+          ${amBox}
+          ${gatesHtml}
+        </div>
       </div>
-      <div class="card"><div class="eyebrow">Claim map: every medical statement and its authority</div>
-        ${s.claim_map.map(m => `<div class="claimrow ${['UNSUPPORTED','CONTRADICTED','AMBIGUOUS'].includes(m.verdict) ? 'bad' : ''}">
-          <div>${esc(m.statement)}</div>
-          <div class="flex" style="margin-top:4px"><span class="mono muted">${esc(m.claim_code)}</span>
-            ${m.verdict ? pill(m.verdict === 'SUPPORTED' ? 'PASS' : m.verdict === 'PARTIALLY_SUPPORTED' ? 'IN_REVIEW' : 'FAIL') : ''}
-            <span class="muted" style="font-size:11.5px">${esc(m.claim_text_en)}</span></div>
-        </div>`).join('')}</div>
       ${s.findings.length ? `<div class="card"><div class="eyebrow">Findings</div>
         ${s.findings.map(f => `<div class="claimrow bad"><b>${esc(f.code)}</b> · ${esc(f.severity)}<br>
           ${esc(f.explanation)}${f.suggested_fix ? `<br><span class="muted">Fix: ${esc(f.suggested_fix)}</span>` : ''}</div>`).join('')}</div>` : ''}
+      ${s.status === 'NEEDS_KNOWLEDGE' ? `<div class="card" style="border-left:4px solid var(--risk-mod)">
+        <b>The writer stopped because a fact it needed is not an approved claim.</b>
+        <div style="font-size:13px;margin:6px 0">That is the system working: it refused to invent. The missing fact:</div>
+        <div class="mono" style="font-size:12px">${esc(JSON.stringify(s.needs_knowledge_note ?? {}).slice(0, 400))}</div>
+        <div style="margin-top:8px"><a class="btn" href="#/gaps">Open the knowledge gap</a></div></div>` : ''}
       <div class="flex">
         ${s.status === 'CLINICAL_REVIEW' && (can('script.approve_clinical')) ?
           `<button class="approve" data-scripttx="${s.id}|APPROVED">Approve clinically</button>
            <button data-scripttx-reason="${s.id}|DRAFT">Request changes</button>
            <button class="danger" data-scripttx-reason="${s.id}|REJECTED">Reject</button>` : ''}
-        ${s.translation && ['LANGUAGE_REVIEW','CLINICAL_REVIEW','VALIDATED'].includes(s.status) && can('script.approve_language') ?
-          `<button class="approve" data-langreview="${s.id}|APPROVED">Language: approve</button>
-           <button data-langreview-edit="${s.id}">Language: approve with edits</button>
-           <button data-langreview-reason="${s.id}|CHANGES_REQUESTED">Language: request changes</button>` : ''}
         ${s.status === 'LANGUAGE_REVIEW' && can('script.approve_language') ?
           `<button data-scripttx="${s.id}|${['TIER_3','TIER_4'].includes(s.risk_tier) ? 'CLINICAL_REVIEW' : 'APPROVED'}">Advance state</button>` : ''}
         ${['DRAFT','VALIDATION_FAILED'].includes(s.status) && can('script.write') ?
           `<button data-scriptvalidate="${s.id}">Re-run validation</button>` : ''}
-        ${!s.translation && s.language === 'EN' && can('script.write') ?
-          `<button data-scriptlocalize="${s.id}">Write Amharic version</button>` : ''}
         ${s.status === 'VALIDATION_FAILED' && can('script.write') ?
           `<button data-scripttx="${s.id}|DRAFT">Back to draft</button>` : ''}
-        ${s.status === 'APPROVED' && can('production.request') ? `<button class="primary" data-produce="${s.id}">Send to production</button>` : ''}
+        ${s.status === 'APPROVED' && can('production.request') && s.production_path !== 'NONE' ?
+          `<a class="btn" href="#/produce/${esc(s.id)}">Plan production (see the cost first)</a>` : ''}
       </div>`;
   },
 
@@ -772,37 +1022,134 @@ const screens = {
       || '<tr><td class="empty">Nothing published yet.</td></tr>'}</table></div>`;
   },
 
+  // Step 7: watch it happen, like a delivery app. Per job: what finished,
+  // what is running, what is queued, what failed and why, and what to do
+  // about it. Polls every 5 seconds while the screen is open; no held
+  // requests, no websockets (Part 2, 14 Aug 2026).
   async production() {
-    const r = await api('GET', '/production/jobs');
-    return `<h1>Production queue</h1><div class="sub">Approved scripts becoming finished media. Click a row to open its script.</div>
-      <div class="card"><table><tr><th>Job</th><th>Script</th><th>Engine</th><th>Template</th><th>Voice</th><th>Status</th><th></th></tr>
-      ${r.items.map(j => `<tr class="rowlink" data-nav="script/${esc(j.script_id)}" tabindex="0"><td class="mono">${esc(j.code)}</td><td class="mono">${esc(j.script_code)}</td>
-        <td>${esc(j.engine)}</td><td class="mono muted">${esc(j.template_code ?? '—')}</td>
-        <td class="muted">${esc(j.voice_source)}</td><td>${pill(j.status)}</td>
-        <td>${j.status === 'QUEUED' && can('production.request') ? `<button class="primary" data-run="${j.id}">Run</button>` : ''}</td>
-      </tr>`).join('') || '<tr><td colspan=7 class="empty">Nothing in production. Send an approved script here with Produce.</td></tr>'}</table></div>`;
+    const r = await api('GET', '/production/progress');
+    if (!POLL) {
+      POLL = setInterval(() => {
+        if (location.hash.replace(/^#\//, '').split('?')[0] === 'production') render();
+        else { clearInterval(POLL); POLL = null; }
+      }, 5000);
+    }
+    const sp = r.spend_today;
+    const meter = (m, label) => {
+      const pct = Math.min(100, Math.round((m.spent_usd / (m.cap_usd || 1)) * 100));
+      return `<div style="flex:1;min-width:180px"><div class="flex" style="justify-content:space-between">
+        <span style="font-size:12px">${label}</span>
+        <span class="mono" style="font-size:12px">$${m.spent_usd.toFixed(2)} of $${m.cap_usd}</span></div>
+        <div class="meter"><div class="meter-fill ${pct >= 100 ? 'full' : pct >= 75 ? 'warn' : ''}" style="width:${pct}%"></div></div></div>`;
+    };
+    const statusWord = { QUEUED: 'queued', ASSETS_PENDING: 'waiting on assets', VOICE_PENDING: 'waiting on the Amharic',
+      RENDERING: 'running', RENDERED: 'finished', FAILED: 'failed', CANCELLED: 'cancelled' };
+    return `<h1>Production progress</h1><div class="sub">Live, refreshed every few seconds. Every state says what it means and what to do next.</div>
+      <div class="card"><div class="eyebrow">Today's spend against the caps</div>
+        <div class="flex" style="gap:20px">${meter(sp.render, 'Renders')}${meter(sp.ai, 'AI')}</div>
+        ${sp.render.spent_usd >= sp.render.cap_usd ? '<div class="claimrow bad" style="margin-top:10px">The daily render cap is reached. Jobs stay queued, nothing fails, and the queue picks up tomorrow. An admin can raise the cap in Settings.</div>' : ''}
+      </div>
+      ${r.items.map(j => `<div class="card">
+        <div class="flex"><b class="mono">${esc(j.code)}</b>
+          <a href="#/script/${esc(j.script_id)}" class="mono">${esc(j.script_code)}</a>
+          <span class="muted">${esc(j.format_label ?? '')}</span>
+          ${pill(j.status)} <span class="muted">${esc(statusWord[j.status] ?? '')}</span>
+          <span class="spacer"></span>
+          <span class="muted" style="font-size:12px">voice: ${esc(j.voice_source === 'HUMAN' ? 'live recording' : j.voice_source === 'AI_TTS' ? 'AI (Azure)' : 'none')}
+            ${j.video_engine ? ` · engine: ${esc(j.video_engine)}` : ''}${j.subtitle_preset ? ` · subs: ${esc(j.subtitle_preset.toLowerCase().replace(/_/g, ' '))}` : ''}</span></div>
+        <div style="font-size:13px;margin-top:6px">${esc(j.text)}</div>
+        <div class="muted" style="font-size:12px;margin-top:2px">${esc(j.action)}</div>
+        ${(j.renders ?? []).map(rr => `<div class="claimrow ${rr.status === 'FAILED' ? 'bad' : ''}" style="margin-top:8px">
+          <div class="flex">${pill(rr.status)}
+            ${rr.cost_usd != null ? `<span class="muted">$${esc(String(rr.cost_usd))}</span>` : ''}
+            ${rr.storage_key ? `<a class="btn" href="${esc(mediaUrl(rr.storage_key))}" target="_blank" rel="noopener">Preview</a>` : ''}</div>
+          ${rr.error_detail ? `<div class="muted" style="font-size:12px;margin-top:4px">${esc(rr.error_detail)}</div>` : ''}
+        </div>`).join('')}
+        <div class="flex" style="margin-top:8px">
+          ${['QUEUED', 'VOICE_PENDING', 'FAILED', 'ASSETS_PENDING'].includes(j.status) && can('production.request')
+            ? `<button class="primary" data-run="${esc(j.id)}">${j.status === 'FAILED' ? 'Run again' : 'Run'}</button>
+               <a class="btn" href="#/produce/${esc(j.script_id)}">Change the plan first</a>` : ''}
+        </div>
+      </div>`).join('') || '<div class="card empty">Nothing in production. Approve a piece, open its production plan, and start it from there.</div>'}`;
   },
 
+  // The asset library, browsable and reusable (Part 2, 14 Aug 2026: owner:
+  // "will we make the asset library easily accessible and searchable...
+  // even have an option to pull from them when generating new stuff?").
+  // Thumbnails and previews, filters a person would use, one-click save for
+  // generated assets waiting on review, and honesty about the semantic
+  // search being coarse while embeddings are a deterministic mock.
   async assets() {
-    const r = await api('GET', '/production/assets');
-    return `<h1>Asset library</h1><div class="sub">Real Ethiopia first. Generated assets are flagged and inactive until reviewed; medical illustration is never generated.</div>
-      ${can('asset.manage') ? `<div class="grid2">
-        <div class="card"><div class="eyebrow">Semantic search</div>
-          <input id="a-search" placeholder="e.g. addis evening street calm phone">
-          <div style="margin-top:8px"><button id="a-go">Search</button></div>
-          <div id="a-results"></div></div>
-        <div class="card"><div class="eyebrow">Generate b-roll (Gemini image / Kling video)</div>
-          <label>Brief</label><input id="a-brief" placeholder="young woman reading her phone in a shared taxi, dusk">
-          <label>Kind</label><select id="a-kind"><option value="IMAGE_PHOTO">Image (Gemini)</option>
-            <option value="VIDEO">Video (Kling)</option></select>
-          <div style="margin-top:8px"><button class="primary" id="a-gen">Generate → producer review</button></div>
-        </div></div>` : ''}
-      <div class="card"><table><tr><th>Code</th><th>Title</th><th>Kind</th><th>Origin</th><th>AI</th><th>Clinical</th></tr>
-      ${r.items.map(a => `<tr><td class="mono">${esc(a.code)}</td><td>${esc(a.title)}</td>
-        <td class="muted">${esc(a.kind)}</td><td class="muted">${esc(a.origin)}</td>
-        <td>${a.is_ai_generated ? pill('IN_REVIEW') : ''}</td>
-        <td>${a.clinically_approved ? pill('APPROVED') : ''}</td></tr>`).join('')
-      || '<tr><td colspan=6 class="empty">Library is empty. Shoot the first B-roll batch.</td></tr>'}</table></div>`;
+    const qp = new URLSearchParams((location.hash.split('?')[1] ?? ''));
+    const kind = qp.get('kind') ?? '', text = qp.get('text') ?? '';
+    const ai = qp.get('ai') ?? '', pending = qp.get('pending') ?? '';
+    const query = new URLSearchParams();
+    if (kind) query.set('kind', kind);
+    if (text) query.set('text', text);
+    if (ai) query.set('ai', ai);
+    if (pending) query.set('include_pending', '1');
+    const r = await api('GET', '/production/assets' + (query.toString() ? `?${query}` : ''));
+    const KINDS = ['VIDEO', 'IMAGE_PHOTO', 'ILLUSTRATION', 'MEDICAL_ILLUSTRATION', 'BACKGROUND', 'TEXTURE',
+      'CHARACTER_REFERENCE', 'BRAND_ELEMENT', 'LOGO', 'AUDIO_VOICEOVER', 'AUDIO_MUSIC', 'AUDIO_SFX',
+      'SOURCE_RECORDING', 'ICON'];
+    const filterLink = (label, params) => {
+      const u = new URLSearchParams(params);
+      return `<a class="tab" href="#/assets?${u}">${esc(label)}</a>`;
+    };
+    return `<h1>Asset library</h1>
+      <div class="sub">Everything a production reuses: b-roll, backgrounds, locked character references, brand elements, audio, the source recordings behind AUA recaps. Binding one of these in a production plan is free; generating a new one is not.</div>
+      <div class="flex" style="margin-bottom:8px">
+        ${filterLink('All', {})}
+        ${filterLink('Character references', { kind: 'CHARACTER_REFERENCE' })}
+        ${filterLink('Backgrounds', { kind: 'BACKGROUND' })}
+        ${filterLink('Awaiting review', { pending: '1', ai: 'true' })}
+      </div>
+      <div class="card"><div class="flex" style="flex-wrap:wrap;gap:10px">
+        <input id="af-text" placeholder="search titles and codes" value="${esc(text)}" style="max-width:220px">
+        <select id="af-kind" style="max-width:200px"><option value="">Any kind</option>
+          ${KINDS.map(k => `<option value="${k}" ${k === kind ? 'selected' : ''}>${k.toLowerCase().replace(/_/g, ' ')}</option>`).join('')}</select>
+        <select id="af-ai" style="max-width:160px"><option value="">AI or human</option>
+          <option value="true" ${ai === 'true' ? 'selected' : ''}>AI generated</option>
+          <option value="false" ${ai === 'false' ? 'selected' : ''}>Not AI</option></select>
+        <label class="otpick"><input type="checkbox" id="af-pending" ${pending ? 'checked' : ''}> include awaiting review</label>
+        <button id="af-go">Filter</button>
+        <span class="spacer"></span>
+        <input id="a-search" placeholder="semantic: addis evening street calm" style="max-width:240px">
+        <button id="a-go">Semantic search</button>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:6px">Semantic search is coarse right now: embeddings fall back to a deterministic stand-in until a real embedding provider is configured. The text filter is exact and reliable.</div>
+      <div id="a-results"></div></div>
+      ${can('asset.manage') ? `<div class="card"><div class="eyebrow">Add to the library</div>
+        <div class="flex" style="flex-wrap:wrap;gap:10px">
+          <input type="file" id="au-file" style="max-width:230px">
+          <input id="au-title" placeholder="title" style="max-width:200px">
+          <select id="au-kind" style="max-width:200px">${KINDS.filter(k => k !== 'MEDICAL_ILLUSTRATION').map(k => `<option value="${k}">${k.toLowerCase().replace(/_/g, ' ')}</option>`).join('')}</select>
+          <input id="au-tags" placeholder="tags, comma separated" style="max-width:200px">
+          <button class="primary" id="au-upload">Upload</button>
+        </div>
+        <div class="flex" style="margin-top:10px;gap:10px">
+          <input id="a-brief" placeholder="or generate: young woman reading her phone in a shared taxi, dusk" style="flex:1">
+          <select id="a-kind" style="max-width:170px"><option value="IMAGE_PHOTO">Image (Gemini)</option>
+            <option value="VIDEO">Video (Kling/Veo)</option></select>
+          <button id="a-gen">Generate &rarr; review</button>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:6px">Generated assets stay out of the library until a producer reviews and saves them. Medical illustrations are never generated; they enter through clinical review only.</div>
+      </div>` : ''}
+      <div class="agrid">
+        ${r.items.map(a => `<div class="acard ${!a.is_active ? 'pending' : ''}">
+          ${assetThumb(a)}
+          <div class="ainfo">
+            <div class="flex"><b style="font-size:12.5px">${esc(a.title)}</b><span class="spacer"></span>
+              ${a.clinically_approved ? '<span class="pill p-APPROVED"><span class="d"></span>clinical</span>' : ''}</div>
+            <div class="muted" style="font-size:11px">${esc(a.kind.toLowerCase().replace(/_/g, ' '))} · ${esc(a.origin.toLowerCase().replace(/_/g, ' '))}${a.is_ai_generated ? ' · AI' : ''} · <span class="mono">${esc(a.code)}</span></div>
+            ${(a.tags ?? []).length ? `<div class="muted" style="font-size:10.5px">${a.tags.map(esc).join(' · ')}</div>` : ''}
+            ${!a.is_active && can('asset.manage') ? `
+              <input id="as-title-${esc(a.id)}" placeholder="title for the library" value="${esc(a.title)}" style="margin-top:6px">
+              <input id="as-tags-${esc(a.id)}" placeholder="tags, comma separated" style="margin-top:4px">
+              <button class="approve" data-assetsave="${esc(a.id)}" style="margin-top:6px">Save to library</button>` : ''}
+          </div>
+        </div>`).join('') || '<div class="card empty" style="grid-column:1/-1">Nothing matches. Clear the filters, or add the first asset above.</div>'}
+      </div>`;
   },
 
   async published() {
@@ -1087,6 +1434,304 @@ const screens = {
         <td class="muted">${a.from_state ? esc(a.from_state) + ' → ' + esc(a.to_state) : ''}</td>
         <td class="muted" style="max-width:220px">${esc(a.reason ?? '')}</td></tr>`).join('')}</table></div>`;
   },
+
+  // ---------- Part 2: the board, Girum's morning screen ----------
+  // Everything in flight, by stage, showing what is waiting on whom.
+  // Blocked items surface first inside each stage. Every card names its
+  // next action; nothing here is a dead end.
+  async board() {
+    const b = await api('GET', '/pipeline/board');
+    const blockedCount = Object.values(b.stages).flat().filter(x => !x.can_advance && x.advance_block !== 'This piece is at its final stage.').length;
+    const cols = b.stage_order.map(stage => {
+      const items = [...(b.stages[stage] ?? [])].sort((x, y) => Number(x.can_advance) - Number(y.can_advance));
+      if (!items.length) return '';
+      return `<div class="bcol"><div class="bhead">${esc(stage.replace(/_/g, ' '))} <span class="muted">${items.length}</span></div>
+        ${items.map(x => `<div class="bitem ${!x.can_advance ? 'blocked' : ''}" data-nav="script/${esc(x.id)}" tabindex="0" role="link">
+          <div class="flex"><span class="mono" style="font-size:11px">${esc(x.code)}</span>
+            ${pill(x.risk_tier)}${x.needs_clinical_signoff ? '<span class="pill p-TIER_4"><span class="d"></span>clinical</span>' : ''}</div>
+          <div style="font-size:12.5px;margin:3px 0">${esc((x.title ?? '').slice(0, 70))}</div>
+          <div class="muted" style="font-size:11px">${esc(x.format_label ?? x.format_code ?? '')}</div>
+          <div style="font-size:11.5px;margin-top:5px;${x.can_advance ? 'color:var(--risk-routine)' : 'color:var(--risk-mod)'}">
+            ${x.can_advance
+              ? `Ready: next is ${esc((x.next_stage ?? '').replace(/_/g, ' '))}`
+              : esc(x.advance_block ?? '')}</div>
+        </div>`).join('')}</div>`;
+    }).join('');
+    return `<h1>Board</h1>
+      <div class="sub">Everything in flight. ${blockedCount ? `<b>${blockedCount} piece${blockedCount === 1 ? ' is' : 's are'} waiting on someone</b>, shown first in each column.` : 'Nothing is blocked right now.'} Click a card to open the piece.</div>
+      <div class="board">${cols || '<div class="card empty">Nothing in flight. Start on the Make screen.</div>'}</div>`;
+  },
+
+  // ---------- Part 2 step 1: what should I make ----------
+  // Demand, the knowledge that answers it, the formats, the audience and
+  // the production path, and what is about to happen BEFORE it happens.
+  async make() {
+    const [trend, cards, formats] = await Promise.all([
+      api('GET', '/demand/trend?bucket=week&periods=12').catch(() => ({ items: [] })),
+      api('GET', '/knowledge/cards').catch(() => ({ items: [] })),
+      api('GET', '/content/formats').catch(() => ({ items: [] })),
+    ]);
+    let transcripts = { items: [] };
+    try { transcripts = await api('GET', '/content/transcripts'); } catch {}
+    const confirmed = transcripts.items.filter(t => t.status === 'CONFIRMED');
+    const demandByTopic = new Map((trend.items ?? []).map(t => [t.topic_code, t]));
+    if (!MAKE.cardId && cards.items?.length) MAKE.cardId = cards.items.find(c => c.status === 'APPROVED')?.id ?? cards.items[0].id;
+    const selCard = cards.items.find(c => c.id === MAKE.cardId);
+    const selDemand = selCard ? demandByTopic.get(selCard.topic_code) : null;
+    const SURFACE_LABEL = { SOCIAL_VIDEO: 'Short-form video', SOCIAL_STATIC: 'Static and cards',
+      TEXT_LONGFORM: 'Text and long form', ABEBA_APP: 'Abeba app', PROGRAMME: 'Programme and institutional' };
+    const surfaces = [...new Set(formats.items.map(f => f.surface))];
+    const fmtBoxes = surfaces.map(sf => `<div class="card">
+      <div class="eyebrow">${esc(SURFACE_LABEL[sf] ?? sf)}</div>
+      <div class="flex" style="flex-wrap:wrap;row-gap:8px">
+        ${formats.items.filter(f => f.surface === sf && !f.is_internal).map(f => `
+          <label class="otpick" title="${esc(f.description ?? '')}">
+            <input type="checkbox" data-mkfmt="${esc(f.code)}" ${MAKE.formats.has(f.code) ? 'checked' : ''}>
+            ${esc(f.label)} <span class="muted">${esc((f.platforms ?? []).join(', '))}</span></label>`).join('')}
+      </div></div>`).join('');
+    const picked = formats.items.filter(f => MAKE.formats.has(f.code));
+    const needsTranscript = picked.some(f => f.code === 'aua_recap');
+    const estMin = Math.max(1, Math.round(picked.length * 0.75));
+    const preview = !picked.length
+      ? 'Pick at least one format above, and this panel will say exactly what is about to happen.'
+      : `<b>${picked.length} piece${picked.length === 1 ? '' : 's'}</b> will be written for
+         <b>${esc(selCard?.code ?? '?')}</b> (${esc(selCard?.canonical_question_en ?? '')}), one per format:
+         ${picked.map(f => esc(f.label)).join(', ')}.
+         Audience ${esc(MAKE.audience.toLowerCase())}, ${esc(MAKE.path.toLowerCase())} production.
+         Expect roughly ${estMin} minute${estMin === 1 ? '' : 's'}; each piece appears below as it finishes.
+         <br><br><b>Cost:</b> writing is the cheap part, a few cents of AI per piece.
+         Nothing is produced or rendered in this step, so no production money is spent.
+         Production costs are shown on each piece's production plan, before anything runs.
+         ${picked.some(f => f.body_kind === 'VIDEO') ? '<br>A piece that comes back needing a missing fact is the writer refusing to invent; that is a success and it says which fact.' : ''}`;
+    return `<h1>Make content</h1>
+      <div class="sub">One topic becomes every format you tick, each written correctly for what it is.</div>
+      <div class="card"><div class="eyebrow">1 · The topic</div>
+        <select id="mk-card" style="max-width:640px">
+          ${cards.items.map(c => `<option value="${esc(c.id)}" ${c.id === MAKE.cardId ? 'selected' : ''}>
+            ${esc(c.code)} · ${esc(c.canonical_question_en.slice(0, 80))} · ${esc(c.status)}</option>`).join('')}
+        </select>
+        <div class="muted" style="font-size:12px;margin-top:6px">
+          ${selDemand ? `${selDemand.total} question${selDemand.total === 1 ? '' : 's'} on this topic in the last 12 weeks, ${esc(selDemand.direction === 'UP' ? 'rising' : selDemand.direction === 'DOWN' ? 'falling' : 'steady')}.` : 'No demand data for this topic yet.'}
+          ${selCard && selCard.status !== 'APPROVED' ? ' This card is NOT approved: generation needs the admin test-mode override, and nothing made from it can publish.' : ''}
+        </div></div>
+      <div class="eyebrow" style="margin:14px 0 6px">2 · The formats</div>
+      ${fmtBoxes}
+      <div class="grid2">
+        <div class="card"><div class="eyebrow">3 · Who it speaks to</div>
+          ${['WOMEN', 'MEN', 'COUPLES', 'GENERAL'].map(a => `<label class="otpick">
+            <input type="radio" name="mk-aud" value="${a}" ${MAKE.audience === a ? 'checked' : ''}> ${a === 'WOMEN' ? 'Women (default)' : a[0] + a.slice(1).toLowerCase()}</label>`).join(' ')}
+          <div class="muted" style="font-size:12px;margin-top:6px">A men's piece is a different question with different fears, never a women's piece with pronouns swapped.</div></div>
+        <div class="card"><div class="eyebrow">4 · How it gets produced</div>
+          ${['DIGITAL', 'LIVE'].map(pp => `<label class="otpick">
+            <input type="radio" name="mk-path" value="${pp}" ${MAKE.path === pp ? 'checked' : ''}> ${pp === 'DIGITAL' ? 'Digital (default): the adapter pipeline' : 'Live: a real shoot, or the AUA live'}</label>`).join(' ')}
+          <div class="muted" style="font-size:12px;margin-top:6px">Changeable per piece until production starts. Formats that only support one path keep it.</div></div>
+      </div>
+      ${needsTranscript ? `<div class="card" style="border-left:4px solid var(--risk-mod)">
+        <div class="eyebrow">AUA recap needs its confirmed transcript</div>
+        ${confirmed.length ? `<select id="mk-transcript" style="max-width:520px">
+            ${confirmed.map(t => `<option value="${esc(t.id)}" ${t.id === MAKE.transcriptId ? 'selected' : ''}>${esc(t.code)} · ${esc(t.title)}</option>`).join('')}
+          </select>` : `<div style="font-size:13px">No confirmed transcript yet. <a href="#/transcripts">Create and confirm one first</a>; the recap generates from what the doctor actually said, never from imagination.</div>`}
+      </div>` : ''}
+      <div class="card"><div class="eyebrow">What is about to happen</div>
+        <div id="mk-preview" style="font-size:13px;line-height:1.7">${preview}</div>
+        <div style="margin-top:12px" class="flex">
+          <button class="primary" id="mk-go" ${!picked.length || (needsTranscript && !confirmed.length) ? 'disabled' : ''}>Write ${picked.length || ''} piece${picked.length === 1 ? '' : 's'}</button>
+          <span class="muted" style="font-size:12px">Each piece is claim-checked as it lands. Nothing publishes from here.</span>
+        </div>
+        <div id="mk-run"></div>
+      </div>`;
+  },
+
+  // ---------- Part 2 step 6b: transcripts for AUA recaps ----------
+  async transcripts() {
+    const r = await api('GET', '/content/transcripts');
+    return `<h1>Live transcripts</h1>
+      <div class="sub">An AUA recap generates from the transcript of the live. Amharic machine transcription is unreliable in every engine, and a doctor's medical statements ride on it, so a human confirms every transcript on its own screen before anything generates from it.</div>
+      ${can('script.write') ? `<div class="grid2">
+        <div class="card"><div class="eyebrow">Paste a transcript (from VEED or anywhere)</div>
+          <label>Title</label><input id="tr-title" placeholder="AUA live, 14 Aug">
+          <label>Transcript. Timecodes like [00:12] or 02:10 at line starts are picked up; untimed lines are kept.</label>
+          <textarea id="tr-text" class="amharic" style="min-height:120px"></textarea>
+          <div style="margin-top:8px"><button class="primary" id="tr-paste">Save as draft</button></div></div>
+        <div class="card"><div class="eyebrow">Or upload the recording for Gemini to transcribe</div>
+          <label>Title</label><input id="tr-title-2" placeholder="AUA live, 14 Aug">
+          <label>Audio preferred. A video upload works, but its audio is stripped server side first; the audio file is a hundred times smaller.</label>
+          <input type="file" id="tr-file" accept="audio/*,video/*">
+          <div style="margin-top:8px"><button class="primary" id="tr-upload">Upload and transcribe</button></div>
+          <div class="muted" style="font-size:12px;margin-top:6px">The result is machine transcription of Amharic and needs checking. It is not ground truth.</div></div>
+      </div>` : ''}
+      <div class="card"><table>
+        <tr><th>Code</th><th>Title</th><th>How it arrived</th><th>Lines</th><th>Status</th><th>Confirmed</th></tr>
+        ${r.items.map(t => `<tr class="rowlink" data-nav="transcript/${esc(t.id)}" tabindex="0">
+          <td class="mono">${esc(t.code)}</td><td>${esc(t.title)}</td>
+          <td class="muted" style="font-size:12px">${esc(t.source.toLowerCase().replace(/_/g, ' '))}${t.transcription_engine ? ` (${esc(t.transcription_engine)})` : ''}</td>
+          <td>${t.segment_count}</td>
+          <td>${pill(t.status === 'CONFIRMED' ? 'APPROVED' : 'DRAFT')}</td>
+          <td class="muted">${t.confirmed_at ? dt(t.confirmed_at) : '—'}</td></tr>`).join('')
+        || empty(6, 'No transcripts yet. Paste or upload the first one above.')}</table></div>`;
+  },
+
+  async transcript(id) {
+    const t = await api('GET', `/content/transcripts/${id}`);
+    const canEdit = can('script.write');
+    const fmtT = (x) => x == null ? '' : String(x);
+    return `<a class="backlink" href="#/transcripts">&larr; All transcripts</a>
+      <div class="eyebrow">Live transcript</div>
+      <h1>${esc(t.title)} <span class="mono" style="font-size:13px;font-weight:400">${esc(t.code)}</span></h1>
+      <div class="sub flex">${pill(t.status === 'CONFIRMED' ? 'APPROVED' : 'DRAFT')}
+        <span class="muted">${esc(t.source.toLowerCase().replace(/_/g, ' '))}${t.transcription_engine ? ` · transcribed by ${esc(t.transcription_engine)}` : ''}</span></div>
+      ${t.transcription_engine ? `<div class="card" style="border-left:4px solid var(--risk-mod)">
+        <b>This is machine transcription of Amharic and needs checking.</b>
+        <div style="font-size:13px;margin-top:4px">Read every line against the recording before confirming. A wrong word here becomes a wrong medical statement in a recap.</div></div>` : ''}
+      ${t.status === 'CONFIRMED' ? `<div class="card" style="border-left:4px solid var(--risk-routine)">
+        Confirmed${t.confirmed_by_name ? ` by ${esc(t.confirmed_by_name)}` : ''} ${dt(t.confirmed_at)}. Editing any line returns it to draft and it must be confirmed again.</div>` : ''}
+      <div class="card"><div class="eyebrow">The transcript, editable in place</div>
+        <table style="min-width:0"><tr><th style="width:80px">Start s</th><th style="width:80px">End s</th><th>What was said</th></tr>
+          ${(t.segments ?? []).map((seg, i) => `<tr>
+            <td><input id="ts-${i}-start" value="${esc(fmtT(seg.start_s))}" ${canEdit ? '' : 'disabled'}></td>
+            <td><input id="ts-${i}-end" value="${esc(fmtT(seg.end_s))}" ${canEdit ? '' : 'disabled'}></td>
+            <td><textarea id="ts-${i}-text" class="amharic" style="min-height:44px" ${canEdit ? '' : 'disabled'}>${esc(seg.text)}</textarea></td>
+          </tr>`).join('')}
+        </table>
+        ${canEdit ? `<div class="flex" style="margin-top:10px">
+          <button data-trsave="${esc(t.id)}" data-count="${(t.segments ?? []).length}">Save edits</button>
+          <button data-traddrow="${esc(t.id)}">Add a line</button>
+          ${t.status !== 'CONFIRMED' ? `<button class="approve" data-trconfirm="${esc(t.id)}">Confirm: this is what was said</button>` : ''}
+        </div>` : ''}
+      </div>`;
+  },
+
+  // ---------- Part 2 steps 4 and 5: the Amharic, side by side ----------
+  async amharic(id) {
+    const s = await api('GET', `/content/scripts/${id}`);
+    const t = s.translation;
+    const v = s.version;
+    if (!t) {
+      return `<a class="backlink" href="#/script/${esc(id)}">&larr; Back to the piece</a>
+        <h1>No Amharic yet</h1>
+        <div class="card">Amharic is written from the approved English.
+        ${can('script.write') ? `<div style="margin-top:8px"><button data-scriptlocalize="${esc(id)}">Write it now</button></div>` : ''}</div>`;
+    }
+    const [driftWord, driftText] = driftWords(t.drift_score);
+    const english = versionEnglishText(v);
+    return `<a class="backlink" href="#/script/${esc(id)}">&larr; Back to the piece</a>
+      <div class="eyebrow">Language review</div>
+      <h1 class="mono">${esc(s.code)} <span style="font-weight:400;font-size:14px">· Amharic against the English</span></h1>
+      <div class="sub flex">${pill(t.status)} <span class="muted">drift ${Number(t.drift_score).toFixed(3)}</span></div>
+      <div class="card" style="border-left:4px solid ${driftWord === 'high drift' ? 'var(--risk-high)' : driftWord === 'acceptable' ? 'var(--risk-mod)' : 'var(--risk-routine)'}">
+        <b>Drift: ${esc(driftWord)}.</b> <span style="font-size:13px">${esc(driftText)}</span>
+        <div class="muted" style="font-size:12px;margin-top:4px">The back-translation was written blind, by an agent that never saw the English. Words marked below appear in it but not in the English source: that is exactly where a meaning shift hides.</div>
+      </div>
+      <div class="grid3">
+        <div class="card"><div class="eyebrow">English source</div>
+          <div style="line-height:1.8;font-size:13.5px">${esc(english)}</div></div>
+        <div class="card"><div class="eyebrow">Amharic${can('script.approve_language') ? ' · edit directly if needed' : ''}</div>
+          <textarea id="am-text" class="amharic" style="min-height:220px" ${can('script.approve_language') || can('script.write') ? '' : 'disabled'}>${esc(t.translated_text)}</textarea></div>
+        <div class="card"><div class="eyebrow">Blind back-translation, divergence marked</div>
+          <div style="line-height:1.8;font-size:13.5px">${diffMark(english, t.back_translation)}</div></div>
+      </div>
+      <div class="flex">
+        ${can('script.approve_language') ? `
+          <button class="approve" data-amapprove="${esc(s.id)}">Approve the Amharic</button>
+          <button data-amapprove-edits="${esc(s.id)}">Approve with my edits above</button>
+          <button data-amchanges="${esc(s.id)}">Request changes</button>` : ''}
+        ${can('script.write') ? `<button data-scriptlocalize="${esc(s.id)}">Rewrite from the English</button>` : ''}
+      </div>
+      ${!can('script.approve_language') ? '<div class="muted" style="font-size:12px;margin-top:8px">Approval here is the language editor\'s gate. You can read and comment; the sign-off is theirs.</div>' : ''}`;
+  },
+
+  // ---------- Part 2 step 6: the production plan and the cost, before spending ----------
+  async produce(scriptId) {
+    const [plan, script] = await Promise.all([
+      api('GET', `/production/plan/${scriptId}`),
+      api('GET', `/content/scripts/${scriptId}`),
+    ]);
+    const sp = plan.spend_today;
+    const approved = script.status === 'APPROVED';
+    const langOk = !script.translation || script.translation.status === 'APPROVED';
+    const AMHARIC_SAMPLE = 'በሚስጥር በቀጥታ ጻፊልን። ማንም አያይም። ነፃ።';
+    const subSample = (code) => ({
+      WORD_HIGHLIGHT: `<span class="ss wordhl">${AMHARIC_SAMPLE.split(' ').map((w, i) => `<span class="${i === 2 ? 'hl' : ''}">${esc(w)}</span>`).join(' ')}</span>`,
+      POP_ON: `<span class="ss popon">${esc(AMHARIC_SAMPLE)}</span>`,
+      BOXED: `<span class="ss boxed">${esc(AMHARIC_SAMPLE)}</span>`,
+      CLEAN: `<span class="ss clean">${esc(AMHARIC_SAMPLE)}</span>`,
+    }[code] ?? '');
+    const stepRow = (st) => `<tr>
+      <td><b>${esc(st.label)}</b><div class="muted" style="font-size:11.5px">${esc(st.detail)}</div></td>
+      <td class="muted" style="font-size:12px">${esc(st.engine)}</td>
+      <td style="text-align:right;white-space:nowrap">${st.included
+        ? '<span class="pill p-APPROVED"><span class="d"></span>included</span>'
+        : `<span class="mono">~$${(st.est_cost_usd ?? 0).toFixed(2)}</span>`}</td></tr>`;
+    const meter = (m, label) => {
+      const pct = Math.min(100, Math.round((m.spent_usd / (m.cap_usd || 1)) * 100));
+      return `<div style="flex:1;min-width:160px"><div class="flex" style="justify-content:space-between">
+        <span style="font-size:12px">${label}</span><span class="mono" style="font-size:12px">$${m.spent_usd.toFixed(2)} / $${m.cap_usd}</span></div>
+        <div class="meter"><div class="meter-fill ${pct >= 100 ? 'full' : pct >= 75 ? 'warn' : ''}" style="width:${pct}%"></div></div></div>`;
+    };
+    return `<a class="backlink" href="#/script/${esc(scriptId)}">&larr; Back to the piece</a>
+      <div class="eyebrow">Production plan</div>
+      <h1 class="mono">${esc(plan.script_code)} <span style="font-weight:400;font-size:14px">· ${esc(plan.format?.label ?? plan.body_kind)}</span></h1>
+      <div class="sub">The whole plan, and where the money actually goes, before anything runs.</div>
+      ${!approved ? `<div class="card" style="border-left:4px solid var(--risk-mod)"><b>This piece is not approved yet.</b>
+        <div style="font-size:13px;margin-top:4px">The plan below is a preview. Production can only start after content, medical and language approval; the sequence is on the piece's own screen.</div></div>` : ''}
+      ${plan.cap_message ? `<div class="card" style="border-left:4px solid var(--risk-high)"><b>${esc(plan.cap_message)}</b></div>` : ''}
+      <div class="card"><div class="eyebrow">The steps, in plain language</div>
+        <table><tr><th>Step</th><th>Runs on</th><th style="text-align:right">Cost</th></tr>
+          ${plan.steps.map(stepRow).join('')}
+          <tr><td><b>Total, before library reuse</b></td><td></td>
+            <td style="text-align:right"><b class="mono" id="pp-total">~$${plan.total_est_usd.toFixed(2)}</b></td></tr>
+        </table>
+        <div class="muted" style="font-size:12px;margin-top:6px">${esc(plan.cost_note)}</div>
+      </div>
+      ${plan.body_kind === 'VIDEO' ? `
+      <div class="grid2">
+        <div class="card"><div class="eyebrow">Video engine</div>
+          ${plan.video_engine.options.map(o => `<label class="otpick">
+            <input type="radio" name="pp-engine" value="${o}" ${o === plan.video_engine.default ? 'checked' : ''}> ${o === 'KLING' ? 'Kling' : 'Veo (same Gemini key)'}</label>`).join(' ')}
+          <div class="muted" style="font-size:12px;margin-top:6px">${esc(plan.video_engine.note)}</div></div>
+        <div class="card"><div class="eyebrow">Voice</div>
+          ${plan.voice.options.map(o => `<label class="otpick" style="display:flex;margin-bottom:4px">
+            <input type="radio" name="pp-voice" value="${o.code}" ${o.code === (plan.voice.ai_allowed_at_tier ? 'AI_TTS' : 'HUMAN') ? 'checked' : ''}>
+            ${esc(o.label)}${o.metered ? ' <span class="muted">(metered)</span>' : ''}</label>${o.note ? `<div class="muted" style="font-size:11.5px;margin:-2px 0 6px 22px">${esc(o.note)}</div>` : ''}`).join('')}
+          ${!plan.voice.ai_allowed_at_tier ? '<div class="claimrow" style="font-size:12px">At this risk tier the AI voice is not permitted; the live recording is the path.</div>' : ''}</div>
+      </div>
+      <div class="card"><div class="eyebrow">Subtitles, in Amharic because that is where rendering is at risk</div>
+        <div class="subgrid">
+          ${plan.subtitle.presets.map(pr => `<label class="subopt">
+            <input type="radio" name="pp-subs" value="${pr.code}" ${pr.code === plan.subtitle.default ? 'checked' : ''}>
+            <div><b style="font-size:12.5px">${esc(pr.label)}</b>${pr.code === plan.subtitle.default ? ' <span class="muted">(this format\'s default)</span>' : ''}
+              <div style="margin:6px 0">${subSample(pr.code)}</div>
+              <div class="muted" style="font-size:11px">${esc(pr.description)}</div></div>
+          </label>`).join('')}
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:6px">Rendered by FFmpeg on Letena's own server: no cost either way.</div>
+      </div>` : ''}
+      ${plan.scene_suggestions.length ? `<div class="card"><div class="eyebrow">The library already has some of this</div>
+        <div class="muted" style="font-size:12px;margin-bottom:10px">Binding an approved asset is free and instant. Generating costs money and time. Generate only where the library has nothing right.</div>
+        ${plan.scene_suggestions.map(sc => `<div class="claimrow">
+          <div style="font-size:12.5px"><b>Scene ${sc.scene}:</b> ${esc(sc.visual_brief || '(no brief)')}</div>
+          <div class="flex" style="margin-top:6px;align-items:flex-start">
+            ${sc.matches.map((m, mi) => `<label class="sceneopt">
+              <input type="radio" name="pp-scene-${sc.scene}" value="${esc(m.id)}" ${mi === 0 && m.similarity >= 0.25 ? 'checked' : ''}>
+              ${assetThumb(m)}
+              <div style="font-size:11px"><b>${esc(m.title.slice(0, 40))}</b><br>
+                <span class="muted">${Math.round(m.similarity * 100)}% match${m.clinically_approved ? ' · clinical' : ''}</span></div>
+            </label>`).join('')}
+            <label class="sceneopt"><input type="radio" name="pp-scene-${sc.scene}" value=""
+              ${!(sc.matches[0]?.similarity >= 0.25) ? 'checked' : ''}>
+              <div class="ath none">NEW</div>
+              <div style="font-size:11px"><b>Generate fresh</b><br><span class="muted">metered</span></div></label>
+          </div></div>`).join('')}
+      </div>` : ''}
+      <div class="card"><div class="eyebrow">Today's spend, against the caps</div>
+        <div class="flex" style="gap:20px">${meter(sp.render, 'Renders')}${meter(sp.ai, 'AI')}</div></div>
+      <div class="flex">
+        ${can('production.request') ? `<button class="primary" data-startprod="${esc(scriptId)}"
+          ${!approved || plan.at_render_cap || !langOk ? 'disabled' : ''}>Approve the plan and start</button>` : ''}
+        ${!langOk ? '<span class="muted" style="font-size:12px">The Amharic is not language-approved yet; the AI voice would be voicing unreviewed Amharic, so start is held.</span>' : ''}
+        ${plan.at_render_cap ? '<span class="muted" style="font-size:12px">Held at the daily cap.</span>' : ''}
+      </div>`;
+  },
 };
 
 // ---------- actions ----------
@@ -1106,7 +1751,7 @@ document.addEventListener('keydown', (e) => {
   // row itself, same as a tile. Only when focus is on the row, not on a
   // button/link/input inside it -- those already have their own Enter/Space
   // behaviour and must not also trigger the row's navigation.
-  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('tr[data-nav]')) {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('tr[data-nav],.bitem[data-nav]')) {
     e.preventDefault(); location.hash = '#/' + e.target.dataset.nav;
   }
   if (e.key === 'Escape') document.body.classList.remove('nav-open');
@@ -1360,10 +2005,12 @@ document.addEventListener('click', async (e) => {
     }
     if (b.id === 'a-go') {
       const r = await api('GET', '/production/assets/search?semantic=' + encodeURIComponent($('#a-search').value));
-      $('#a-results').innerHTML = r.items.map(a =>
-        `<div class="claimrow"><span class="mono">${esc(a.code)}</span> ${esc(a.title)}
-         <span class="muted">${Math.round((a.similarity ?? 0) * 100)}%</span></div>`).join('')
-        || '<div class="muted" style="margin-top:8px">No matches.</div>';
+      $('#a-results').innerHTML = `<div class="agrid" style="margin-top:10px">` + (r.items.map(a =>
+        `<div class="acard">${assetThumb(a)}<div class="ainfo">
+           <b style="font-size:12px">${esc(a.title)}</b>
+           <div class="muted" style="font-size:11px"><span class="mono">${esc(a.code)}</span> · ${Math.round((a.similarity ?? 0) * 100)}% match</div>
+         </div></div>`).join('')
+        || '<div class="muted">No matches. Semantic search is coarse until real embeddings exist; try the text filter.</div>') + '</div>';
       return;
     }
     if (b.id === 'a-gen') {
@@ -1411,8 +2058,288 @@ document.addEventListener('click', async (e) => {
   } catch (ex) { toast(ex.message, true); render(); }
 });
 
+// ---------- Part 2 guided-flow actions (14 Aug 2026) ----------
+// A second delegated listener for the new screens, kept separate from the
+// original one so neither selector string becomes unreadable. No overlap:
+// every id/attribute here is new.
+const fileB64 = (file) => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(String(r.result).split(',')[1]);
+  r.onerror = rej; r.readAsDataURL(file);
+});
+const elv = (id) => document.getElementById(id)?.value;
+const has = (id) => !!document.getElementById(id);
+
+// The Make screen's selections live in MAKE so a re-render keeps them.
+document.addEventListener('change', (e) => {
+  const t = e.target;
+  if (t.id === 'mk-card') { MAKE.cardId = t.value; return render(); }
+  if (t.name === 'mk-aud') { MAKE.audience = t.value; return render(); }
+  if (t.name === 'mk-path') { MAKE.path = t.value; return render(); }
+  if (t.dataset?.mkfmt) {
+    if (t.checked) MAKE.formats.add(t.dataset.mkfmt); else MAKE.formats.delete(t.dataset.mkfmt);
+    return render();
+  }
+  if (t.id === 'mk-transcript') { MAKE.transcriptId = t.value; }
+});
+
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-scriptedit],[data-regen],[data-advance],#mk-go,#tr-paste,#tr-upload,[data-trsave],[data-traddrow],[data-trconfirm],[data-amapprove],[data-amapprove-edits],[data-amchanges],[data-startprod],#af-go,#au-upload,[data-assetsave]');
+  if (!b) {
+    const bi = e.target.closest('.bitem[data-nav]');
+    if (bi && !e.target.closest('a[href],button')) location.hash = '#/' + bi.dataset.nav;
+    return;
+  }
+  e.preventDefault();
+  try {
+    // ---- step 3: save inline edits, and say plainly what the edit did ----
+    if (b.dataset.scriptedit) {
+      const id = b.dataset.scriptedit;
+      b.disabled = true; b.textContent = 'Saving…';
+      const cur = await api('GET', `/content/scripts/${id}`);
+      const v = cur.version ?? {};
+      const payload = { hook: elv('ed-hook'), cta: elv('ed-cta') };
+      const body = JSON.parse(JSON.stringify(v.body ?? {}));
+      if (has('ed-spoken')) payload.spoken_script = elv('ed-spoken');
+      if (has('ed-post')) payload.post_text = elv('ed-post');
+      if (has('ed-g-headline')) payload.static_graphic = { headline: elv('ed-g-headline'),
+        body: elv('ed-g-body'), footer: elv('ed-g-footer') || null };
+      if (has('ed-sl-0-title')) {
+        const slides = [];
+        for (let i = 0; has(`ed-sl-${i}-title`); i++) {
+          slides.push({ ...(v.carousel_slides?.[i] ?? {}), title: elv(`ed-sl-${i}-title`), body: elv(`ed-sl-${i}-body`) });
+        }
+        payload.carousel_slides = slides;
+      }
+      if (has('ed-b-intro')) {
+        body.intro = elv('ed-b-intro');
+        for (let i = 0; has(`ed-sec-${i}-heading`); i++) {
+          body.sections[i] = { ...(body.sections?.[i] ?? {}), heading: elv(`ed-sec-${i}-heading`), body: elv(`ed-sec-${i}-body`) };
+        }
+      }
+      for (let i = 0; has(`ed-it-${i}-en`); i++) {
+        body.items[i] = { ...(body.items?.[i] ?? {}), text_en: elv(`ed-it-${i}-en`), text_am: elv(`ed-it-${i}-am`) };
+      }
+      if (has('ed-p-title')) body.push = { title: elv('ed-p-title'), body: elv('ed-p-body'), deep_link: elv('ed-p-link') };
+      for (let i = 0; has(`ed-seg-${i}-title`); i++) {
+        body.segments[i] = { ...(body.segments?.[i] ?? {}), title: elv(`ed-seg-${i}-title`), description: elv(`ed-seg-${i}-desc`) };
+      }
+      if (has('ed-pinned')) body.pinned_message = elv('ed-pinned');
+      for (let i = 0; has(`ed-cut-${i}`); i++) body.cutdown_briefs[i] = elv(`ed-cut-${i}`);
+      if (has('ed-body-extra')) {
+        try { Object.assign(body, JSON.parse(elv('ed-body-extra'))); }
+        catch { toast('The structured-fields JSON does not parse; fix it or leave it as it was.', true); return render(); }
+      }
+      payload.body = body;
+      const r = await api('POST', `/content/scripts/${id}/edit`, payload);
+      if (!r.content_changed) {
+        FLASH.set(id, { kind: 'ok', title: 'Saved, but nothing actually changed.',
+          text: 'The text is identical to the last version, so every sign-off stands.' });
+      } else if (r.edit_class === 'MEDICAL') {
+        FLASH.set(id, { kind: 'medical', title: 'Saved. This edit touched medical content, so it goes back to medical review.',
+          text: `What tripped it: ${(r.edit_reasons ?? []).join('; ')}. The medical sign-off was withdrawn because it no longer describes this text. Re-run validation, then a doctor signs again. That is the rule working, not a problem.` });
+      } else {
+        FLASH.set(id, { kind: 'ok', title: 'Saved. Style-only edit, the medical sign-off stands.',
+          text: 'No claim-mapped statement, number, time window, negation or term changed. Any corrected Amharic phrasing was kept as an approved example the localizer learns from.' });
+      }
+      return render();
+    }
+    // ---- step 3: regenerate one piece, steered ----
+    if (b.dataset.regen) {
+      const id = b.dataset.regen;
+      const direction = elv('rg-direction')?.trim() || null;
+      b.disabled = true; b.textContent = 'Rewriting…';
+      const r = await api('POST', `/content/scripts/${id}/regenerate`, { direction });
+      if (r.status === 'NEEDS_KNOWLEDGE') {
+        FLASH.set(id, { kind: 'medical', title: 'The writer stopped: a fact it needed is not an approved claim.',
+          text: 'That is a success, not a failure. The missing fact is on this page; the clinical team can approve it from the knowledge gaps board.' });
+      } else {
+        FLASH.set(id, { kind: 'ok', title: `Rewritten as version ${r.version}${direction ? `, steered: "${direction}"` : ''}.`,
+          text: `Claim validation ${r.validation_result === 'PASS' ? 'passed' : `came back ${r.validation_result}`}. ${r.note}` });
+      }
+      return render();
+    }
+    // ---- advance a piece along its stages ----
+    if (b.dataset.advance) {
+      b.disabled = true;
+      const r = await api('POST', `/pipeline/scripts/${b.dataset.advance}/advance`, {});
+      toast(`Moved to ${String(r.stage).replace(/_/g, ' ')}.`);
+      return render();
+    }
+    // ---- step 2: generate, per piece, progress as it happens ----
+    if (b.id === 'mk-go') {
+      const formats = [...MAKE.formats];
+      if (!formats.length || MAKE.running) return;
+      MAKE.running = true; b.disabled = true; b.textContent = 'Writing…';
+      const run = $('#mk-run');
+      run.innerHTML = '<div class="eyebrow" style="margin-top:12px">Writing, piece by piece</div>'
+        + formats.map(f => `<div class="claimrow" id="mkr-${esc(f)}"><b>${esc(f)}</b> · queued</div>`).join('');
+      const tid = elv('mk-transcript') ?? MAKE.transcriptId;
+      let made = 0, stopped = 0, failed = 0;
+      for (const f of formats) {
+        const row = document.getElementById(`mkr-${f}`);
+        row.innerHTML = `<b>${esc(f)}</b> · writing now…`;
+        try {
+          const payload = { card_id: MAKE.cardId, formats: [f], audience: MAKE.audience };
+          if (f === 'aua_recap') payload.transcript_id = tid;
+          const r = await api('POST', '/content/generate', payload);
+          const sc = r.scripts[0] ?? {};
+          const sid = sc.script_id ?? sc.id;
+          if (sc.status === 'NEEDS_KNOWLEDGE') {
+            stopped++;
+            let note = '';
+            try { const d = await api('GET', `/content/scripts/${sid}`);
+              note = JSON.stringify(d.needs_knowledge_note ?? {}).slice(0, 180); } catch {}
+            row.style.borderLeftColor = 'var(--risk-mod)';
+            row.innerHTML = `<b>${esc(f)}</b> · <b>stopped honestly:</b> a fact it needed is not an approved claim, so it refused to invent one.
+              <div class="mono muted" style="font-size:11px;margin:4px 0">${esc(note)}</div>
+              <a href="#/gaps">Open the knowledge gap</a> · <a href="#/script/${esc(sid)}">open the piece</a>`;
+          } else {
+            made++;
+            if (MAKE.path === 'LIVE') {
+              try { await api('POST', `/pipeline/scripts/${sid}/production-path`, { path: 'LIVE' }); } catch {}
+            }
+            row.innerHTML = `<b>${esc(f)}</b> · written and claim-checked${sc.status === 'VALIDATION_FAILED' ? ' (validation failed; the findings say why)' : ''}
+              · <a href="#/script/${esc(sid)}">read it</a>`;
+          }
+        } catch (ex) {
+          failed++;
+          row.className = 'claimrow bad';
+          row.innerHTML = `<b>${esc(f)}</b> · ${esc(ex.message)}`;
+        }
+      }
+      MAKE.running = false;
+      b.textContent = `Done: ${made} written${stopped ? `, ${stopped} waiting on a missing fact` : ''}${failed ? `, ${failed} failed` : ''}`;
+      run.insertAdjacentHTML('beforeend',
+        `<div style="margin-top:10px;font-size:13px">Next: read each piece, edit or steer it, then it moves to medical review. <a href="#/board">The board</a> tracks all of them.</div>`);
+      return;
+    }
+    // ---- transcripts ----
+    if (b.id === 'tr-paste') {
+      const title = elv('tr-title')?.trim();
+      if (!title || !elv('tr-text')?.trim()) return toast('A title and the pasted transcript are both needed.', 'warn');
+      b.disabled = true;
+      const r = await api('POST', '/content/transcripts', { title, transcript_text: elv('tr-text') });
+      toast(`Saved as draft with ${r.segments.length} lines. ${r.warning}`);
+      return render();
+    }
+    if (b.id === 'tr-upload') {
+      const title = elv('tr-title-2')?.trim();
+      const file = document.getElementById('tr-file')?.files?.[0];
+      if (!title || !file) return toast('A title and a file are both needed.', 'warn');
+      if (file.size > 17 * 1024 * 1024) return toast('That file is too big. Upload the audio, not the video: transcription needs only the audio and the file is a hundred times smaller.', 'warn');
+      b.disabled = true; b.textContent = 'Transcribing…';
+      const r = await api('POST', '/content/transcripts',
+        { title, media_base64: await fileB64(file), media_mime_type: file.type || 'audio/mpeg' });
+      toast(`${r.note ? r.note + ' ' : ''}${r.warning}`, 'warn');
+      return render();
+    }
+    if (b.dataset.trsave) {
+      const segs = [];
+      for (let i = 0; has(`ts-${i}-text`); i++) {
+        const text = elv(`ts-${i}-text`)?.trim();
+        if (!text) continue;
+        const num = (x) => { const n = Number(x); return Number.isFinite(n) && x !== '' ? n : null; };
+        segs.push({ start_s: num(elv(`ts-${i}-start`)), end_s: num(elv(`ts-${i}-end`)), speaker: 'doctor', text });
+      }
+      const r = await api('PUT', `/content/transcripts/${b.dataset.trsave}`, { segments: segs });
+      toast(r.reconfirm_needed
+        ? 'Saved. This transcript was confirmed before the edit, so it is back to draft and must be confirmed again.'
+        : 'Saved as draft.', r.reconfirm_needed ? 'warn' : false);
+      return render();
+    }
+    if (b.dataset.traddrow) {
+      let i = 0; while (has(`ts-${i}-text`)) i++;
+      const table = b.closest('.card').querySelector('table');
+      table.insertAdjacentHTML('beforeend', `<tr>
+        <td><input id="ts-${i}-start" value=""></td><td><input id="ts-${i}-end" value=""></td>
+        <td><textarea id="ts-${i}-text" class="amharic" style="min-height:44px"></textarea></td></tr>`);
+      return;
+    }
+    if (b.dataset.trconfirm) {
+      const r = await api('POST', `/content/transcripts/${b.dataset.trconfirm}/confirm`, {});
+      toast(r.message);
+      return render();
+    }
+    // ---- steps 4-5: the Amharic ----
+    if (b.dataset.amapprove) {
+      b.disabled = true;
+      const r = await api('POST', `/content/scripts/${b.dataset.amapprove}/language-review`,
+        { decision: 'APPROVED', naturalness_score: 4, meaning_preserved: true });
+      toast(`Amharic approved. ${r.next ?? ''}`);
+      location.hash = '#/script/' + b.dataset.amapprove; return;
+    }
+    if (b.dataset.amapproveEdits) {
+      const corrected = elv('am-text')?.trim();
+      if (!corrected) return toast('The Amharic text is empty.', 'warn');
+      b.disabled = true;
+      const r = await api('POST', `/content/scripts/${b.dataset.amapproveEdits}/language-review`,
+        { decision: 'APPROVED_WITH_EDITS', corrected_amharic: corrected,
+          naturalness_score: 4, meaning_preserved: true });
+      toast(`Amharic approved with your edits; the corrected phrasing feeds the localizer. ${r.next ?? ''}`);
+      location.hash = '#/script/' + b.dataset.amapproveEdits; return;
+    }
+    if (b.dataset.amchanges) {
+      const comment = prompt('What needs to change in the Amharic:'); if (!comment) return;
+      await api('POST', `/content/scripts/${b.dataset.amchanges}/language-review`,
+        { decision: 'CHANGES_REQUESTED', comment });
+      toast('Sent back with your note. The piece does not advance until the Amharic is approved.');
+      return render();
+    }
+    // ---- step 6: approve the plan and start ----
+    if (b.dataset.startprod) {
+      const sid = b.dataset.startprod;
+      b.disabled = true; b.textContent = 'Starting…';
+      const job = await api('POST', '/production/jobs', { script_id: sid });
+      const pick = (name) => document.querySelector(`input[name="${name}"]:checked`)?.value ?? null;
+      const bindings = [...document.querySelectorAll('input[name^="pp-scene-"]:checked')]
+        .filter(x => x.value)
+        .map(x => ({ scene: Number(x.name.replace('pp-scene-', '')), asset_id: x.value }));
+      const saved = await api('POST', `/production/jobs/${job.id}/plan`,
+        { video_engine: pick('pp-engine'), subtitle_preset: pick('pp-subs'),
+          voice_source: pick('pp-voice'), asset_bindings: bindings });
+      const run = await api('POST', `/production/jobs/${job.id}/run`);
+      if (run.status === 'CAP_REACHED') toast(run.reason, 'warn');
+      else toast(`Started. ${saved.summary}`);
+      location.hash = '#/production'; return;
+    }
+    // ---- the asset library ----
+    if (b.id === 'af-go') {
+      const params = new URLSearchParams();
+      if (elv('af-text')) params.set('text', elv('af-text'));
+      if (elv('af-kind')) params.set('kind', elv('af-kind'));
+      if (elv('af-ai')) params.set('ai', elv('af-ai'));
+      if (document.getElementById('af-pending')?.checked) params.set('pending', '1');
+      location.hash = '#/assets' + (params.toString() ? `?${params}` : '');
+      return;
+    }
+    if (b.id === 'au-upload') {
+      const file = document.getElementById('au-file')?.files?.[0];
+      const title = elv('au-title')?.trim();
+      if (!file || !title) return toast('Pick a file and give it a title.', 'warn');
+      if (file.size > 6 * 1024 * 1024) return toast('Uploads are capped at 6MB here. For big source recordings, use the transcripts screen or ask the developer to bulk-load.', 'warn');
+      b.disabled = true; b.textContent = 'Uploading…';
+      await api('POST', '/production/assets', {
+        title, kind: elv('au-kind'), origin: 'SHOT_IN_HOUSE', mime_type: file.type || 'application/octet-stream',
+        content_base64: await fileB64(file),
+        tags: (elv('au-tags') ?? '').split(',').map(x => x.trim()).filter(Boolean) });
+      toast(`Saved "${title}" to the library.`);
+      return render();
+    }
+    if (b.dataset.assetsave) {
+      const id = b.dataset.assetsave;
+      b.disabled = true;
+      const r = await api('POST', `/production/assets/${id}/activate`,
+        { title: elv(`as-title-${id}`) ?? '', tags: (elv(`as-tags-${id}`) ?? '').split(',').map(x => x.trim()).filter(Boolean) });
+      toast(r.message ?? 'Saved to the library.');
+      return render();
+    }
+  } catch (ex) { toast(ex.message, true); render(); }
+});
+
 // ---------- router ----------
 async function render() {
+  if (POLL) { clearInterval(POLL); POLL = null; }
   if (!TOKEN) {
     app.innerHTML = `<div id="login">
       <div class="mark">letena<b>.</b>os</div>

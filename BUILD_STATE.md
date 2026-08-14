@@ -1,9 +1,63 @@
 # BUILD_STATE — Letena Content OS
 
-Authoritative resume point. Updated 2026-08-14 (Run Two), working directly
-against Nate's Mac checkout (/Users/natezewdu/Desktop/lcos, device bridge),
-branch main. The sections below this one are the earlier resume points,
-left as history.
+Authoritative resume point. Updated 2026-08-14 (Run Three, Part 2: the
+guided flow), working against Nate's Mac checkout
+(/Users/natezewdu/Desktop/lcos, device bridge), branch main. The sections
+below this one are the earlier resume points, left as history.
+
+UNIFIED CONTENT MACHINE, RUN THREE (Part 2, the guided flow), 14 Aug 2026.
+The experience on top of the Run One/Two engine, verified against Postgres
+16 + pgvector: migrations 0001-0025 apply cleanly and the suite passes
+237/237 with MOCK AI (the 16 new tests are apps/api/test/part2_flow.test.mjs).
+- Migration 0025: asset kinds BACKGROUND / TEXTURE / CHARACTER_REFERENCE /
+  BRAND_ELEMENT / SOURCE_RECORDING; production_jobs.video_engine (KLING or
+  VEO; NULL resolves to the production.video_engine setting at run time),
+  production_jobs.subtitle_preset (+ per-format defaults on
+  content_formats), production_jobs.plan jsonb (chosen asset bindings);
+  lcos.live_transcripts (aua_recap's transcript confirmation: DRAFT until a
+  human confirms; editing a CONFIRMED one reverts it);
+  content_concepts.transcript_id; settings production.video_engine and
+  production.cost_estimates (zero = self-hosted = shown as included).
+- Backend, narrow additions the flow needed: GET /production/plan/:scriptId
+  (steps, honest costs, engine/voice/subtitle options, per-scene library
+  matches, spend vs caps); POST /production/jobs/:id/plan; GET
+  /production/spend-today; GET /production/progress (plain-language state +
+  next action per job); daily render cap refuses politely in
+  runProductionJob BEFORE spending (job stays QUEUED); chosen bindings win
+  over the automatic pgvector search at run time; POST
+  /content/scripts/:id/regenerate (steerable, new version, conservative
+  medical reset via invalidateMedicalSignoff, revalidates); transcripts
+  module (paste / upload / Gemini transcribe / confirm; generateContent
+  refuses aua_recap without a CONFIRMED transcript; transcript rides into
+  the writer, pre-checked for PII with a plain fix message); GET
+  /pipeline/gate-signers (role-scoped gate visibility); GET
+  /production/assets grew filters + tags + mime for previews; activate
+  accepts title/tags/kind (MEDICAL_ILLUSTRATION reclass refused);
+  /api/v1/media/* streams stored files with a ?token= JWT (img/video tags
+  cannot send headers); veo adapter + videoEngine() slot;
+  gemini.transcribeAudio.
+- Frontend (apps/web, same no-build vanilla idiom): Board (morning screen,
+  by stage, blocked-first, waiting-on-whom); Make (step 1 wizard: topic +
+  demand, formats by surface, audience, production path, what-happens-next
+  preview, then per-piece progress with NEEDS_KNOWLEDGE rendered as an
+  honest stop, never a failure); the piece screen rebuilt (approval
+  sequence stepper, inline editing of every body kind, save tells Girum in
+  plain language whether the edit was medical or style-only, steerable
+  single-piece regenerate, claim map beside the copy, gates panel with
+  role-scoped advance); Amharic review (three columns: English, editable
+  Amharic, blind back-translation with divergence marked; drift in words);
+  production plan screen (steps + costs, included vs metered, engine and
+  voice and subtitle-preset choice with Amharic samples, per-scene library
+  binding with generate-as-fallback, spend meters, polite cap hold);
+  production progress (5s poll, plain-language explanations, retry);
+  asset library as a browsable grid (thumbnails, hover-play video, audio
+  players, filters, one-click save-to-library, honesty note about mock
+  embeddings); transcripts screens. Ethiopic font stack + Noto Sans
+  Ethiopic webfont; new screens work at phone width (board scrolls by
+  column, three-way Amharic stacks).
+- Still true: clinical review toggle stays OFF for testing (owner ruling),
+  publish still requires the signed medical_review gate for every format;
+  the toggle must go back ON before real publishing.
 
 UNIFIED CONTENT MACHINE, RUN TWO (Part 1 corrections), 14 Aug 2026. Owner
 feedback applied to Run One, verified against a real Postgres 16 + pgvector

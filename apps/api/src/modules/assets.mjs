@@ -61,6 +61,7 @@ export default async function routes(app) {
       const v = toVectorLiteral(await embed(semantic));
       rows = (await q(
         `SELECT a.id, a.code, a.title, a.kind, a.origin, a.is_ai_generated, a.clinically_approved,
+                a.storage_key, a.mime_type,
                 1 - (a.embedding <=> $1::vector) AS similarity
          FROM lcos.assets a WHERE a.is_active AND a.embedding IS NOT NULL
            AND ($2::text IS NULL OR a.kind=$2::lcos.asset_kind)
@@ -132,13 +133,38 @@ export default async function routes(app) {
     return reply.code(201).send({ ...a, review: 'queued for producer approval; inactive until approved' });
   });
 
+  // Activate = "save to the library". One click from wherever the asset
+  // appeared (Part 2, 14 Aug 2026: "An asset that is awkward to save does
+  // not get saved, and then it gets regenerated and paid for twice"), so
+  // the click can carry a proper title and tags in the same action instead
+  // of a second screen. This IS the producer review completing: activating
+  // a generated asset closes its review task.
   app.post('/production/assets/:id/activate', { preHandler: requirePerm('asset.manage') }, async (req, reply) => {
-    const a = await one(`UPDATE lcos.assets SET is_active=true WHERE id=$1 RETURNING *`, [req.params.id]);
+    const { title, tags = [], kind } = req.body ?? {};
+    if (kind != null && kind === 'MEDICAL_ILLUSTRATION') {
+      // Reclassifying an arbitrary asset into the clinically gated kind at
+      // save time would route around the clinical approval flag.
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        'Medical illustrations enter the library through clinical review, not a save-time reclassification.',
+        { guard: 'noMedicalIllustrationReclass' }));
+    }
+    const a = await one(
+      `UPDATE lcos.assets SET is_active=true,
+         title = COALESCE(NULLIF($2, ''), title),
+         kind = COALESCE($3::lcos.asset_kind, kind)
+       WHERE id=$1 RETURNING *`, [req.params.id, title ?? '', kind ?? null]);
     if (!a) return reply.code(404).send(err(404, 'NOT_FOUND', 'asset'));
+    for (const t of Array.isArray(tags) ? tags : []) {
+      const [ns, val] = String(t).includes(':') ? String(t).split(':', 2) : ['general', t];
+      if (!String(val ?? '').trim()) continue;
+      await q(`INSERT INTO lcos.asset_tags (asset_id, namespace, value, tagged_by)
+               VALUES ($1,$2,$3,'HUMAN') ON CONFLICT DO NOTHING`, [a.id, ns, val]);
+    }
     await q(`UPDATE lcos.review_tasks SET status='COMPLETED', completed_at=now(), assigned_to=$2
              WHERE object_type='ASSET' AND object_id=$1 AND status IN ('OPEN','IN_PROGRESS')`,
       [a.id, req.actor.id]);
-    await audit(null, { actor: req.actor, action: 'asset.activate', objectType: 'ASSET', objectId: a.id });
-    return a;
+    await audit(null, { actor: req.actor, action: 'asset.activate', objectType: 'ASSET', objectId: a.id,
+      objectCode: a.code, reason: `saved to library${title ? ` as "${title}"` : ''}` });
+    return { ...a, message: `Saved to the library${title ? ` as "${title}"` : ''}. It is now findable in search and bindable in production plans.` };
   });
 }

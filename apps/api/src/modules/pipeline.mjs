@@ -149,6 +149,21 @@ export default async function routes(app) {
     return { stages, stage_order: STAGES, total: rows.length };
   });
 
+  // Who signs what, for the UI (Part 2, 14 Aug 2026: "Show a user only the
+  // gates their role signs, plus admin override marked as an override").
+  // Roles only, resolved at runtime; never a person's name in code or copy.
+  // For the current actor, mine[] is the list of gates they sign in a
+  // declared role, and admin_override says whether their signature on
+  // anything else would be recorded as an override.
+  app.get('/pipeline/gate-signers', { preHandler: requirePerm('script.read') }, async (req) => {
+    const mine = Object.keys(GATE_SIGNERS).filter((g) => {
+      const role = signerRoleFor(req.actor, g);
+      return role && role !== 'admin_override';
+    });
+    return { gates: GATE_SIGNERS, mine,
+      admin_override: !!req.actor?.roles?.includes('admin') };
+  });
+
   // Sign a gate. Idempotent per (script, gate): the first signature stands.
   app.post('/pipeline/scripts/:id/gates/:gate', async (req, reply) => {
     const gate = String(req.params.gate);

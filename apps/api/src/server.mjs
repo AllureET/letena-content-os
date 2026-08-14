@@ -17,6 +17,7 @@ import experiments from './modules/experiments.mjs';
 import voice from './modules/voice.mjs';
 import platformSpecs from './modules/platform_specs.mjs';
 import pipeline from './modules/pipeline.mjs';
+import transcripts from './modules/transcripts.mjs';
 
 export async function buildServer() {
   const app = Fastify({ logger: process.env.NODE_ENV !== 'test',
@@ -86,6 +87,37 @@ export async function buildServer() {
     return reply.redirect('/#sso=' + lcosJwt);
   });
 
+  // Authenticated media streaming for the asset library and render previews
+  // (Part 2, 14 Aug 2026). The storage adapter's url() returns file:// paths
+  // that a browser cannot open, which is the whole reason the existing
+  // asset screen was "a text table with no pictures". <img>/<video>/<audio>
+  // tags cannot send an Authorization header, so this route accepts the
+  // session JWT as ?token= and verifies it itself (the auth hook in
+  // core.mjs skips /api/v1/media/ for exactly this reason). Path traversal
+  // is refused by resolving against the storage root.
+  app.get('/api/v1/media/*', async (req, reply) => {
+    const jwtLib = (await import('jsonwebtoken')).default;
+    const { JWT_SECRET } = await import('./core.mjs');
+    const nodePath = await import('node:path');
+    const fs = await import('node:fs');
+    const token = String(req.query?.token ?? (req.headers.authorization ?? '').replace(/^Bearer /, ''));
+    try { jwtLib.verify(token, JWT_SECRET); }
+    catch { return reply.code(401).send(err(401, 'UNAUTHENTICATED', 'valid token required for media')); }
+    const store = process.env.LCOS_STORAGE_DIR || '/tmp/lcos-storage';
+    const key = String(req.params['*'] ?? '');
+    const full = nodePath.resolve(store, key);
+    if (!full.startsWith(nodePath.resolve(store) + nodePath.sep) || !fs.existsSync(full)
+        || !fs.statSync(full).isFile()) {
+      return reply.code(404).send(err(404, 'NOT_FOUND', 'media'));
+    }
+    const types = { mp4: 'video/mp4', webm: 'video/webm', png: 'image/png', jpg: 'image/jpeg',
+      jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+      mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', json: 'application/json' };
+    const ext = full.split('.').pop().toLowerCase();
+    reply.type(types[ext] ?? 'application/octet-stream');
+    return reply.send(fs.createReadStream(full));
+  });
+
   app.post('/api/v1/auth/login', async (req, reply) => {
     const { email, password, totp } = req.body ?? {};
     if (!email || !password) return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'email and password required'));
@@ -109,6 +141,7 @@ export async function buildServer() {
     await v1.register(voice);
     await v1.register(platformSpecs);
     await v1.register(pipeline);
+    await v1.register(transcripts);
 
     // TOTP enrolment (any authenticated user, own account only)
     v1.post('/auth/totp/enroll', async (req) => {

@@ -177,7 +177,15 @@ test('quiz formats require the giveaway mechanic and keep it non-clinical and un
 });
 
 test('aua_recap requires exactly four cutdown briefs; aua_live is the run of show', async () => {
-  const { v } = await genOne('aua_recap');
+  // The recap generates from the live's transcript, and only a CONFIRMED
+  // one (Part 2, 14 Aug 2026): create, confirm, then generate.
+  const created = await call('POST', '/api/v1/content/transcripts', tokens.admin,
+    { title: 'part1 recap fixture', transcript_text: '[00:05] Postpill works within 72 hours.' });
+  assert.equal(created.statusCode, 201, created.body);
+  const transcriptId = created.json().id;
+  const confirmed = await call('POST', `/api/v1/content/transcripts/${transcriptId}/confirm`, tokens.admin);
+  assert.equal(confirmed.statusCode, 200, confirmed.body);
+  const { v } = await genOne('aua_recap', { transcript_id: transcriptId });
   assert.equal(v.format, 'VIDEO');
   assert.equal(v.body.cutdown_briefs.length, 4);
   const live = await genOne('aua_live');

@@ -74,7 +74,19 @@ export default async function routes(app) {
       [s.id, s.current_version])).rows;
     const translation = await one(
       `SELECT * FROM lcos.translations WHERE object_type='SCRIPT' AND object_id=$1 AND language='AM'`, [s.id]);
-    return { ...s, version, claim_map: claimMap, findings, translation };
+    // The guided flow (Part 2, 14 Aug 2026) shows the whole approval
+    // sequence on one screen, so the detail response carries what the
+    // stepper needs: the signed gates, and the format row's label, body
+    // kind and stage list. Girum should never have to ask what happens
+    // next or who is waiting on what.
+    const gates = (await q(
+      `SELECT gate, signed_role, note, signed_at FROM lcos.script_gates WHERE script_id=$1`, [s.id])).rows;
+    const fmtRow = await formatRowForScript(s.id);
+    return { ...s, version, claim_map: claimMap, findings, translation, gates,
+      format_info: fmtRow ? { code: fmtRow.code, label: fmtRow.label, body_kind: fmtRow.body_kind,
+        surface: fmtRow.surface, platforms: fmtRow.platforms, stages_applicable: fmtRow.stages_applicable,
+        production_paths: fmtRow.production_paths, is_internal: fmtRow.is_internal,
+        subtitle_preset: fmtRow.subtitle_preset, video_engine: fmtRow.video_engine } : null };
   });
   app.post('/content/scripts/:id/transition', async (req, reply) => {
     try {
@@ -317,7 +329,7 @@ export default async function routes(app) {
       `SELECT code, label, kind, surface, platforms, language_mode, body_kind, video_family,
               headings, rules, body_schema, stages_applicable, review_ladder, target_length,
               hedging_allowed, wants_captions, ends_at_door, is_internal, sort_order, description,
-              comment_prompt_allowed, production_paths, cta_spec
+              comment_prompt_allowed, production_paths, cta_spec, subtitle_preset, video_engine
        FROM lcos.content_formats WHERE is_active ORDER BY sort_order`);
     return { items: r.rows };
   });
@@ -429,9 +441,93 @@ export default async function routes(app) {
       edit_class: editClass.medical ? 'MEDICAL' : 'NON_MEDICAL', edit_reasons: editClass.reasons,
       medical_signoff_invalidated: invalidated, style_warnings: styleWarnings };
   });
+  // Regenerate ONE piece, steerable (Part 2, owner brief, 14 Aug 2026:
+  // "Regenerate one piece, not the whole run, and let him steer it:
+  // shorter, different angle, less clinical, more direct, warmer"). The
+  // steer is free text, passed to the writer as direction. The rewrite
+  // lands as a NEW VERSION of the same script, so nothing downstream loses
+  // its thread. A regeneration replaces the whole body, so by the
+  // conservative edit rule it is a medical change: the medical sign-off is
+  // withdrawn, validation reruns, and the piece returns to review. A false
+  // re-review costs a click; a false pass ships unreviewed medical content.
+  app.post('/content/scripts/:id/regenerate', { preHandler: requirePerm('script.write') }, async (req, reply) => {
+    const direction = String(req.body?.direction ?? '').trim() || null;
+    const s = await one(`SELECT * FROM lcos.scripts WHERE id=$1`, [req.params.id]);
+    if (!s) return reply.code(404).send(err(404, 'NOT_FOUND', 'script'));
+    const concept = await one(`SELECT * FROM lcos.content_concepts WHERE id=$1`, [s.concept_id]);
+    const family = await one(`SELECT * FROM lcos.content_families WHERE id=$1`, [s.family_id]);
+    const card = await one(`SELECT kc.*, t.code AS topic_code FROM lcos.knowledge_cards kc
+                            JOIN lcos.topics t ON t.id=kc.topic_id WHERE kc.id=$1`,
+      [family.knowledge_card_id]);
+    const cardVersion = await one(`SELECT * FROM lcos.knowledge_card_versions WHERE id=$1`,
+      [family.knowledge_card_version_id]);
+    // Same claims basis as validateScript: test-mode scripts regenerate
+    // from what they were written from, not a stricter filter that would
+    // fail every statement on a mismatch.
+    const claims = (await q(
+      `SELECT mc.id, mc.code, mc.claim_text_en, mc.claim_type, mc.certainty FROM lcos.knowledge_card_claims kcc
+       JOIN lcos.medical_claims mc ON mc.id=kcc.claim_id
+       WHERE kcc.card_id=$1 AND (
+         ($2::boolean AND mc.status <> 'RETIRED') OR (NOT $2::boolean AND mc.status='APPROVED')
+       )`, [family.knowledge_card_id, s.is_test_content])).rows;
+    try {
+      const { out, fmtRow, bodyKind, stayEnglish, effectiveTone } = await writeBodyForConcept({
+        concept, card, cardVersion, claims, tonePreset: req.body?.tone_preset ?? null, direction });
+      if (out.result === 'NEEDS_KNOWLEDGE') {
+        // Still a success: the writer refused to invent a fact.
+        await q(`UPDATE lcos.scripts SET status='NEEDS_KNOWLEDGE', needs_knowledge_note=$2 WHERE id=$1`,
+          [s.id, JSON.stringify(out.needs_knowledge)]);
+        await audit(null, { actor: req.actor, action: 'script.regenerated', objectType: 'SCRIPT',
+          objectId: s.id, objectCode: s.code, reason: `NEEDS_KNOWLEDGE${direction ? `; steer: ${direction}` : ''}` });
+        return { script_id: s.id, status: 'NEEDS_KNOWLEDGE', needs_knowledge: out.needs_knowledge };
+      }
+      const sc = out.script;
+      requireFormatBody(fmtRow, sc);
+      const bodyText = bodyTextOf(sc);
+      const bodyHash = sha(bodyText);
+      const styleWarnings = lintStyle([bodyText, sc.caption].filter(Boolean).join('\n'),
+        { hedgingAllowed: !!fmtRow?.hedging_allowed,
+          commentPromptAllowed: fmtRow ? !!fmtRow.comment_prompt_allowed : true, stayEnglish });
+      const nv = s.current_version + 1;
+      await q(
+        `INSERT INTO lcos.script_versions (script_id, version, hook, spoken_script, onscreen_text,
+           scene_plan, cta, caption, hashtags, platform_variants, estimated_duration_s, content_sha256,
+           created_by, tone_preset, style_warnings, format, carousel_slides, static_graphic, post_text,
+           body, captions_by_platform, change_summary)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+        [s.id, nv, sc.hook, sc.spoken_script ?? '', JSON.stringify(sc.onscreen_text ?? []),
+         JSON.stringify(sc.scene_plan ?? []), sc.cta, sc.caption ?? null, sc.hashtags ?? [],
+         JSON.stringify(sc.platform_variants ?? {}), sc.estimated_duration_s ?? null, bodyHash,
+         req.actor.id, effectiveTone, JSON.stringify(styleWarnings),
+         sc.format ?? bodyKind ?? 'VIDEO', JSON.stringify(sc.carousel_slides ?? []),
+         sc.static_graphic ? JSON.stringify(sc.static_graphic) : null, sc.post_text ?? null,
+         JSON.stringify(sc.body ?? {}), JSON.stringify(sc.captions ?? {}),
+         `regenerated${direction ? `: ${direction}` : ''}`]);
+      for (const m of sc.claim_map ?? []) {
+        await q(`INSERT INTO lcos.script_claims (script_id, script_version, claim_id, statement, location)
+                 VALUES ($1,$2,$3,$4,$5)`, [s.id, nv, m.claim_id, m.statement, m.location]);
+      }
+      await q(`UPDATE lcos.scripts SET current_version=$2, content_sha256=$3 WHERE id=$1`, [s.id, nv, bodyHash]);
+      await invalidateMedicalSignoff(s.id, { actor: req.actor,
+        reason: `regenerated${direction ? ` with steer: ${direction}` : ''}; whole body replaced` });
+      const validation = await validateScript(s.id, { actor: req.actor });
+      await audit(null, { actor: req.actor, action: 'script.regenerated', objectType: 'SCRIPT',
+        objectId: s.id, objectCode: s.code,
+        reason: `v${nv}${direction ? `; steer: ${direction}` : ''}; validation ${validation.overall_result}` });
+      return { script_id: s.id, version: nv, status: 'REGENERATED',
+        validation_result: validation.overall_result, findings: validation.findings.length,
+        style_warnings: styleWarnings, direction_used: direction,
+        note: 'The rewrite replaced the whole body, so medical review starts over for this piece. The Amharic, if any, must be rewritten from the new English after approval.' };
+    } catch (e) {
+      const status = e.status ?? 500;
+      if (status >= 500) req.log.error(e);
+      return reply.code(status).send(err(status, e.code ?? 'PIPELINE_ERROR', e.message, e.guard ? { guard: e.guard } : {}));
+    }
+  });
+
   app.post('/content/generate', { preHandler: requirePerm('question.turn_into_content') }, async (req, reply) => {
     const { card_id, concept_id, output_types, formats, question_id, languages = ['EN', 'AM'],
-      tone_preset = null, audience = 'WOMEN', is_brand_tier = false } = req.body ?? {};
+      tone_preset = null, audience = 'WOMEN', is_brand_tier = false, transcript_id = null } = req.body ?? {};
     if (!card_id && !concept_id) {
       return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'card_id (topic) or concept_id is required'));
     }
@@ -442,7 +538,7 @@ export default async function routes(app) {
       const result = await generateContent({ cardId: card_id, conceptId: concept_id,
         outputTypes: output_types, formatCodes: formats, questionId: question_id,
         languages, actor: req.actor, tonePreset: tone_preset, audience,
-        isBrandTier: !!is_brand_tier });
+        isBrandTier: !!is_brand_tier, transcriptId: transcript_id });
       return reply.code(202).send(result);
     } catch (e) {
       const status = e.status ?? 500;
@@ -660,7 +756,7 @@ async function processGeneratedScript(s, family, languages, actor, step, tonePre
 // turn-into-content: falls back to the content.tone_preset setting.
 export async function generateContent({ cardId, conceptId, outputTypes, formatCodes = null,
     questionId, languages = ['EN', 'AM'], actor, tonePreset = null, audience = 'WOMEN',
-    isBrandTier = false }) {
+    isBrandTier = false, transcriptId = null }) {
   const steps = [];
   const step = (name, status, extra = {}) => { steps.push({ step: name, status, ...extra }); };
   const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
@@ -725,6 +821,25 @@ export async function generateContent({ cardId, conceptId, outputTypes, formatCo
     }
   }
 
+  // aua_recap transcribes a recorded live before it generates anything
+  // (Part 2, 14 Aug 2026). Amharic machine transcription is unreliable and
+  // carries medical statements a doctor said out loud, so generation REFUSES
+  // to run without a transcript a human has confirmed on screen. Fails
+  // closed, with the fix named plainly.
+  let transcript = null;
+  if (types.some(t => t.format_code === 'aua_recap')) {
+    if (!transcriptId) {
+      const e = new Error('An AUA recap generates from the transcript of the live. Create and confirm the transcript first (Content > Transcripts), then pass transcript_id.');
+      e.status = 422; e.code = 'GUARD_FAILED'; e.guard = 'transcriptRequired'; throw e;
+    }
+    transcript = await one(`SELECT * FROM lcos.live_transcripts WHERE id=$1`, [transcriptId]);
+    if (!transcript) { const e = new Error('transcript not found'); e.status = 404; e.code = 'NOT_FOUND'; throw e; }
+    if (transcript.status !== 'CONFIRMED') {
+      const e = new Error(`Transcript ${transcript.code} is still DRAFT. It is machine transcription of Amharic and a human must confirm it before anything generates from it.`);
+      e.status = 422; e.code = 'GUARD_FAILED'; e.guard = 'transcriptConfirmed'; throw e;
+    }
+  }
+
   const segment = await one(`SELECT * FROM lcos.audience_segments WHERE slug='general_public'`);
   const riskTier = computeRiskTier({ cardTiers: [card.risk_tier],
     claimTypes: claims.map(c => c.claim_type), topicCodes: [card.topic_code] });
@@ -749,14 +864,19 @@ export async function generateContent({ cardId, conceptId, outputTypes, formatCo
     else if (tl && tl.unit === 'minutes') dur = Math.min(600, (Number(tl.max ?? tl.target ?? 1) || 1) * 60);
     const row = await one(
       `INSERT INTO lcos.content_concepts (code, family_id, video_family, format_code, title, hook_line, premise,
-         treatment, claim_ids_referenced, target_duration_s, cta_intent, why_this_works, status, audience)
-       VALUES ($1,$2,$3::lcos.video_family,$4,$5,$6,$7,$8,$9::uuid[],$10,$11,$12,'SELECTED',$13) RETURNING *`,
+         treatment, claim_ids_referenced, target_duration_s, cta_intent, why_this_works, status, audience,
+         transcript_id)
+       VALUES ($1,$2,$3::lcos.video_family,$4,$5,$6,$7,$8,$9::uuid[],$10,$11,$12,'SELECTED',$13,$14) RETURNING *`,
       [code('CC'), family.id, t.video_family, t.format_code,
        `${t.label}: ${card.canonical_question_en.slice(0, 70)}`,
        card.canonical_question_en, t.description ?? `Direct answer using ${card.code}.`,
        `Format: ${t.label}${t.platform ? ` (${t.platform})` : ''}. ${t.description ?? ''}`.trim(),
        claims.map(c => c.id), dur, 'private telegram consult',
-       `Targeted generation request for ${t.format_code ? 'format' : 'output type'} ${t.code}.`, audience]);
+       `Targeted generation request for ${t.format_code ? 'format' : 'output type'} ${t.code}.`, audience,
+       // The concept remembers which confirmed transcript its recap came
+       // from, so a lifted medical statement is traceable to what the
+       // doctor actually said.
+       t.format_code === 'aua_recap' ? transcript?.id ?? null : null]);
     conceptRows.push(row);
   }
   step('create_concepts', 'SUCCEEDED', { count: conceptRows.length, output_types: types.map(t => t.code) });
@@ -932,8 +1052,12 @@ export function requireFormatBody(fmtRow, sc) {
   }
 }
 
-export async function generateScript({ concept, family, card, cardVersion, claims, actor, seedUnsupported = false,
-    isTestContent = false, tonePreset = null, isBrandTier = false }) {
+// The writer call for one concept, shared by first generation and by
+// single-piece regeneration (Part 2, 14 Aug 2026: "Regenerate one piece,
+// not the whole run, and let him steer it"). Returns the writer output plus
+// the format context the caller needs to store or version the body.
+export async function writeBodyForConcept({ concept, card, cardVersion, claims,
+    tonePreset = null, seedUnsupported = false, direction = null }) {
   const effectiveTone = tonePreset || String(await setting('content.tone_preset', 'LETENA_DEFAULT'));
   // Registry-driven generation (Run One, 14 Aug 2026). When the concept
   // carries a format_code, lcos.content_formats is the authority for what
@@ -983,7 +1107,33 @@ export async function generateScript({ concept, family, card, cardVersion, claim
   // the outbound PII assertion; the blocks ride verbatim in the prompt).
   const stayEnglish = await stayEnglishTerms();
   const audience = AUDIENCES.includes(concept.audience) ? concept.audience : 'WOMEN';
+  // aua_recap: the confirmed transcript of the live rides into the writer,
+  // so the recap quotes what the doctor actually said instead of inventing
+  // a live that never happened. Guarded before the agent call: if the
+  // transcript still carries an identifying pattern, this is a hard stop
+  // with a plain fix, not a mysterious BLOCKED_PII from the gateway.
+  let liveTranscript;
+  if (concept.transcript_id) {
+    const t = await one(`SELECT * FROM lcos.live_transcripts WHERE id=$1 AND status='CONFIRMED'`,
+      [concept.transcript_id]);
+    if (!t) {
+      const e = new Error('The transcript this recap was planned from is no longer confirmed. Re-confirm it (Content > Transcripts), then regenerate.');
+      e.status = 422; e.code = 'GUARD_FAILED'; e.guard = 'transcriptConfirmed'; throw e;
+    }
+    const flat = (t.segments ?? []).map(s => s.text).join(' ');
+    if (containsForbidden(flat)) {
+      const e = new Error(`Transcript ${t.code} still carries an identifying pattern (a phone number, handle or name). Redact it on the transcript screen before generating.`);
+      e.status = 422; e.code = 'GUARD_FAILED'; e.guard = 'transcriptDeidentified'; throw e;
+    }
+    liveTranscript = (t.segments ?? []).map(s =>
+      ({ start_s: s.start_s, end_s: s.end_s, speaker: s.speaker, text: s.text }));
+  }
   const out = await invokeAgent('script_writer', {
+    // Free-text steer from single-piece regeneration (Part 2: "shorter,
+    // different angle, less clinical, more direct, warmer"). Passed to the
+    // writer as direction; absent on first generation.
+    regeneration_direction: direction || undefined,
+    live_transcript: liveTranscript,
     hook_line: concept.hook_line, video_family: concept.video_family,
     hook_line_is_placeholder: hookLineIsPlaceholder,
     treatment: concept.treatment,
@@ -1008,6 +1158,13 @@ export async function generateScript({ concept, family, card, cardVersion, claim
     claims: claims.map(c => ({ id: c.id, code: c.code, claim_text_en: c.claim_text_en, certainty: c.certainty })),
     __seed_unsupported: seedUnsupported || undefined,
   }, { objectType: 'CONCEPT', objectId: concept.id, workflowCode: 'WF07', tone_preset: effectiveTone });
+  return { out, fmtRow, bodyKind, stayEnglish, effectiveTone };
+}
+
+export async function generateScript({ concept, family, card, cardVersion, claims, actor, seedUnsupported = false,
+    isTestContent = false, tonePreset = null, isBrandTier = false, direction = null }) {
+  const { out, fmtRow, bodyKind, stayEnglish, effectiveTone } = await writeBodyForConcept({
+    concept, card, cardVersion, claims, tonePreset, seedUnsupported, direction });
 
   // Abortion-adjacent detection, ported from letenav2 content_board.php.
   // Substring detection over the piece's identity text OR the tier-4 topic

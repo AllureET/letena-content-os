@@ -31,17 +31,33 @@ NULLS NOT DISTINCT plus a one-time dedupe (migration 0011). And
 classify-pending now runs automatically every 5 minutes, so the backlog
 clears without anyone needing a browser tab open.
 
-Real gap found and flagged, NOT fixed yet: cron_lcos_export_inquiries.php
-on the EMR side guesses at table names (consult_message,
-clarification_threads, answers) that do not exist anywhere in the live
-emr_v2 codebase, so it silently falls back to exporting the opening message
-alone for every written/chat consult reaching LCOS today. The classifier
-can now use a full thread when it has one; almost none of today's live
-traffic actually supplies one. This is exactly the EMR full-inquiry
-exporter v2 work already on the next-tasks list below (needs the real
-unified_inbox join, not a guessed table name), and it is now the concrete
-reason single-message classification is still the common case in practice,
-not a data-availability problem on the LCOS side.
+EMR EXPORTER FIXED FOR REAL 14 Aug 2026 (letenav2 commit 3d4d747, local main,
+NOT pushed yet -- Nate needs to run the push himself). The gap below was
+flagged but the first pass at fixing it (13-14 Aug, letenav2 commits 5d4c305
+through 9ad97bd) still read from `questions`/`answers`, which turned out to
+be the OLD write path (live `questions` table holds 9 rows total). Traced
+lib/consult.php end to end: the live doctor workspace and the coordinator's
+inbox reply both write every message, patient inbound and doctor outbound,
+into `consult_message` (letena_consult_add_inbound() / letena_consult_respond()).
+cron_lcos_export_inquiries.php now reads consult_message FIRST for every
+consult (opening = first inbound row, answer_text = last outbound row,
+everything else rides in thread with role patient/doctor), keeping the
+questions/answers-plus-letenaet_complete path as a fallback only for older
+consults with no consult_message rows. No LCOS-side change needed --
+migration 0004's thread/answer_text/consult_mode columns and the ingest
+contract already cover this shape; verified against demand.mjs's
+THREAD_ROLES/THREAD_KEYS/MAX_THREAD_SEGMENTS and the HMAC-over-raw-bytes
+check, both unchanged and both already compatible. php -l clean. Once Nate
+pushes letenav2 main, the classifier should start seeing real multi-turn
+threads on live traffic within one export cycle.
+
+Original gap (context, now fixed as of the paragraph above):
+cron_lcos_export_inquiries.php on the EMR side guessed at table names
+(consult_message, clarification_threads, answers) that did not exist
+anywhere in the live emr_v2 codebase, so it silently fell back to exporting
+the opening message alone for every written/chat consult reaching LCOS. The
+classifier can use a full thread when it has one; almost none of the traffic
+up to 14 Aug actually supplied one.
 
 BULK GENERATION SHIPPED 2026-08-12 (Nate decision: "I don't want to have to
 approve knowledge cards anymore... generate content automatically... human
@@ -409,10 +425,11 @@ claims, reviewer) → analytics (honest nulls) → scores → demand recompute.
    blocker; bulk generation + the 13-14 Aug stability fixes above are what
    actually made it usable end to end.
 2. English-first UI + drill-downs + ui-ux-pro-max pass (pivot items 2-4).
-3. EMR full-inquiry exporter v2 (pivot item 5) — now higher priority than
-   it looks on this list: it is the fix for the guessed-table-names gap
-   flagged just above, which is currently the main reason the classifier
-   is starved of thread context on live traffic.
+3. DONE 14 Aug 2026 — EMR full-inquiry exporter v2 (pivot item 5): fixed
+   for real (see the paragraph near the top of this file), reads
+   consult_message as the primary thread source. Committed locally in
+   letenav2 (3d4d747); needs Nate to push before it takes effect on live
+   traffic.
 4. WF12-style asset binding in the production router: search library for
    scene_plan asset_requirements and bind storage keys into the Creatomate
    payload (currently typography-only modifications ship)

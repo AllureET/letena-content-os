@@ -146,7 +146,7 @@ export default async function routes(app) {
        ORDER BY r.created_at DESC LIMIT 100`)).rows
       .map(r => ({ ...r, download_url: r.storage_key ? storage.url(r.storage_key) : null }));
     const recent = (await q(
-      `SELECT pc.id, pc.platform, pc.published_at, pc.permalink, cf.code AS family_code
+      `SELECT pc.id, pc.platform, pc.published_at, pc.platform_url, cf.code AS family_code
        FROM lcos.published_content pc JOIN lcos.content_families cf ON cf.id=pc.family_id
        ORDER BY pc.published_at DESC LIMIT 20`)).rows;
     return { awaiting_approval: awaiting, to_produce: toProduce, to_publish: toPublish, recent };

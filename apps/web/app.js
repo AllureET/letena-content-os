@@ -190,6 +190,32 @@ function flowStepper(s) {
   }).join('<span class="farrow">&rarr;</span>')}</div>`;
 }
 
+// Everything in flight, by stage, showing what is waiting on whom. Blocked
+// items surface first inside each stage. Every card names its next action;
+// nothing here is a dead end. Extracted 15 Aug 2026 so the merged Today
+// screen and the #/board alias render the identical thing from one place.
+function boardHtml(b) {
+  const blockedCount = Object.values(b.stages).flat().filter(x => !x.can_advance && x.advance_block !== 'This piece is at its final stage.').length;
+  const cols = b.stage_order.map(stage => {
+    const items = [...(b.stages[stage] ?? [])].sort((x, y) => Number(x.can_advance) - Number(y.can_advance));
+    if (!items.length) return '';
+    return `<div class="bcol"><div class="bhead">${esc(stage.replace(/_/g, ' '))} <span class="muted">${items.length}</span></div>
+      ${items.map(x => `<div class="bitem ${!x.can_advance ? 'blocked' : ''}" data-nav="script/${esc(x.id)}" tabindex="0" role="link">
+        <div class="flex"><span class="mono" style="font-size:11px">${esc(x.code)}</span>
+          ${pill(x.risk_tier)}${x.needs_clinical_signoff ? '<span class="pill p-TIER_4"><span class="d"></span>clinical</span>' : ''}</div>
+        <div style="font-size:12.5px;margin:3px 0">${esc((x.title ?? '').slice(0, 70))}</div>
+        <div class="muted" style="font-size:11px">${esc(x.format_label ?? x.format_code ?? '')}</div>
+        <div style="font-size:11.5px;margin-top:5px;${x.can_advance ? 'color:var(--risk-routine)' : 'color:var(--risk-mod)'}">
+          ${x.can_advance
+            ? `Ready: next is ${esc((x.next_stage ?? '').replace(/_/g, ' '))}`
+            : esc(x.advance_block ?? '')}</div>
+      </div>`).join('')}</div>`;
+  }).join('');
+  return `<div class="eyebrow" style="margin-top:6px">The board</div>
+    <div class="sub" style="margin-top:-2px">Everything in flight. ${blockedCount ? `<b>${blockedCount} piece${blockedCount === 1 ? ' is' : 's are'} waiting on someone</b>, shown first in each column.` : 'Nothing is blocked right now.'} Click a card to open the piece.</div>
+    <div class="board">${cols || '<div class="card empty">Nothing in flight. Start on the Make screen.</div>'}</div>`;
+}
+
 // Drift, in words rather than a bare number. Thresholds mirror the
 // translation.drift_threshold setting (0.12 routes to a human).
 function driftWords(score) {
@@ -265,8 +291,15 @@ function versionEnglishText(v) {
 // same route that existed before, so screens.* are untouched, the router is
 // untouched, and every existing link, bookmark and data-nav drill-down
 // still resolves exactly as it did. This is grouping and labelling only.
+// Today and Board merged into one command-center screen 15 Aug 2026, per the
+// redesign's Phase 1 finding: they answer the same morning question ("what
+// should I make, is it any good, is it out yet") and splitting them into two
+// tabs made Girum check two screens for one answer. #/board keeps working
+// (bookmarks, the Make screen's post-generation link) as an alias to the
+// same merged render; see DETAIL_SECTION below for how it still lights the
+// right sidebar item.
 const SECTIONS = [
-  ['today',      'Today',      [['dashboard', 'Today'], ['board', 'Board']]],
+  ['today',      'Today',      [['dashboard', 'Today']]],
   ['plan',       'Plan',       [['demand', 'Demand'], ['make', 'Make content'], ['coverage', 'Gaps']]],
   ['questions',  'Questions',  [['questions', 'Inbox'], ['clusters', 'Clusters'],
                                 ['quarantine', 'Quarantine']]],
@@ -289,6 +322,7 @@ const SECTIONS = [
 const DETAIL_SECTION = {
   question: 'questions', card: 'knowledge', script: 'content', render: 'production',
   amharic: 'content', produce: 'production', transcript: 'content',
+  board: 'today',
 };
 
 // route id -> [sectionId, sectionLabel, tabs]
@@ -375,8 +409,14 @@ function shell(active, content) {
 
 // ---------- screens ----------
 const screens = {
+  // Today and Board, merged (15 Aug 2026): tiles as a compact strip up top,
+  // then the board as the main content, since both answer the same morning
+  // question. #/board renders through this same function; see boardHtml().
   async dashboard() {
-    const d = await api('GET', '/platform/dashboard');
+    const [d, b] = await Promise.all([
+      api('GET', '/platform/dashboard'),
+      api('GET', '/pipeline/board').catch(() => null),
+    ]);
     const tiles = [
       ['questions_24h', 'Questions, 24h', '#/questions'],
       ['quarantine', 'In quarantine', '#/quarantine', d.quarantine > 0 ? 'warn' : ''],
@@ -405,8 +445,9 @@ const screens = {
     } catch {}
     return `<h1>Today</h1><div class="sub">Operational picture across the whole pipeline</div>
       <div class="tiles">${tiles.map(([k, l, href, cls]) =>
-        `<div class="tile ${cls ?? ''}" role="link" tabindex="0" onclick="location.hash='${href.slice(1)}'">
+        `<div class="tile ${cls ?? ''}" role="link" tabindex="0" data-nav="${href.slice(2)}">
           <div class="n">${d[k]}</div><div class="l">${l}</div></div>`).join('')}</div>
+      ${b ? boardHtml(b) : ''}
       ${gapsHtml}`;
   },
 
@@ -504,7 +545,7 @@ const screens = {
     return `<h1>Question clusters</h1><div class="sub">Semantically similar questions, kept apart when answers differ. Click a matched cluster to open its card.</div>
       <div class="flex" style="margin-bottom:10px">
         ${can('cluster.manage') ? `<button id="classify-pending">Classify pending questions</button>
-        <select id="classify-limit" style="width:110px">
+        <select id="classify-limit" style="width:auto;min-width:140px">
           <option value="100">100 at a time</option>
           <option value="250">250 at a time</option>
           <option value="500">500 at a time</option>
@@ -603,7 +644,7 @@ const screens = {
                 <div class="flex" style="flex-wrap:wrap;row-gap:8px">
                   ${outputTypes.map(ot => `<label class="otpick">
                     <input type="checkbox" class="gen-ot-${esc(c.id)}" value="${esc(ot.code)}">
-                    ${esc(ot.label)} <span class="muted">${esc(ot.platform ?? '')}</span></label>`).join('')}
+                    ${esc(ot.label)}${ot.platform ? chan(ot.platform) : ''}</label>`).join('')}
                 </div>
                 <div style="margin-top:10px">
                   <button class="primary" data-plangenerate="${esc(c.id)}">Generate selected</button></div>
@@ -673,9 +714,9 @@ const screens = {
       genHtml = `<div class="card"><div class="eyebrow">Generate content from this card</div>
         <div class="sub" style="margin-bottom:10px">Pick exactly which output types to generate for this one topic, instead of the full four-output batch.${c.status !== 'APPROVED' ? ' This card is not yet APPROVED; generation will only work if an admin has turned on the test-mode override in Settings.' : ''}</div>
         <div class="flex" style="flex-wrap:wrap;row-gap:10px">
-          ${outputTypes.map(t => `<label style="display:flex;align-items:center;gap:6px;font-weight:400;margin:0;width:auto">
-            <input type="checkbox" value="${esc(t.code)}" class="gen-ot" style="width:auto">
-            ${esc(t.label)}${t.platform ? ` <span class="muted">(${esc(t.platform)})</span>` : ''}</label>`).join('')
+          ${outputTypes.map(t => `<label class="otpick">
+            <input type="checkbox" value="${esc(t.code)}" class="gen-ot">
+            ${esc(t.label)}${t.platform ? chan(t.platform) : ''}</label>`).join('')
             || '<span class="muted">No output types configured.</span>'}
         </div>
         <div style="margin-top:12px"><button class="primary" data-cardgenerate="${c.id}">Generate selected</button></div>
@@ -705,7 +746,8 @@ const screens = {
           ${v?.canonical_answer_am ? `<div class="eyebrow" style="margin-top:12px">Approved answer (AM)</div>
             <div class="amharic">${esc(v.canonical_answer_am)}</div>` : ''}</div>
         <div class="card"><div class="eyebrow">Guardrails</div>
-          <div class="kv"><b>Prohibited claims</b><br>${(v?.prohibited_claims ?? []).map(esc).join('<br>') || '<span class="muted">none recorded</span>'}
+          <div class="kv"><b>Prohibited claims</b><br>${(v?.prohibited_claims ?? [])
+            .map(p => (p && typeof p === 'object') ? esc(p.statement ?? JSON.stringify(p)) : esc(p)).join('<br>') || '<span class="muted">none recorded</span>'}
           <br><br><b>Approved CTAs</b><br>${(v?.approved_ctas ?? []).map(esc).join('<br>') || '<span class="muted">none recorded</span>'}</div></div>
       </div>
       <div class="card"><div class="eyebrow">Claims (${c.claims.length})</div>${claimHtml || '<span class="muted">No claims attached.</span>'}</div>
@@ -720,12 +762,19 @@ const screens = {
   async claims() {
     const r = await api('GET', '/knowledge/claims');
     return `<h1>Medical claims</h1><div class="sub">The atomic units of approved medical truth</div>
-      <div class="card"><table>
+      <div class="card">
+      <div class="flex" style="flex-wrap:wrap;gap:10px;margin-bottom:10px">
+        <input id="cl-filter" data-livefilter="cl-table" data-count-target="cl-count"
+          placeholder="filter by code, claim text, or topic" style="max-width:320px">
+        <span id="cl-count" class="muted">${r.items.length} of ${r.items.length} shown</span>
+      </div>
+      <table id="cl-table">
       <tr><th>Code</th><th>Claim</th><th>Topic</th><th>Type</th><th>Certainty</th><th>Status</th></tr>
-      ${r.items.map(c => `<tr><td class="mono"><b>${esc(c.code)}</b></td>
+      ${r.items.map(c => `<tr data-filter-item><td class="mono"><b>${esc(c.code)}</b></td>
         <td style="max-width:420px">${esc(c.claim_text_en)}</td>
         <td>${esc(c.topic_code)}</td><td class="muted">${esc(c.claim_type)}</td>
-        <td class="muted">${esc(c.certainty)}</td><td>${pill(c.status)}</td></tr>`).join('')}
+        <td class="muted">${esc(c.certainty)}</td><td>${pill(c.status)}</td></tr>`).join('')
+      || '<tr><td colspan=6 class="empty">No claims yet.</td></tr>'}
       </table></div>`;
   },
 
@@ -744,12 +793,25 @@ const screens = {
 
   async gaps() {
     const r = await api('GET', '/knowledge/needs-knowledge');
+    // needs_knowledge_note is a structured object ({blocking_reason,
+    // missing_facts:[{fact_needed,why}]}), but arrives from the API as a
+    // JSON string on at least this table; the old code called
+    // JSON.stringify on it regardless, which on a string just re-escapes
+    // it, producing a raw \"like\" \"this\" dump instead of readable text.
+    // Parse defensively and render the actual fields.
+    const noteText = (note) => {
+      let n = note;
+      if (typeof n === 'string') { try { n = JSON.parse(n); } catch { return n; } }
+      if (!n || typeof n !== 'object') return '';
+      const facts = (n.missing_facts ?? []).map(f => f.fact_needed || f.why).filter(Boolean).join('; ');
+      return [n.blocking_reason, facts].filter(Boolean).join(' — ');
+    };
     return `<h1>Knowledge gaps</h1>
       <div class="sub">Scripts stopped because a required fact has no approved claim. Each row is real demand the clinical team can answer.</div>
       <div class="card"><table><tr><th>Script</th><th>Card</th><th>Missing knowledge</th><th>When</th></tr>
       ${r.items.map(i => `<tr class="rowlink" data-nav="script/${esc(i.id)}" tabindex="0">
         <td class="mono">${esc(i.code)}</td><td class="mono">${esc(i.card_code)}</td>
-        <td style="max-width:420px" class="mono">${esc(JSON.stringify(i.needs_knowledge_note)?.slice(0, 220) ?? '')}</td>
+        <td style="max-width:420px">${esc(noteText(i.needs_knowledge_note))}</td>
         <td class="muted">${dt(i.created_at)}</td></tr>`).join('')
       || '<tr><td colspan=4 class="empty">No open knowledge gaps.</td></tr>'}</table></div>`;
   },
@@ -772,20 +834,53 @@ const screens = {
   async concepts(familyId) {
     const r = await api('GET', '/content/concepts' + (familyId ? `?family_id=${encodeURIComponent(familyId)}` : ''));
     let family = null;
+    // Concepts repeat the same handful of titles across many families (the
+    // redesign audit's Tier 2 finding: an unfiltered flat list makes this
+    // very hard to scan). Group by family so duplicates sit together, and
+    // add the same live-filter pattern used on the Claims screen. Families
+    // are only fetched once, for the id -> code/title lookup, not per row.
+    let familiesById = new Map();
     if (familyId) {
       try { family = (await api('GET', '/content/families')).items.find(f => f.id === familyId); } catch {}
+    } else {
+      try { (await api('GET', '/content/families')).items.forEach(f => familiesById.set(f.id, f)); } catch {}
     }
-    return `${familyId ? '<a class="backlink" href="#/families">&larr; Content families</a>' : ''}
-      <h1>Creative concepts</h1>
-      <div class="sub">${family ? `Filtered to ${esc(family.code)} · ${esc(family.title)}` : 'Distinct treatments of approved knowledge. Selection is the cheap place for editorial judgement.'}</div>
-      ${r.items.map(c => `<div class="card">
+    const card = c => `<div class="card" data-filter-item>
         <div class="flex"><b>${esc(c.title)}</b>${pill(c.status)}<span class="muted">${esc(c.video_family)}</span>
           <span class="spacer"></span>
           ${c.status === 'PROPOSED' && can('concept.select') ? `<button class="approve" data-select="${c.id}">Select</button>` : ''}</div>
         <div style="margin:6px 0"><b>Hook:</b> ${esc(c.hook_line)}</div>
         <div class="muted">${esc(c.premise)}</div>
         <div class="muted" style="font-size:12px;margin-top:6px">Why it works: ${esc(c.why_this_works ?? '')}</div>
-      </div>`).join('') || `<div class="card empty">${familyId ? 'No concepts recorded for this family.' : 'No concepts yet. Use Turn into content from the Questions screen to start one.'}</div>`}`;
+      </div>`;
+    let body;
+    if (!r.items.length) {
+      body = `<div class="card empty">${familyId ? 'No concepts recorded for this family.' : 'No concepts yet. Use Turn into content from the Questions screen to start one.'}</div>`;
+    } else if (familyId) {
+      body = r.items.map(card).join('');
+    } else {
+      // Group by family_id, family with the most recent concept first.
+      const groups = new Map();
+      for (const c of r.items) {
+        if (!groups.has(c.family_id)) groups.set(c.family_id, []);
+        groups.get(c.family_id).push(c);
+      }
+      body = [...groups.entries()].map(([fid, items]) => {
+        const f = familiesById.get(fid);
+        const label = f ? `${esc(f.code)} · ${esc(f.title)}` : 'Ungrouped';
+        return `<div class="eyebrow" style="margin-top:14px">${label} (${items.length})</div>
+          ${items.map(card).join('')}`;
+      }).join('');
+    }
+    return `${familyId ? '<a class="backlink" href="#/families">&larr; Content families</a>' : ''}
+      <h1>Creative concepts</h1>
+      <div class="sub">${family ? `Filtered to ${esc(family.code)} · ${esc(family.title)}` : 'Distinct treatments of approved knowledge, grouped by family. Selection is the cheap place for editorial judgement.'}</div>
+      ${!familyId && r.items.length ? `<div class="flex" style="flex-wrap:wrap;gap:10px;margin-bottom:10px">
+        <input id="cc-filter" data-livefilter="cc-list" data-count-target="cc-count"
+          placeholder="filter by title, hook, or premise" style="max-width:320px">
+        <span id="cc-count" class="muted">${r.items.length} of ${r.items.length} shown</span>
+      </div>` : ''}
+      <div id="cc-list">${body}</div>`;
   },
 
   async scripts() {
@@ -1351,16 +1446,30 @@ const screens = {
         : st === 'env'
           ? '<span class="pill p-DRAFT"><span class="d"></span>from server env</span>'
           : '<span class="pill p-CLOSED"><span class="d"></span>not set</span>';
+      // Groups collapse behind <details>, per the Phase 1 finding that this
+      // page's length was the actual problem: ~20 always-open credential
+      // rows before you reach anything you came here to change. The status
+      // badges move into the summary line so the collapsed state still
+      // answers "is this set" without opening it. A group with anything
+      // unset opens by default (that's the actionable state); a fully-saved
+      // group starts closed.
       credsHtml = `<h1 style="margin-top:26px">API keys and providers</h1>
         <div class="sub">Enter and save credentials here, exactly like the EMR integration credentials page. Values are never shown again once saved; leave a field blank to keep what is stored. Saving an empty value clears the saved entry and falls back to the server environment.</div>
-        ${groups.map(g => `<div class="card"><div class="eyebrow">${esc(g)}</div><table>
-          ${c.items.filter(i => i.group === g).map(i => `<tr>
+        ${groups.map(g => {
+          const items = c.items.filter(i => i.group === g);
+          const unsetCount = items.filter(i => i.status === 'unset').length;
+          return `<details class="card credgrp" ${unsetCount ? 'open' : ''}>
+          <summary><span class="eyebrow" style="display:inline;margin:0">${esc(g)}</span>
+            <span class="muted" style="font-size:12px">${items.length} key${items.length === 1 ? '' : 's'}${unsetCount ? `, ${unsetCount} not set` : ', all set'}</span></summary>
+          <table>
+          ${items.map(i => `<tr>
             <td style="width:220px"><b>${esc(i.label)}</b><div class="muted" style="font-size:11px">${esc(i.hint ?? '')}</div></td>
             <td style="width:130px">${badge(i.status)}</td>
             <td><input type="${i.secret ? 'password' : 'text'}" id="cred-${esc(i.key)}"
               placeholder="${i.status === 'unset' ? 'enter value' : 'enter new value to replace'}" autocomplete="off"></td>
             <td style="width:90px"><button class="primary" data-credsave="${esc(i.key)}">Save</button></td>
-          </tr>`).join('')}</table></div>`).join('')}`;
+          </tr>`).join('')}</table></details>`;
+        }).join('')}`;
     } catch { /* not settings.manage; hide the credentials section */ }
     const pm = String(r.items.find(s => s.key === 'publishing.mode')?.value ?? 'DRAFT_BATCH');
     const pmHtml = can('settings.manage') ? `<div class="card"><div class="eyebrow">Publishing mode</div>
@@ -1452,11 +1561,17 @@ const screens = {
     // Raw settings dump is reference-only, nothing on this table is clicked
     // or edited day to day, so it sits last, after every screen someone
     // actually acts on (override, publishing mode, tone, API keys).
+    // Object/array values render as multi-line, scroll-capped pre blocks
+    // instead of one unreadable escaped-JSON line, per the Phase 1 finding
+    // on this table; scalars stay inline, unchanged.
+    const rawVal = (v) => (v !== null && typeof v === 'object')
+      ? `<pre class="mono" style="max-height:90px;overflow:auto;white-space:pre-wrap;margin:0">${esc(JSON.stringify(v, null, 2))}</pre>`
+      : esc(JSON.stringify(v));
     const rawTableHtml = `<h1 style="margin-top:26px">All settings (raw)</h1>
       <div class="sub">Every key/value this instance holds, for reference. Thresholds and weights the team can argue with, without a deploy.</div>
-      <div class="card"><table><tr><th>Key</th><th>Value</th><th>Description</th></tr>
+      <div class="card"><table><tr><th>Key</th><th style="width:320px">Value</th><th>Description</th></tr>
       ${r.items.map(s => `<tr><td class="mono">${esc(s.key)}</td>
-        <td class="mono" style="max-width:260px;overflow-wrap:anywhere">${esc(JSON.stringify(s.value))}</td>
+        <td class="mono" style="max-width:320px;overflow-wrap:anywhere">${rawVal(s.value)}</td>
         <td class="muted">${esc(s.description ?? '')}</td></tr>`).join('')}</table></div>`;
     return `<h1>Settings</h1><div class="sub">What the team can actually change, without a deploy</div>
       ${overrideHtml}
@@ -1468,11 +1583,24 @@ const screens = {
       ${rawTableHtml}`;
   },
 
+  // Capped at 60 rows by default, not paginated server side (the API
+  // returns everything in one call). Nothing is hidden permanently: the
+  // full count is always stated and "Show all" is one click, one hash
+  // query param, no data loss, per the Phase 1 finding that a 239-row
+  // unbroken table was the real problem on this screen.
   async audit() {
+    const qp = new URLSearchParams((location.hash.split('?')[1] ?? ''));
+    const showAll = qp.get('all') === '1';
     const r = await api('GET', '/platform/audit');
-    return `<h1>Audit log</h1><div class="sub">Append-only. Every state change, forever.</div>
+    const CAP = 60;
+    const rows = showAll ? r.items : r.items.slice(0, CAP);
+    const toggle = r.items.length > CAP
+      ? (showAll ? ` Showing all ${r.items.length}. <a href="#/audit">Show the most recent ${CAP}</a>.`
+                 : ` Showing the most recent ${CAP} of ${r.items.length}. <a href="#/audit?all=1">Show all</a>.`)
+      : '';
+    return `<h1>Audit log</h1><div class="sub">Append-only. Every state change, forever.${toggle}</div>
       <div class="card"><table><tr><th>When</th><th>Actor</th><th>Action</th><th>Object</th><th>Transition</th><th>Reason</th></tr>
-      ${r.items.map(a => `<tr><td class="muted">${dt(a.occurred_at)}</td>
+      ${rows.map(a => `<tr><td class="muted">${dt(a.occurred_at)}</td>
         <td class="muted">${esc(a.actor_label ?? a.actor_type)}</td>
         <td class="mono">${esc(a.action)}</td>
         <td class="mono">${esc(a.object_code ?? (a.object_type ?? ''))}</td>
@@ -1484,27 +1612,11 @@ const screens = {
   // Everything in flight, by stage, showing what is waiting on whom.
   // Blocked items surface first inside each stage. Every card names its
   // next action; nothing here is a dead end.
+  // #/board is now an alias of the merged Today/Board screen; kept as its
+  // own route so the Make screen's post-generation link and anyone's
+  // existing bookmark still resolve exactly as before.
   async board() {
-    const b = await api('GET', '/pipeline/board');
-    const blockedCount = Object.values(b.stages).flat().filter(x => !x.can_advance && x.advance_block !== 'This piece is at its final stage.').length;
-    const cols = b.stage_order.map(stage => {
-      const items = [...(b.stages[stage] ?? [])].sort((x, y) => Number(x.can_advance) - Number(y.can_advance));
-      if (!items.length) return '';
-      return `<div class="bcol"><div class="bhead">${esc(stage.replace(/_/g, ' '))} <span class="muted">${items.length}</span></div>
-        ${items.map(x => `<div class="bitem ${!x.can_advance ? 'blocked' : ''}" data-nav="script/${esc(x.id)}" tabindex="0" role="link">
-          <div class="flex"><span class="mono" style="font-size:11px">${esc(x.code)}</span>
-            ${pill(x.risk_tier)}${x.needs_clinical_signoff ? '<span class="pill p-TIER_4"><span class="d"></span>clinical</span>' : ''}</div>
-          <div style="font-size:12.5px;margin:3px 0">${esc((x.title ?? '').slice(0, 70))}</div>
-          <div class="muted" style="font-size:11px">${esc(x.format_label ?? x.format_code ?? '')}</div>
-          <div style="font-size:11.5px;margin-top:5px;${x.can_advance ? 'color:var(--risk-routine)' : 'color:var(--risk-mod)'}">
-            ${x.can_advance
-              ? `Ready: next is ${esc((x.next_stage ?? '').replace(/_/g, ' '))}`
-              : esc(x.advance_block ?? '')}</div>
-        </div>`).join('')}</div>`;
-    }).join('');
-    return `<h1>Board</h1>
-      <div class="sub">Everything in flight. ${blockedCount ? `<b>${blockedCount} piece${blockedCount === 1 ? ' is' : 's are'} waiting on someone</b>, shown first in each column.` : 'Nothing is blocked right now.'} Click a card to open the piece.</div>
-      <div class="board">${cols || '<div class="card empty">Nothing in flight. Start on the Make screen.</div>'}</div>`;
+    return screens.dashboard();
   },
 
   // ---------- Part 2 step 1: what should I make ----------
@@ -1798,10 +1910,36 @@ document.addEventListener('keydown', (e) => {
   // row itself, same as a tile. Only when focus is on the row, not on a
   // button/link/input inside it -- those already have their own Enter/Space
   // behaviour and must not also trigger the row's navigation.
-  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('tr[data-nav],.bitem[data-nav]')) {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('tr[data-nav],.bitem[data-nav],.tile[data-nav]')) {
     e.preventDefault(); location.hash = '#/' + e.target.dataset.nav;
   }
   if (e.key === 'Escape') document.body.classList.remove('nav-open');
+});
+// Generic client-side filter: any input with data-livefilter="<container id>"
+// hides non-matching items inside that container as you type and updates
+// the element named by data-count-target with "N of M shown". Items are
+// anything marked data-filter-item (a <tr> in a table, a <div class="card">
+// in a list), so the same input works for both the Claims table and the
+// Concepts card list. No server round trip, built for endpoints the API
+// returns whole rather than paginating, per the redesign audit's Tier 1/
+// Tier 2 fixes. Family headings in the Concepts list are left alone by the
+// filter (they aren't data-filter-item), so a match still shows which
+// family it belongs to.
+document.addEventListener('input', (e) => {
+  const el = e.target.closest('[data-livefilter]');
+  if (!el) return;
+  const container = document.getElementById(el.dataset.livefilter);
+  if (!container) return;
+  const needle = el.value.trim().toLowerCase();
+  const rows = container.querySelectorAll('[data-filter-item]');
+  let shown = 0;
+  rows.forEach(row => {
+    const match = !needle || row.textContent.toLowerCase().includes(needle);
+    row.style.display = match ? '' : 'none';
+    if (match) shown++;
+  });
+  const countEl = document.getElementById(el.dataset.countTarget);
+  if (countEl) countEl.textContent = `${shown} of ${rows.length} shown`;
 });
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
@@ -1815,7 +1953,7 @@ document.addEventListener('click', async (e) => {
     // tr[data-nav] and .bitem[data-nav] via the keydown listener above,
     // but a mouse click on a board card matched neither selector here,
     // so the board, Girum's morning screen, was unclickable with a mouse.
-    const row = e.target.closest('tr[data-nav],.bitem[data-nav]');
+    const row = e.target.closest('tr[data-nav],.bitem[data-nav],.tile[data-nav]');
     if (row) location.hash = '#/' + row.dataset.nav;
     return;
   }
@@ -2432,7 +2570,19 @@ async function render() {
     const html = await fn(arg);
     app.innerHTML = shell(route, html);
   } catch (ex) {
-    app.innerHTML = shell(route, `<div class="card">${esc(ex.message)}</div>`);
+    // role="alert" so screen readers announce the failure (ui-ux-pro-max,
+    // Accessibility > Error Messages), a Retry action so there is a
+    // recovery path (Feedback > Error Recovery), and a destructive-tinted
+    // card so it reads as an error, not just another panel, matching the
+    // "Error Empty State" / "AI Error Handler" shape from Magic MCP's
+    // get_inspiration benchmarking. This is the one place every screen's
+    // fetch failure lands, fixing it here fixes every screen at once.
+    app.innerHTML = shell(route, `<div class="card errcard" role="alert">
+      <div class="et">Something went wrong loading this screen</div>
+      <div class="muted">${esc(ex.message)}</div>
+      <button class="primary" data-retry="1">Retry</button>
+    </div>`);
+    $('[data-retry]')?.addEventListener('click', () => render());
   }
 }
 window.addEventListener('hashchange', render);

@@ -14,19 +14,37 @@
 :root{
   --cetacean:#16103F; --cetacean-2:#241A5C;
   --fuzzy-wuzzy:#CD6962; --fuzzy-wuzzy-hover:#B85850; --fuzzy-wuzzy-press:#A64840;
+  /* Button-fill-specific shade, kept separate from the brand accent above:
+     white text on #CD6962 measures 3.63:1, short of WCAG AA's 4.5:1 for
+     normal text. #C1463E with white text measures 4.98:1. Used only where
+     white/light text sits on top of it (button.primary); the lighter
+     --fuzzy-wuzzy stays the brand accent everywhere text isn't printed
+     directly on it (nav icon, wordmark). */
+  --fuzzy-wuzzy-btn:#C1463E;
   --marigold:#EBAB20;
   --jelly-bean:#477287; --plump-purple:#5D489C; --teal:#5BBFB5;
   --canvas:#F5F3EF; --surface:#FFFFFF; --surface-2:#FAF8F4; --surface-3:#F0EDE5;
   --line:#E6E2DA; --line-soft:#EFEBE3;
-  --ink:#16103F; --ink-2:#4A5160; --ink-mute:#8A8578;
+  --ink:#16103F; --ink-2:#4A5160;
+  /* Darkened from #8A8578 (was 3.15-3.68:1 against surface/canvas/surface-3,
+     short of WCAG AA's 4.5:1 for normal text; .muted renders every
+     timestamp, hint, and meta line in the app at fs-xs/fs-sm/fs-2xs, all
+     below the large-text exception). #6D695F clears 4.5:1 against all
+     three backgrounds (4.68-5.47:1), same hue and saturation, darker only. */
+  --ink-mute:#6D695F;
   --risk-high:#B91C1C; --risk-high-bg:#FBEAEA;
-  --risk-mod:#B6810F; --risk-mod-bg:#FCF2DC;
+  /* Darkened from #B6810F (3.08:1 on --risk-mod-bg, short of WCAG AA's
+     4.5:1; also 3.42:1 for the white toast text this same color backs in
+     #toast.warn). #8D640C clears both: 4.77:1 on --risk-mod-bg, 5.30:1
+     for white toast text on it. Same hue, darker only. */
+  --risk-mod:#8D640C; --risk-mod-bg:#FCF2DC;
   --risk-routine:#2C6F68; --risk-routine-bg:#E2F0EE;
   --st-new:#477287; --st-new-bg:#E6EEF1;
   --st-review:#5D489C; --st-review-bg:#ECE7F4;
-  --st-wait:#B6810F; --st-wait-bg:#FCF2DC;
+  --st-wait:#8D640C; --st-wait-bg:#FCF2DC;
   --st-referred:#2C6F68; --st-referred-bg:#E2F0EE;
-  --st-closed:#6B7280; --st-closed-bg:#EFEFEF;
+  /* Darkened from #6B7280 (4.20:1 on --st-closed-bg, short of 4.5:1). */
+  --st-closed:#626875; --st-closed-bg:#EFEFEF;
   --telegram:#229ED9; --whatsapp:#25D366; --facebook:#3b5998; --instagram:#c13584;
   --font-ui:'Poppins',system-ui,sans-serif;
   --font-data:-apple-system,'Segoe UI',Roboto,system-ui,sans-serif;
@@ -71,6 +89,8 @@ h1{font-size:var(--fs-lg);font-weight:600;margin-bottom:var(--sp-1);letter-spaci
 /* cards + tiles */
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp-4) var(--sp-5);
   margin-bottom:var(--sp-4);box-shadow:var(--sh-1)}
+.errcard{border-left:4px solid var(--risk-high);display:flex;flex-direction:column;align-items:flex-start;gap:var(--sp-3)}
+.errcard .et{font-weight:600;color:var(--risk-high);font-size:var(--fs-md)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(154px,1fr));gap:var(--sp-3);margin-bottom:var(--sp-5)}
 .tile{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--jelly-bean);border-radius:var(--r-md);
   padding:var(--sp-3) var(--sp-4);cursor:pointer;box-shadow:var(--sh-1);
@@ -109,7 +129,7 @@ button,.btn{font-family:var(--font-ui);font-size:var(--fs-xs);font-weight:500;bo
   border-radius:var(--r-sm);padding:9px 16px;cursor:pointer;box-shadow:var(--sh-1)}
 button:hover{border-color:var(--jelly-bean);box-shadow:var(--sh-2)}
 button:active{transform:translateY(1px);box-shadow:var(--sh-1)}
-button.primary{background:var(--fuzzy-wuzzy);border-color:var(--fuzzy-wuzzy);color:#fff;font-weight:600;box-shadow:0 2px 8px rgba(205,105,98,.35)}
+button.primary{background:var(--fuzzy-wuzzy-btn);border-color:var(--fuzzy-wuzzy-btn);color:#fff;font-weight:600;box-shadow:0 2px 8px rgba(205,105,98,.35)}
 button.primary:hover{background:var(--fuzzy-wuzzy-hover);border-color:var(--fuzzy-wuzzy-hover);box-shadow:0 4px 14px rgba(205,105,98,.4)}
 button.primary:active{background:var(--fuzzy-wuzzy-press);border-color:var(--fuzzy-wuzzy-press)}
 button.approve{background:var(--risk-routine);border-color:var(--risk-routine);color:#fff;font-weight:600}
@@ -184,6 +204,13 @@ td.empty{color:var(--ink-mute);text-align:center;padding:var(--sp-6) var(--sp-3)
 .plantable td.num,.plantable th.num{text-align:right;font-variant-numeric:tabular-nums}
 .trend-up{color:var(--risk-routine);font-size:12.5px}
 .trend-down{color:var(--ink-mute);font-size:12.5px}
+/* collapsible credential groups on Settings, per Phase 1: ~20 always-open
+   rows was the actual problem on that screen, not its colors. */
+.credgrp summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;padding:2px 0}
+.credgrp summary::-webkit-details-marker{display:none}
+.credgrp summary::before{content:'\25B8';color:var(--ink-mute);font-size:11px;transition:transform var(--dur-fast) ease}
+.credgrp[open] summary::before{transform:rotate(90deg)}
+.credgrp table{margin-top:var(--sp-3)}
 .genbox summary{cursor:pointer;font-size:12.5px;color:var(--plump-purple);font-family:var(--font-ui);
   list-style:none;padding:5px 12px;border:1px solid var(--line);border-radius:var(--r-sm);
   display:inline-block;background:var(--surface)}
@@ -310,6 +337,28 @@ mark{background:var(--risk-mod-bg);color:var(--risk-mod);border-radius:3px;paddi
   #main{padding:64px 14px 20px;max-width:none}
   .card{overflow-x:auto}
   .card table{min-width:560px}
+  /* Scroll-shadow hint for cards whose table is wider than the phone
+     screen (redesign audit Tier 3): two edge shadows layered with
+     background-attachment local/scroll so each one only shows while
+     there is still unscrolled content on that side, and disappears on
+     its own once you've scrolled all the way, no JS, no state to get
+     out of sync with the real scroll position. */
+  .card:has(table){
+    /* background (not background-image): the two right-hand layers need a
+       position token ("100% 0") attached per-layer, which only the
+       shorthand accepts per comma-separated layer -- putting it on the
+       background-image longhand is invalid and silently drops the whole
+       comma list to "none" (found and fixed while verifying this rule). */
+    background:
+      linear-gradient(to right,var(--surface) 30%,rgba(245,243,239,0)),
+      linear-gradient(to right,rgba(245,243,239,0),var(--surface) 70%) 100% 0,
+      linear-gradient(to right,rgba(22,16,63,.16),rgba(22,16,63,0)),
+      linear-gradient(to right,rgba(22,16,63,0),rgba(22,16,63,.16)) 100% 0;
+    background-repeat:no-repeat;
+    background-color:var(--surface);
+    background-size:24px 100%,24px 100%,10px 100%,10px 100%;
+    background-attachment:local,local,scroll,scroll;
+  }
   .grid2{grid-template-columns:1fr}
   #login{margin:10vh 16px}
   input,select,textarea{font-size:16px}
@@ -323,7 +372,7 @@ mark{background:var(--risk-mod-bg);color:var(--risk-mod);border-radius:3px;paddi
   /* touch targets: the skill's 44px minimum, checked against short
      single-line board cards which were landing under it */
   .bitem{min-height:44px;padding:12px}
-  .otpick{padding:9px 14px 9px 12px;min-height:26px}
+  .otpick{padding:9px 14px 9px 12px;min-height:44px}
   button,.btn{padding:11px 16px;min-height:44px}
   #side a{padding:12px var(--sp-3);min-height:44px}
 }
@@ -331,7 +380,7 @@ mark{background:var(--risk-mod-bg);color:var(--risk-mod);border-radius:3px;paddi
 </head>
 <body>
 <div id="app"></div>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 <script type="module" src="/app.js?v=9"></script>
 </body>
 </html>

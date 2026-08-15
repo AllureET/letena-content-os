@@ -128,11 +128,22 @@ const mediaUrl = (key) => key ? `/api/v1/media/${key.split('/').map(encodeURICom
 // A thumbnail for any asset kind: a still shows, a video plays on hover,
 // audio gets a player, anything else gets a labelled tile. Nobody browses a
 // reference library as a list of codes.
+// A broken thumbnail URL used to fall through to the browser's bare
+// broken-image glyph (Phase 1 finding, half the seeded library did this).
+// This swaps it for the same quiet placeholder .ath.none already uses for
+// assets with no media at all, so a bad URL degrades gracefully instead
+// of looking like the app itself is broken.
+window.assetImgError = function (img, kind) {
+  const div = document.createElement('div');
+  div.className = 'ath none';
+  div.textContent = kind;
+  img.replaceWith(div);
+};
 function assetThumb(a) {
   const u = mediaUrl(a.storage_key);
   const mt = a.mime_type ?? '';
   if (!u) return `<div class="ath none">${esc(a.kind)}</div>`;
-  if (mt.startsWith('image/')) return `<img class="ath" src="${esc(u)}" alt="${esc(a.title)}" loading="lazy">`;
+  if (mt.startsWith('image/')) return `<img class="ath" src="${esc(u)}" alt="${esc(a.title)}" loading="lazy" onerror="assetImgError(this,'${esc(a.kind)}')">`;
   if (mt.startsWith('video/')) return `<video class="ath" src="${esc(u)}" muted loop playsinline preload="metadata"
     onmouseover="this.play().catch(()=>{})" onmouseout="this.pause()"></video>`;
   if (mt.startsWith('audio/')) return `<div class="ath audio">&#9835;<audio controls preload="none" src="${esc(u)}"></audio></div>`;
@@ -309,20 +320,54 @@ function tabsFor(route) {
     `<a href="#/${id}" class="tab ${id === route ? 'on' : ''}">${label}</a>`).join('')}</div>`;
 }
 
+// Icon-and-label nav rows, grouped, per the Phase 1 finding that a flat
+// list of eight text links reads as a placeholder next to the rest of the
+// app. Minimal stroke icons (18x18, currentColor) so they inherit the
+// on/hover color states for free. Grouping mirrors how Girum actually
+// described his own workflow: what to make, the pipeline it moves through,
+// the record behind it, then admin.
+const NAV_ICON = {
+  today: '<path d="M3 10.5 10 4l7 6.5"/><path d="M5 9v7h10V9"/>',
+  plan: '<rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 2v4M13 2v4"/><path d="M6.5 11.5l1.7 1.7 3.3-3.6"/>',
+  questions: '<path d="M3 4h14v9H8l-3.5 3V13H3z"/>',
+  knowledge: '<path d="M4 3.5A1.5 1.5 0 0 1 5.5 2H15v14H5.5A1.5 1.5 0 0 0 4 17.5z"/><path d="M4 3.5v14"/>',
+  content: '<rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="M2.5 7h15M6.5 3.5v3.5"/>',
+  production: '<path d="M2.5 6.5 10 2.5l7.5 4v7L10 17.5l-7.5-4z"/><path d="M2.5 6.5 10 10.5l7.5-4M10 10.5v7"/>',
+  publishing: '<path d="M17 3 2 9.5l6 2 2 6z"/><path d="M17 3 10 11.5"/>',
+  insights: '<path d="M3 17V3M3 17h14"/><path d="M6 14V9M10 14V6M14 14v-3"/>',
+  admin: '<circle cx="10" cy="10" r="2.5"/><path d="M10 3v2M10 15v2M17 10h-2M5 10H3M15.1 4.9l-1.4 1.4M6.3 13.7l-1.4 1.4M15.1 15.1l-1.4-1.4M6.3 6.3 4.9 4.9"/>',
+};
+const NAV_GROUPS = [
+  ['Work', ['today', 'plan']],
+  ['Pipeline', ['questions', 'knowledge', 'content', 'production', 'publishing']],
+  ['System', ['insights', 'admin']],
+];
 function shell(active, content) {
+  const sec = sectionFor(active);
+  const activeSection = sec ? sec[0] : null;
+  const byId = new Map(SECTIONS.map(s => [s[0], s]));
+  const navHtml = NAV_GROUPS.map(([grpLabel, ids]) => `
+    <div class="navgrp">
+      <div class="grp">${esc(grpLabel)}</div>
+      ${ids.map(id => {
+        const s = byId.get(id);
+        if (!s) return '';
+        const [sid, label, tabs] = s;
+        return `<a href="#/${tabs[0][0]}" class="${sid === activeSection ? 'on' : ''}">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${NAV_ICON[sid] ?? ''}</svg>
+          ${esc(label)}</a>`;
+      }).join('')}
+    </div>`).join('');
   return `<div id="shell">
     <div id="mtop"><button id="burger" aria-label="Open menu">&#9776;</button><span class="mark">letena<b>.</b>os</span></div>
     <div id="navveil"></div>
     <nav id="side">
       <div class="mark">letena<b>.</b>os</div>
-      ${(() => {
-        const sec = sectionFor(active);
-        const activeSection = sec ? sec[0] : null;
-        return SECTIONS.map(([id, label, tabs]) =>
-          `<a href="#/${tabs[0][0]}" class="${id === activeSection ? 'on' : ''}">${label}</a>`).join('');
-      })()}
-      <div class="grp">${esc(ME?.full_name ?? '')}</div>
-      <a href="#" id="logout">Sign out</a>
+      ${navHtml}
+      <div class="navfoot">
+        <div class="grp">${esc(ME?.full_name ?? '')}</div>
+        <a href="#" id="logout">Sign out</a>
+      </div>
     </nav>
     <main id="main">${tabsFor(active)}${content}</main>
   </div>`;
@@ -1487,7 +1532,7 @@ const screens = {
         ${formats.items.filter(f => f.surface === sf && !f.is_internal).map(f => `
           <label class="otpick" title="${esc(f.description ?? '')}">
             <input type="checkbox" data-mkfmt="${esc(f.code)}" ${MAKE.formats.has(f.code) ? 'checked' : ''}>
-            ${esc(f.label)} <span class="muted">${esc((f.platforms ?? []).join(', '))}</span></label>`).join('')}
+            ${esc(f.label)} ${(f.platforms ?? []).map(chan).join('')}</label>`).join('')}
       </div></div>`).join('');
     const picked = formats.items.filter(f => MAKE.formats.has(f.code));
     const needsTranscript = picked.some(f => f.code === 'aua_recap');
@@ -1536,7 +1581,9 @@ const screens = {
         <div id="mk-preview" style="font-size:13px;line-height:1.7">${preview}</div>
         <div style="margin-top:12px" class="flex">
           <button class="primary" id="mk-go" ${!picked.length || (needsTranscript && !confirmed.length) ? 'disabled' : ''}>Write ${picked.length || ''} piece${picked.length === 1 ? '' : 's'}</button>
-          <span class="muted" style="font-size:12px">Each piece is claim-checked as it lands. Nothing publishes from here.</span>
+          <span class="muted" style="font-size:12px">${!picked.length ? 'Pick at least one format above to continue.'
+            : (needsTranscript && !confirmed.length) ? 'The AUA recap format needs a confirmed transcript first.'
+            : 'Each piece is claim-checked as it lands. Nothing publishes from here.'}</span>
         </div>
         <div id="mk-run"></div>
       </div>`;
@@ -2348,6 +2395,7 @@ async function render() {
   if (!TOKEN) {
     app.innerHTML = `<div id="login">
       <div class="mark">letena<b>.</b>os</div>
+      <div class="am-tagline">የይዘት ፋብሪካ</div>
       <div class="sub" style="text-align:center">Content OS · internal team sign-in</div>
       <div class="card">
         <label>Email</label><input id="em" value="content@letena.local">
@@ -2372,7 +2420,14 @@ async function render() {
   const [path] = (location.hash.replace(/^#\//, '') || 'dashboard').split('?');
   const [route, arg] = path.split('/');
   const fn = screens[route] ?? screens.dashboard;
-  app.innerHTML = shell(route, '<div class="muted">Loading…</div>');
+  // A skeleton, not bare "Loading..." text: the skill's own loading-state
+  // rule (progressive-loading) puts the threshold at 300ms, and every
+  // screen here fetches on navigation, so silent pop-in was the norm.
+  app.innerHTML = shell(route, `<div class="skelwrap">
+    <div class="skel sk-h1"></div><div class="skel sk-sub"></div>
+    <div class="tiles">${Array.from({ length: 4 }).map(() => '<div class="skel sk-tile"></div>').join('')}</div>
+    <div class="card"><div class="skel sk-line" style="width:70%"></div><div class="skel sk-line" style="width:92%"></div><div class="skel sk-line" style="width:55%"></div></div>
+  </div>`);
   try {
     const html = await fn(arg);
     app.innerHTML = shell(route, html);

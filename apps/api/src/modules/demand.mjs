@@ -728,32 +728,29 @@ export async function computeDemand() {
   return { computed_for: today, rows: inserted };
 }
 
-// ---------- background sweep (added 14 Aug 2026) ----------
-// Clears the classify-pending backlog automatically so it doesn't require
-// someone to keep a browser tab open and click a button every few minutes.
-// Guarded against overlapping runs (a slow AI call could otherwise let two
-// sweeps stack up) and against test runs (matches the NODE_ENV convention
-// already used in server.mjs for the request logger).
-let sweepRunning = false;
-async function backgroundClassifySweep() {
-  if (sweepRunning) return;
-  sweepRunning = true;
-  try {
-    const result = await classifyPendingBatch(30);
-    if (result.attempted > 0) {
-      await audit(null, { actor: { type: 'SYSTEM', label: 'classify-sweep' },
-        action: 'question.bulk_classify', objectType: 'INGEST_BATCH',
-        reason: `scheduled sweep: ${result.classified}/${result.attempted} classified, ` +
-          `${result.quarantined_not_genuine} not genuine, ${result.failed} failed, ` +
-          `${result.remaining_pending} still pending` }).catch(() => null);
-    }
-  } catch (e) {
-    // A bad interval tick must never crash the server -- swallow and retry
-    // on the next tick.
-  } finally {
-    sweepRunning = false;
-  }
-}
-if (process.env.NODE_ENV !== 'test') {
-  setInterval(backgroundClassifySweep, 5 * 60 * 1000);
-}
+// ---------- background sweep: REMOVED 15 Aug 2026 ----------
+// This used to run classifyPendingBatch(30) automatically every 5 minutes,
+// day and night, with no spend limit anywhere in the pipeline. It landed on
+// 14 Aug right after a separate fix made real Anthropic billing start
+// working for the first time (previously every real call 400'd before
+// billing anything, so cost always read $0). The two changes stacked and
+// the sweep quietly ran up real, unbounded AI spend against the thousands
+// of questions in the EMR backfill backlog with nobody able to see it
+// happening and nothing able to stop it.
+//
+// Nate, 15 Aug 2026: "this needs to be done with... maybe only when we
+// reach X amount of new questions and it tells me and I request a batch
+// pull." That is the replacement design: no automatic AI calls at all.
+// classifyPendingBatch() still exists and is still what runs, but only two
+// ways now, both visible and both capped:
+//   1. Someone clicks "Classify pending questions" (existing manual button,
+//      POST /questions/classify-pending), which now also stops early and
+//      returns a clear error if aiDailyBudgetStatus() says the day's cap is
+//      already spent (see ai/gateway.mjs).
+//   2. The backlog banner (screens.dashboard / screens.questions in
+//      app.js) surfaces in-app once pending_count crosses
+//      demand.backlog_notify_threshold (a settings key, default 50), so
+//      someone sees it and can decide to run a batch. Nothing fires on its
+//      own.
+// If a scheduled sweep is wanted again later, it must read the budget cap
+// before every batch, not just log after the fact.

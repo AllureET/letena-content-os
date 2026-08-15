@@ -443,7 +443,23 @@ const screens = {
           </table></div>`;
       }
     } catch {}
+    // Backlog/budget banners (15 Aug 2026): nothing here runs on its own.
+    // These just tell someone it is time to act, replacing the automatic
+    // classify sweep that used to spend money every 5 minutes unattended.
+    let banners = '';
+    if (d.pending_classification >= d.backlog_notify_threshold) {
+      banners += `<div class="card warn"><b>${d.pending_classification}</b> questions are waiting to be classified
+        (threshold: ${d.backlog_notify_threshold}). Nothing runs automatically.
+        Go to <a href="#/clusters">Question clusters</a> and click "Classify pending questions" to pull a batch.</div>`;
+    }
+    if (d.ai_budget?.capped) {
+      banners += `<div class="card bad"><b>AI budget cap reached today:</b> $${d.ai_budget.spent_usd} of $${d.ai_budget.cap} spent.
+        All AI calls are refused until tomorrow (UTC) or until the cap is raised in <a href="#/settings">Settings</a>.</div>`;
+    } else if (d.ai_budget?.cap != null) {
+      banners += `<div class="card"><div class="eyebrow">AI spend today</div>$${d.ai_budget.spent_usd} of $${d.ai_budget.cap} daily cap.</div>`;
+    }
     return `<h1>Today</h1><div class="sub">Operational picture across the whole pipeline</div>
+      ${banners}
       <div class="tiles">${tiles.map(([k, l, href, cls]) =>
         `<div class="tile ${cls ?? ''}" role="link" tabindex="0" data-nav="${href.slice(2)}">
           <div class="n">${d[k]}</div><div class="l">${l}</div></div>`).join('')}</div>
@@ -1497,6 +1513,17 @@ const screens = {
                 : `<button data-ureactivate="${u.id}">Reactivate</button>`}
             </div>
           </div>
+          <div class="card"><div class="eyebrow">Password</div>
+            <div class="muted" style="font-size:12px;margin-bottom:8px">Generate a new password to hand to this person, or type one directly. Either way the new password shows once, right here, and is never stored in plain text or shown again.</div>
+            <div class="flex" style="margin-bottom:8px">
+              <button data-pwgenerate="${u.id}">Generate new password</button>
+            </div>
+            <div class="flex">
+              <input type="text" id="u-pw-manual" placeholder="type a password (12+ characters)" autocomplete="off" style="max-width:260px">
+              <button data-pwset="${u.id}">Set password</button>
+            </div>
+            <div id="u-pw-result"></div>
+          </div>
           <div class="card"><div class="eyebrow">Roles</div>
             <div class="flex" style="flex-wrap:wrap;gap:8px">
               ${rolesRes.items.map(r => heldRoles.has(r.slug)
@@ -1637,6 +1664,31 @@ const screens = {
           <td class="muted" style="font-size:11.5px">${esc(p.format_notes ?? '')}</td></tr>`).join('')
         || '<tr><td colspan=6 class="empty">No specs seeded yet.</td></tr>'}</table></div>`;
     } catch { /* publish.read missing; hide */ }
+    // AI budget cap and backlog notify threshold (15 Aug 2026). Replaces the
+    // old always-on background classify sweep: nothing calls the AI on its
+    // own timer anymore. This cap is the real backstop against a big manual
+    // batch overshooting, and the threshold controls when the dashboard
+    // banner speaks up.
+    const budgetHtml = can('settings.manage') ? (() => {
+      const capRaw = r.items.find(s => s.key === 'ai.daily_budget_cap_usd')?.value;
+      const capVal = (capRaw === null || capRaw === undefined) ? '' : capRaw;
+      const threshold = Number(r.items.find(s => s.key === 'demand.backlog_notify_threshold')?.value ?? 50);
+      return `<div class="card"><div class="eyebrow">AI spend and backlog alerts</div>
+        <div class="sub" style="margin-bottom:10px">There is no automatic AI calling anymore. Classification only runs when someone clicks "Classify pending questions." This cap is the backstop for that click; the threshold controls when the dashboard tells you it is time to click it.</div>
+        <div class="flex" style="flex-wrap:wrap;gap:18px">
+          <div>
+            <label class="muted" style="font-size:12px;display:block;margin-bottom:4px">Daily AI budget cap (USD, blank = no cap)</label>
+            <div class="flex"><input type="number" min="0" step="0.01" id="budget-cap" style="max-width:140px" value="${esc(String(capVal))}" placeholder="no cap">
+              <button class="primary" id="budget-save">Save</button></div>
+          </div>
+          <div>
+            <label class="muted" style="font-size:12px;display:block;margin-bottom:4px">Notify when pending questions reach</label>
+            <div class="flex"><input type="number" min="1" step="1" id="backlog-threshold" style="max-width:100px" value="${threshold}">
+              <button class="primary" id="threshold-save">Save</button></div>
+          </div>
+        </div>
+      </div>`;
+    })() : '';
     // Raw settings dump is reference-only, nothing on this table is clicked
     // or edited day to day, so it sits last, after every screen someone
     // actually acts on (override, publishing mode, tone, API keys).
@@ -1656,6 +1708,7 @@ const screens = {
       ${overrideHtml}
       ${clinicalHtml}
       ${pmHtml}
+      ${budgetHtml}
       ${toneHtml}
       ${credsHtml}
       ${specsHtml}
@@ -2021,7 +2074,7 @@ document.addEventListener('input', (e) => {
   if (countEl) countEl.textContent = `${shown} of ${rows.length} shown`;
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-scriptdelete],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],[data-ureactivate],[data-usave],[data-uroleadd],[data-urolerem],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-scriptdelete],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],[data-ureactivate],[data-usave],[data-uroleadd],[data-urolerem],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue,#budget-save,#threshold-save,[data-pwgenerate],[data-pwset]');
   if (!b) {
     // A real link (external platform URL, download, backlink) inside a
     // drill-down row must keep its native navigation; only fall through to
@@ -2117,6 +2170,18 @@ document.addEventListener('click', async (e) => {
       const value = $('#tonepreset').value;
       await api('PUT', '/platform/settings', { key: 'content.tone_preset', value });
       toast('Tone preset saved: ' + value); return render();
+    }
+    if (b.id === 'budget-save') {
+      const raw = $('#budget-cap').value.trim();
+      const value = raw === '' ? null : Number(raw);
+      await api('PUT', '/platform/settings', { key: 'ai.daily_budget_cap_usd', value });
+      toast(value === null ? 'No daily AI budget cap.' : `Daily AI budget cap saved: $${value}`);
+      return render();
+    }
+    if (b.id === 'threshold-save') {
+      const value = Number($('#backlog-threshold').value);
+      await api('PUT', '/platform/settings', { key: 'demand.backlog_notify_threshold', value });
+      toast(`Backlog notify threshold saved: ${value}`); return render();
     }
     if (b.dataset.batchapprove) {
       b.disabled = true; b.textContent = 'Approving…';
@@ -2285,6 +2350,21 @@ document.addEventListener('click', async (e) => {
       const full_name = elv('u-edit-name'), email = elv('u-edit-email');
       await api('PATCH', `/platform/users/${b.dataset.usave}`, { full_name, email });
       toast('Profile saved'); return render();
+    }
+    if (b.dataset.pwgenerate) {
+      const r = await api('POST', `/platform/users/${b.dataset.pwgenerate}/password`, { generate: true });
+      $('#u-pw-result').innerHTML = `<div class="card" style="margin-top:10px;border:1px solid var(--risk-mod);background:var(--risk-mod-bg)">
+        <div class="muted" style="font-size:12px;margin-bottom:4px">New password, shown once. Copy it now and hand it to this person; it will not be shown again.</div>
+        <div class="mono" style="font-size:16px;font-weight:600;user-select:all">${esc(r.password)}</div></div>`;
+      toast('Password generated'); return;
+    }
+    if (b.dataset.pwset) {
+      const password = elv('u-pw-manual');
+      if (!password) { toast('Type a password first', true); return; }
+      await api('POST', `/platform/users/${b.dataset.pwset}/password`, { password });
+      $('#u-pw-manual').value = '';
+      $('#u-pw-result').innerHTML = `<div class="card" style="margin-top:10px"><div class="muted" style="font-size:12px">Password set.</div></div>`;
+      toast('Password set'); return;
     }
     if (b.dataset.uroleadd) {
       const [id, slug] = b.dataset.uroleadd.split('|');

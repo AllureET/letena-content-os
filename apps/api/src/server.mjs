@@ -4,7 +4,8 @@ import Fastify from 'fastify';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { authPlugin, login, err, q, one, totpSecret, totpVerify, audit, invalidateSetting, userPermissions, userRoles } from './core.mjs';
+import { authPlugin, login, err, q, one, totpSecret, totpVerify, audit, invalidateSetting, userPermissions, userRoles, setting } from './core.mjs';
+import { aiDailyBudgetStatus } from './ai/gateway.mjs';
 import { CRED_REGISTRY, loadCreds, credStatus, setCred } from './creds.mjs';
 import knowledge from './modules/knowledge.mjs';
 import demand from './modules/demand.mjs';
@@ -349,6 +350,42 @@ export async function buildServer() {
         objectId: u.id, reason: [full_name ? 'name' : null, email ? 'email' : null].filter(Boolean).join(', ') });
       return u;
     });
+    // Reset an existing user's password, either admin-typed or auto-generated.
+    // The plain password is returned in the response body exactly once, for
+    // the admin to copy and hand to that person; it is never stored,
+    // logged, or written into the audit reason (only "generated"/"set by
+    // admin" is recorded there). Added 15 Aug 2026, Nate: "I cant set a
+    // password or have you autogenerate a password, or change the password
+    // or reset it."
+    v1.post('/platform/users/:id/password', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const { password, generate } = req.body ?? {};
+      let plain;
+      if (generate) {
+        const crypto = await import('node:crypto');
+        // Excludes visually ambiguous characters (0/O, 1/l/I) since a
+        // generated password is often read aloud or retyped by hand.
+        const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+        plain = Array.from(crypto.randomBytes(16)).map(b => alphabet[b % alphabet.length]).join('');
+      } else if (password) {
+        if (password.length < 12) {
+          return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'password must be at least 12 characters'));
+        }
+        plain = password;
+      } else {
+        return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'password or generate required'));
+      }
+      const bcrypt = (await import('bcryptjs')).default;
+      const u = await one(
+        `UPDATE lcos.users SET password_hash=$2, updated_at=now() WHERE id=$1 RETURNING id, email, full_name`,
+        [req.params.id, bcrypt.hashSync(plain, 10)]);
+      if (!u) return reply.code(404).send(err(404, 'NOT_FOUND', 'user'));
+      await audit(null, { actor: req.actor, action: 'user.password_reset', objectType: 'USER',
+        objectId: u.id, reason: generate ? 'generated' : 'set by admin' });
+      return { ok: true, password: generate ? plain : undefined };
+    });
     v1.delete('/platform/users/:id/roles/:slug', async (req, reply) => {
       if (!req.actor.permissions.includes('user.manage')) {
         return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
@@ -426,7 +463,8 @@ export async function buildServer() {
       if (!req.actor.permissions.includes('settings.manage')) {
         return reply.code(403).send(err(403, 'FORBIDDEN', 'settings.manage'));
       }
-      const { key, value } = req.body ?? {};
+      const { key } = req.body ?? {};
+      let { value } = req.body ?? {};
       if (!key || String(key).startsWith('cred.')) {
         return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'bad settings key'));
       }
@@ -477,6 +515,28 @@ export async function buildServer() {
             `content.tone_preset must be an active tone preset key (e.g. LETENA_DEFAULT)`));
         }
       }
+      // ai.daily_budget_cap_usd: the real-dollar backstop added 15 Aug 2026
+      // after the background classify sweep ran up spend with nothing able
+      // to stop it (see the removed sweep in modules/demand.mjs and the cap
+      // check in ai/gateway.mjs). null/blank means no cap, matching the
+      // historical behavior; anything else must be a non-negative number.
+      if (key === 'ai.daily_budget_cap_usd') {
+        if (value !== null && value !== '' && (typeof value !== 'number' || value < 0)) {
+          return reply.code(422).send(err(422, 'VALIDATION_ERROR',
+            'ai.daily_budget_cap_usd must be a non-negative number, or blank for no cap'));
+        }
+        if (value === '') value = null;
+      }
+      // demand.backlog_notify_threshold: how many pending-classification
+      // questions accumulate before the in-app banner tells someone to run
+      // a batch. Replaces the old automatic every-5-minute sweep with a
+      // "tell me, I'll pull it" model (Nate, 15 Aug 2026).
+      if (key === 'demand.backlog_notify_threshold') {
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+          return reply.code(422).send(err(422, 'VALIDATION_ERROR',
+            'demand.backlog_notify_threshold must be a whole number of 1 or more'));
+        }
+      }
       const row = await q(
         `UPDATE lcos.settings SET value=$2::jsonb, updated_by=$3, updated_at=now()
          WHERE key=$1 AND NOT is_secret RETURNING key`,
@@ -509,7 +569,8 @@ export async function buildServer() {
       return { ok: true, key, status: credStatus(key) };
     });
     v1.get('/platform/dashboard', async () => {
-      const [qToday, quarantine, scriptsReview, rendering, awaitingApproval, scheduled, cardsDue, deadLetters] =
+      const [qToday, quarantine, scriptsReview, rendering, awaitingApproval, scheduled, cardsDue, deadLetters,
+             pendingClassification, backlogThreshold, budget] =
         await Promise.all([
           q(`SELECT count(*)::int n FROM lcos.audience_questions WHERE ingested_at > now() - interval '24 hours'`),
           q(`SELECT count(*)::int n FROM lcos.audience_questions WHERE status='QUARANTINED'`),
@@ -519,12 +580,22 @@ export async function buildServer() {
           q(`SELECT count(*)::int n FROM lcos.publishing_jobs WHERE status='SCHEDULED'`),
           q(`SELECT count(*)::int n FROM lcos.knowledge_cards WHERE status='APPROVED' AND review_due_at < CURRENT_DATE + 30`),
           q(`SELECT count(*)::int n FROM lcos.workflow_events WHERE status='DEAD_LETTER' AND NOT resolved`),
+          q(`SELECT count(*)::int n FROM lcos.audience_questions WHERE status='DEIDENTIFIED'`),
+          setting('demand.backlog_notify_threshold', 50),
+          aiDailyBudgetStatus(),
         ]);
       return {
         questions_24h: qToday.rows[0].n, quarantine: quarantine.rows[0].n,
         scripts_awaiting_review: scriptsReview.rows[0].n, videos_rendering: rendering.rows[0].n,
         reviews_open: awaitingApproval.rows[0].n, scheduled_posts: scheduled.rows[0].n,
         cards_due_review: cardsDue.rows[0].n, dead_letters: deadLetters.rows[0].n,
+        // Backlog/budget banner (15 Aug 2026): replaces the old automatic
+        // classify sweep. Nothing runs by itself; this just tells whoever
+        // is looking that a batch is worth pulling, or that spend hit its
+        // ceiling for the day.
+        pending_classification: pendingClassification.rows[0].n,
+        backlog_notify_threshold: Number(backlogThreshold),
+        ai_budget: budget,
       };
     });
   }, { prefix: '/api/v1' });

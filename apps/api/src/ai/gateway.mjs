@@ -389,6 +389,26 @@ export function buildAgentSystemPrompt(basePrompt, toneInstructions) {
   return [HOUSE_STYLE_RULES, toneBlock, basePrompt].filter(Boolean).join('\n\n');
 }
 
+// Daily AI spend cap. Setting key 'ai.daily_budget_cap_usd': blank/unset
+// means no cap (the historical behavior). When set, sums today's real
+// cost_usd from ai_invocations (UTC calendar day, matching occurred_at's
+// timestamptz default) and compares against the cap. Added 15 Aug 2026
+// after a background sweep ran up real spend with nothing able to stop it
+// (see the removed sweep in modules/demand.mjs) -- this is the backstop so
+// that can never happen silently again, cap or no cap: even a large manual
+// batch pull now checks this before every call in the batch, not just once
+// at the start, so it stops mid-batch the moment the cap is crossed rather
+// than overshooting by a full batch's worth of spend.
+export async function aiDailyBudgetStatus() {
+  const capRaw = await setting('ai.daily_budget_cap_usd', null);
+  const cap = capRaw === null || capRaw === '' ? null : Number(capRaw);
+  const r = await one(
+    `SELECT COALESCE(sum(cost_usd),0)::numeric(12,4) AS spent
+     FROM lcos.ai_invocations WHERE occurred_at >= date_trunc('day', now())`);
+  const spent = Number(r.spent);
+  return { cap, spent_usd: spent, capped: cap !== null && !Number.isNaN(cap) && spent >= cap };
+}
+
 export async function invokeAgent(agentKey, context, { objectType = null, objectId = null,
   workflowCode = null, provider: providerName, tone_preset: tonePreset = null } = {}) {
   const schema = S[agentKey];
@@ -397,6 +417,19 @@ export async function invokeAgent(agentKey, context, { objectType = null, object
     `SELECT * FROM lcos.ai_prompts WHERE prompt_key=$1 AND is_active`, [agentKey]);
   const provider = getProvider(providerName);
   const started = Date.now();
+  // Real spend only: MOCK mode is free, so a cap on real dollars should
+  // never block someone testing the pipeline in demo mode.
+  if (provider.name !== 'MOCK') {
+    const budget = await aiDailyBudgetStatus();
+    if (budget.capped) {
+      await record({ agentKey, prompt, provider, objectType, objectId, workflowCode,
+        started, outcome: 'BUDGET_CAPPED',
+        error: `daily cap $${budget.cap} reached ($${budget.spent_usd} spent today)` });
+      throw new AgentError(
+        `Daily AI budget cap reached ($${budget.spent_usd} of $${budget.cap} spent today). Raise the cap in Settings or wait until tomorrow.`,
+        'BUDGET_CAPPED');
+    }
+  }
   const toneInstructions = await getTonePresetInstructions(tonePreset);
   // Schema guide goes last, after the agent's own task instructions -- it is
   // the strictest, most mechanical constraint (exact field names/types), so

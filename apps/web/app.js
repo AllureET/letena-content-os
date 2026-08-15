@@ -1079,6 +1079,9 @@ const screens = {
         ${['VALIDATION_FAILED','NEEDS_KNOWLEDGE'].includes(s.status) && can('script.write') ?
           `<button data-scripttx="${s.id}|DRAFT">Back to draft</button>
            <button class="danger" data-scripttx-reason="${s.id}|REJECTED">Reject</button>` : ''}
+        ${s.status === 'REJECTED' && can('script.write') ?
+          `<button class="danger" data-scriptdelete="${s.id}">Delete permanently</button>
+           <span class="muted" style="font-size:12px;align-self:center">Removes it for good, not just from view. Only possible because it is already rejected.</span>` : ''}
         ${s.status === 'APPROVED' && can('production.request') && s.production_path !== 'NONE' ?
           `<a class="btn" href="#/produce/${esc(s.id)}">Plan production (see the cost first)</a>` : ''}
       </div>`;
@@ -1943,7 +1946,7 @@ document.addEventListener('input', (e) => {
   if (countEl) countEl.textContent = `${shown} of ${rows.length} shown`;
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-scriptdelete],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
   if (!b) {
     // A real link (external platform URL, download, backlink) inside a
     // drill-down row must keep its native navigation; only fall through to
@@ -2159,6 +2162,11 @@ document.addEventListener('click', async (e) => {
     if (b.dataset.scripttx) {
       const [id, to] = b.dataset.scripttx.split('|');
       await api('POST', `/content/scripts/${id}/transition`, { to }); toast(`Script → ${to}`); return render();
+    }
+    if (b.dataset.scriptdelete) {
+      if (!confirm('Delete this rejected script permanently? This cannot be undone.')) return;
+      await api('DELETE', `/content/scripts/${b.dataset.scriptdelete}`);
+      toast('Script deleted'); location.hash = '#/scripts'; return render();
     }
     if (b.dataset.scriptlocalize) {
       // Amharic is normally written inside the generation pipeline

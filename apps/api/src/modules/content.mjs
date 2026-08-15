@@ -97,6 +97,45 @@ export default async function routes(app) {
       return reply.code(status).send(err(status, e.code ?? 'INTERNAL', e.message, { guard: e.guard }));
     }
   });
+  // Everything else in this app only ever moves through audited status
+  // transitions, never a hard delete, on purpose: content history matters
+  // here. But once a script is REJECTED it is a dead end with no further
+  // transitions out, and Nate, 15 Aug 2026, wanted rejected test scripts
+  // actually gone, not just parked. So this is scoped tight rather than a
+  // general delete: only a script already in REJECTED can be removed, so
+  // nothing in flight or with a clinical/editorial history still open can
+  // be deleted through this route, and the audit_log row survives the
+  // delete (object_id has no FK back to scripts) so the fact that it
+  // existed and was removed, and why, is still on record.
+  app.delete('/content/scripts/:id', { preHandler: requirePerm('script.write') }, async (req, reply) => {
+    return tx(async (client) => {
+      const r = await client.query('SELECT * FROM lcos.scripts WHERE id=$1 FOR UPDATE', [req.params.id]);
+      const s = r.rows[0];
+      if (!s) return reply.code(404).send(err(404, 'NOT_FOUND', 'script'));
+      if (s.status !== 'REJECTED') {
+        return reply.code(409).send(err(409, 'NOT_REJECTED',
+          'Only a rejected script can be deleted. Reject it first.'));
+      }
+      try {
+        await client.query('DELETE FROM lcos.scripts WHERE id=$1', [s.id]);
+      } catch (e) {
+        // Postgres FK violation: something still references this script
+        // (a production job, a render, published content). Those links are
+        // exactly the cases a delete should refuse, so surface it plainly
+        // instead of a raw constraint error.
+        if (e.code === '23503') {
+          return reply.code(409).send(err(409, 'HAS_DEPENDENTS',
+            'This script has production or publishing history attached and cannot be deleted. It stays rejected.'));
+        }
+        throw e;
+      }
+      await audit(client, { actor: req.actor, action: 'script.delete', objectType: 'SCRIPT',
+        objectId: s.id, objectCode: s.code, fromState: 'REJECTED', toState: null,
+        reason: s.rejected_reason ?? null });
+      reply.code(204);
+      return null;
+    });
+  });
   // Manual re-validation from the review screen. Found live 14 Aug 2026: a
   // script that FAILs on its first pass (through the Turn Into Content
   // pipeline, processGeneratedScript) never reaches routeReviews() -- that

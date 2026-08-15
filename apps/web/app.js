@@ -1076,8 +1076,9 @@ const screens = {
           `<button data-scripttx="${s.id}|${['TIER_3','TIER_4'].includes(s.risk_tier) ? 'CLINICAL_REVIEW' : 'APPROVED'}">Advance state</button>` : ''}
         ${['DRAFT','VALIDATION_FAILED'].includes(s.status) && can('script.write') ?
           `<button data-scriptvalidate="${s.id}">Re-run validation</button>` : ''}
-        ${s.status === 'VALIDATION_FAILED' && can('script.write') ?
-          `<button data-scripttx="${s.id}|DRAFT">Back to draft</button>` : ''}
+        ${['VALIDATION_FAILED','NEEDS_KNOWLEDGE'].includes(s.status) && can('script.write') ?
+          `<button data-scripttx="${s.id}|DRAFT">Back to draft</button>
+           <button class="danger" data-scripttx-reason="${s.id}|REJECTED">Reject</button>` : ''}
         ${s.status === 'APPROVED' && can('production.request') && s.production_path !== 'NONE' ?
           `<a class="btn" href="#/produce/${esc(s.id)}">Plan production (see the cost first)</a>` : ''}
       </div>`;

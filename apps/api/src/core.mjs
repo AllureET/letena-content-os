@@ -324,6 +324,14 @@ export const machines = {
         }] },
       'DRAFT>NEEDS_KNOWLEDGE': { perm: 'script.write' },
       'NEEDS_KNOWLEDGE>DRAFT': { perm: 'script.write' },
+      // A piece the writer stopped on because it needed a fact that is not
+      // an approved claim can sit here indefinitely with no way to close it
+      // out (Nate, 15 Aug 2026: "no way of rejecting or deleting the first
+      // 2 failed ones"). This app never hard-deletes anything, every object
+      // type only ever moves through audited status transitions, so the
+      // fix is a real REJECTED exit here, not a delete endpoint.
+      'NEEDS_KNOWLEDGE>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')],
+        apply: rejectScript },
       'VALIDATING>VALIDATED': { perm: 'script.write',
         guards: [async ({ object }) => {
           if (object.validation_result !== 'PASS') {
@@ -332,6 +340,8 @@ export const machines = {
         }] },
       'VALIDATING>VALIDATION_FAILED': { perm: 'script.write' },
       'VALIDATION_FAILED>DRAFT': { perm: 'script.write' },
+      'VALIDATION_FAILED>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')],
+        apply: rejectScript },
       'VALIDATED>LOCALIZING': { perm: 'script.write' },
       'VALIDATED>CLINICAL_REVIEW': { perm: 'script.write' },
       'VALIDATED>APPROVED': { perm: 'script.approve_editorial',
@@ -380,16 +390,21 @@ export const machines = {
         apply: approveScriptClinical },
       'CLINICAL_REVIEW>DRAFT': { perm: 'script.approve_clinical', guards: [G.hasReason('changesNeedReason')] },
       'CLINICAL_REVIEW>REJECTED': { perm: 'script.approve_clinical', guards: [G.hasReason('rejectNeedsReason')],
-        apply: async ({ object, ctx, client }) => {
-          await client.query('UPDATE lcos.scripts SET rejected_reason=$2 WHERE id=$1',
-            [object.id, ctx.reason]);
-        } },
+        apply: rejectScript },
       'APPROVED>SUPERSEDED': { perm: 'script.write' },
     },
   },
 };
 async function retireCard({ object, ctx, client }) {
   await client.query('UPDATE lcos.knowledge_cards SET retired_reason=$2 WHERE id=$1',
+    [object.id, ctx.reason]);
+}
+// Shared by every *>REJECTED script transition (clinical rejection, and the
+// two writer-stage exits from NEEDS_KNOWLEDGE/VALIDATION_FAILED added 15 Aug
+// 2026): a rejected script keeps its full audit trail instead of vanishing,
+// which is the whole point of never hard-deleting content here.
+async function rejectScript({ object, ctx, client }) {
+  await client.query('UPDATE lcos.scripts SET rejected_reason=$2 WHERE id=$1',
     [object.id, ctx.reason]);
 }
 async function approveScript({ object, ctx, client }) {

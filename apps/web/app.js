@@ -1763,7 +1763,12 @@ document.addEventListener('click', async (e) => {
     // drill-down row must keep its native navigation; only fall through to
     // the row's own data-nav when the click was not on an <a>.
     if (e.target.closest('a[href],select,input,textarea,label')) return;
-    const row = e.target.closest('tr[data-nav]');
+    // Board cards are .bitem divs, not table rows (Part 2, 15 Aug 2026
+    // browser check found this: keyboard Enter already handled both
+    // tr[data-nav] and .bitem[data-nav] via the keydown listener above,
+    // but a mouse click on a board card matched neither selector here,
+    // so the board, Girum's morning screen, was unclickable with a mouse.
+    const row = e.target.closest('tr[data-nav],.bitem[data-nav]');
     if (row) location.hash = '#/' + row.dataset.nav;
     return;
   }

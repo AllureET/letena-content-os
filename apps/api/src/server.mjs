@@ -4,7 +4,7 @@ import Fastify from 'fastify';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { authPlugin, login, err, q, one, totpSecret, totpVerify, audit, invalidateSetting } from './core.mjs';
+import { authPlugin, login, err, q, one, totpSecret, totpVerify, audit, invalidateSetting, userPermissions, userRoles } from './core.mjs';
 import { CRED_REGISTRY, loadCreds, credStatus, setCred } from './creds.mjs';
 import knowledge from './modules/knowledge.mjs';
 import demand from './modules/demand.mjs';
@@ -272,6 +272,132 @@ export async function buildServer() {
       const { audit } = await import('./core.mjs');
       await audit(null, { actor: req.actor, action: 'user.deactivated', objectType: 'USER',
         objectId: req.params.id });
+      return { ok: true };
+    });
+    // Reactivate closes the loop Deactivate opened: Nate, 15 Aug 2026, just
+    // wanted a way back, not a separate archived state.
+    v1.post('/platform/users/:id/reactivate', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      await q(`UPDATE lcos.users SET is_active=true WHERE id=$1`, [req.params.id]);
+      await audit(null, { actor: req.actor, action: 'user.reactivated', objectType: 'USER',
+        objectId: req.params.id });
+      return { ok: true };
+    });
+    v1.get('/platform/roles', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const r = await q(
+        `SELECT slug, name, description, is_clinical FROM lcos.roles
+         WHERE slug != 'automation' ORDER BY name`);
+      return { items: r.rows };
+    });
+    v1.get('/platform/permissions', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const r = await q(`SELECT slug, domain, description FROM lcos.permissions ORDER BY domain, slug`);
+      return { items: r.rows };
+    });
+    // Full detail for the user editor screen: roles, any per-user permission
+    // overrides on top of those roles, and the effective permission set
+    // those two combine into, so the screen never has to recompute the
+    // override logic itself.
+    v1.get('/platform/users/:id', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const u = await one(
+        `SELECT id, email, full_name, is_active, totp_enabled, last_login_at FROM lcos.users WHERE id=$1`,
+        [req.params.id]);
+      if (!u) return reply.code(404).send(err(404, 'NOT_FOUND', 'user'));
+      const roles = await userRoles(u.id);
+      const overrides = (await q(
+        `SELECT p.slug, upo.effect, upo.reason, upo.set_at
+         FROM lcos.user_permission_overrides upo JOIN lcos.permissions p ON p.id = upo.permission_id
+         WHERE upo.user_id = $1`, [u.id])).rows;
+      const effective_permissions = await userPermissions(u.id);
+      return { ...u, roles, overrides, effective_permissions };
+    });
+    // Name and email only (Nate, 15 Aug 2026: phone and photo are not worth
+    // it yet -- these are staff accounts, the schema has neither field, and
+    // a photo means real file storage, not just a form).
+    v1.patch('/platform/users/:id', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const { full_name, email } = req.body ?? {};
+      if (!full_name && !email) {
+        return reply.code(422).send(err(422, 'VALIDATION_ERROR', 'full_name or email required'));
+      }
+      const sets = []; const vals = [req.params.id]; let i = 2;
+      if (full_name) { sets.push(`full_name=$${i++}`); vals.push(full_name); }
+      if (email) { sets.push(`email=$${i++}`); vals.push(email); }
+      let u;
+      try {
+        u = await one(
+          `UPDATE lcos.users SET ${sets.join(', ')}, updated_at=now() WHERE id=$1
+           RETURNING id, email, full_name`, vals);
+      } catch (e) {
+        if (e.code === '23505') return reply.code(409).send(err(409, 'CONFLICT', 'email already exists'));
+        throw e;
+      }
+      if (!u) return reply.code(404).send(err(404, 'NOT_FOUND', 'user'));
+      await audit(null, { actor: req.actor, action: 'user.profile_edited', objectType: 'USER',
+        objectId: u.id, reason: [full_name ? 'name' : null, email ? 'email' : null].filter(Boolean).join(', ') });
+      return u;
+    });
+    v1.delete('/platform/users/:id/roles/:slug', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      if (req.params.id === req.actor.id && req.params.slug === 'admin') {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          'You cannot remove your own admin role.', { guard: 'notSelfAdmin' }));
+      }
+      const current = await userRoles(req.params.id);
+      if (current.length <= 1 && current.includes(req.params.slug)) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          'A user must hold at least one role. Add another role before removing this one.',
+          { guard: 'lastRole' }));
+      }
+      await q(
+        `DELETE FROM lcos.user_roles WHERE user_id=$1
+         AND role_id=(SELECT id FROM lcos.roles WHERE slug=$2)`, [req.params.id, req.params.slug]);
+      await audit(null, { actor: req.actor, action: 'user.role_revoked', objectType: 'USER',
+        objectId: req.params.id, reason: req.params.slug });
+      return { ok: true };
+    });
+    // The permission-override layer itself: GRANT adds a permission the
+    // user's roles don't carry, REVOKE removes one they would otherwise
+    // have, effect: null clears the override back to whatever the role(s)
+    // say by default. userPermissions() in core.mjs applies this on every
+    // request, so it takes effect immediately, no re-login needed.
+    v1.post('/platform/users/:id/permissions', async (req, reply) => {
+      if (!req.actor.permissions.includes('user.manage')) {
+        return reply.code(403).send(err(403, 'FORBIDDEN', 'user.manage'));
+      }
+      const { permission_slug, effect, reason } = req.body ?? {};
+      if (!permission_slug || ![null, undefined, 'GRANT', 'REVOKE'].includes(effect)) {
+        return reply.code(422).send(err(422, 'VALIDATION_ERROR',
+          'permission_slug required; effect must be GRANT, REVOKE, or null to clear'));
+      }
+      const perm = await one(`SELECT id FROM lcos.permissions WHERE slug=$1`, [permission_slug]);
+      if (!perm) return reply.code(422).send(err(422, 'VALIDATION_ERROR', `unknown permission ${permission_slug}`));
+      if (!effect) {
+        await q(`DELETE FROM lcos.user_permission_overrides WHERE user_id=$1 AND permission_id=$2`,
+          [req.params.id, perm.id]);
+      } else {
+        await q(
+          `INSERT INTO lcos.user_permission_overrides (user_id, permission_id, effect, set_by, reason)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (user_id, permission_id) DO UPDATE SET effect=$3, set_by=$4, reason=$5, set_at=now()`,
+          [req.params.id, perm.id, effect, req.actor.id, reason ?? null]);
+      }
+      await audit(null, { actor: req.actor, action: 'user.permission_override', objectType: 'USER',
+        objectId: req.params.id, reason: `${permission_slug} -> ${effect ?? 'default'}` });
       return { ok: true };
     });
 

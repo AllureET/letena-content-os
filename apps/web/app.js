@@ -1416,27 +1416,101 @@ const screens = {
   },
 
   async users() {
-    const r = await api('GET', '/platform/users');
-    const roles = ['medical_director','consulting_doctor','content_lead','language_editor',
-      'intake_coordinator','social_lead','producer','developer','viewer','admin'];
-    return `<h1>Users & roles</h1><div class="sub">One account per person, real emails, no shared logins. Approval rights follow roles.</div>
+    const [r, rolesRes] = await Promise.all([
+      api('GET', '/platform/users'), api('GET', '/platform/roles').catch(() => ({ items: [] })) ]);
+    const roles = rolesRes.items.length ? rolesRes.items.map(x => x.slug)
+      : ['medical_director','consulting_doctor','content_lead','language_editor',
+         'intake_coordinator','social_lead','producer','developer','viewer','admin'];
+    return `<h1>Users & roles</h1><div class="sub">One account per person, real emails, no shared logins. Approval rights follow roles. Click a row to edit name, roles, and individual permissions.</div>
       <div class="card"><div class="eyebrow">Add user</div>
         <div class="grid2">
           <div><label>Email</label><input id="u-email">
             <label>Full name</label><input id="u-name"></div>
           <div><label>Temporary password (12+ chars)</label><input id="u-pw">
-            <label>Role</label><select id="u-role">${roles.map(x => `<option>${x}</option>`).join('')}</select></div>
+            <label>Role</label><select id="u-role">${roles.map(x => `<option>${esc(x)}</option>`).join('')}</select></div>
         </div>
         <div style="margin-top:10px"><button class="primary" id="u-create">Create user</button></div></div>
       <div class="card"><table>
         <tr><th>Name</th><th>Email</th><th>Roles</th><th>2FA</th><th>Last login</th><th>Status</th><th></th></tr>
-        ${r.items.map(u => `<tr><td>${esc(u.full_name)}</td><td class="mono">${esc(u.email)}</td>
+        ${r.items.map(u => `<tr class="rowlink" data-nav="user/${u.id}" tabindex="0">
+          <td>${esc(u.full_name)}</td><td class="mono">${esc(u.email)}</td>
           <td>${(u.roles ?? []).map(x => `<span class="pill p-DRAFT"><span class="d"></span>${esc(x)}</span>`).join(' ')}</td>
           <td>${u.totp_enabled ? pill('APPROVED') : '<span class="muted">off</span>'}</td>
           <td class="muted">${dt(u.last_login_at)}</td>
           <td>${u.is_active ? pill('ACTIVE') : pill('RETIRED')}</td>
-          <td>${u.is_active ? `<button class="danger" data-deactivate="${u.id}">Deactivate</button>` : ''}</td>
+          <td>${u.is_active ? `<button class="danger" data-deactivate="${u.id}">Deactivate</button>`
+            : `<button data-ureactivate="${u.id}">Reactivate</button>`}</td>
         </tr>`).join('')}</table></div>`;
+  },
+
+  // Per-user editor: profile, roles (grant/revoke), and the permission
+  // override layer on top of roles (0027_user_permission_overrides.sql).
+  // Nate, 15 Aug 2026: the list screen only ever supported creating a user
+  // and deactivating one; this is where the rest of it lives.
+  async user(id) {
+    const [u, rolesRes, permsRes] = await Promise.all([
+      api('GET', `/platform/users/${id}`),
+      api('GET', '/platform/roles'),
+      api('GET', '/platform/permissions'),
+    ]);
+    const heldRoles = new Set(u.roles ?? []);
+    const overrideBySlug = new Map((u.overrides ?? []).map(o => [o.slug, o.effect]));
+    const effectiveSet = new Set(u.effective_permissions ?? []);
+    const groups = new Map();
+    for (const p of permsRes.items) {
+      if (!groups.has(p.domain)) groups.set(p.domain, []);
+      groups.get(p.domain).push(p);
+    }
+    const permRows = [...groups.entries()].map(([domain, items]) => `
+      <div class="eyebrow" style="margin-top:12px;text-transform:capitalize">${esc(domain)}</div>
+      ${items.map(p => {
+        const override = overrideBySlug.get(p.slug) ?? '';
+        const isOn = effectiveSet.has(p.slug);
+        return `<div class="claimrow" style="align-items:center">
+          <div style="flex:1">
+            <div class="mono" style="font-size:12.5px">${esc(p.slug)}</div>
+            <div class="muted" style="font-size:11.5px">${esc(p.description)}</div>
+          </div>
+          ${isOn ? '<span class="pill p-APPROVED"><span class="d"></span>granted</span>'
+            : '<span class="pill p-DRAFT"><span class="d"></span>not granted</span>'}
+          <select data-upermset="${u.id}|${esc(p.slug)}" style="width:auto;min-width:170px">
+            <option value="" ${override === '' ? 'selected' : ''}>Default (from role)</option>
+            <option value="GRANT" ${override === 'GRANT' ? 'selected' : ''}>Override: granted</option>
+            <option value="REVOKE" ${override === 'REVOKE' ? 'selected' : ''}>Override: revoked</option>
+          </select>
+        </div>`;
+      }).join('')}`).join('');
+    return `<a class="backlink" href="#/users">&larr; Users & roles</a>
+      <h1 class="mono">${esc(u.full_name)}</h1>
+      <div class="sub flex">${esc(u.email)} ${u.is_active ? pill('ACTIVE') : pill('RETIRED')}
+        ${u.totp_enabled ? '<span class="muted">2FA on</span>' : '<span class="muted">2FA off</span>'}
+        ${u.last_login_at ? `<span class="muted">last login ${dt(u.last_login_at)}</span>` : ''}</div>
+      <div class="grid2">
+        <div>
+          <div class="card"><div class="eyebrow">Profile</div>
+            <label>Full name</label><input id="u-edit-name" value="${esc(u.full_name)}">
+            <label>Email</label><input id="u-edit-email" value="${esc(u.email)}">
+            <div class="flex" style="margin-top:10px">
+              <button class="primary" data-usave="${u.id}">Save changes</button>
+              ${u.is_active ? `<button class="danger" data-deactivate="${u.id}">Deactivate</button>`
+                : `<button data-ureactivate="${u.id}">Reactivate</button>`}
+            </div>
+          </div>
+          <div class="card"><div class="eyebrow">Roles</div>
+            <div class="flex" style="flex-wrap:wrap;gap:8px">
+              ${rolesRes.items.map(r => heldRoles.has(r.slug)
+                ? `<span class="pill p-APPROVED"><span class="d"></span>${esc(r.slug)}
+                     <button class="danger" style="margin-left:6px;padding:2px 8px;font-size:11px" data-urolerem="${u.id}|${esc(r.slug)}">remove</button></span>`
+                : `<button style="font-size:12px" data-uroleadd="${u.id}|${esc(r.slug)}">+ ${esc(r.slug)}</button>`).join('')}
+            </div>
+            <div class="muted" style="font-size:12px;margin-top:8px">A user must hold at least one role. Removing someone's only role is blocked until another is added.</div>
+          </div>
+        </div>
+        <div class="card"><div class="eyebrow">Individual permissions</div>
+          <div class="muted" style="font-size:12px;margin-bottom:4px">These are exceptions on top of the roles above. Leave on Default unless this person specifically needs more or less than their role normally grants.</div>
+          ${permRows}
+        </div>
+      </div>`;
   },
 
   async settings() {
@@ -1946,7 +2020,7 @@ document.addEventListener('input', (e) => {
   if (countEl) countEl.textContent = `${shown} of ${rows.length} shown`;
 });
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-scriptdelete],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
+  const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-scriptdelete],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],[data-ureactivate],[data-usave],[data-uroleadd],[data-urolerem],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue');
   if (!b) {
     // A real link (external platform URL, download, backlink) inside a
     // drill-down row must keep its native navigation; only fall through to
@@ -2202,6 +2276,25 @@ document.addEventListener('click', async (e) => {
       await api('POST', `/platform/users/${b.dataset.deactivate}/deactivate`);
       toast('Deactivated'); return render();
     }
+    if (b.dataset.ureactivate) {
+      await api('POST', `/platform/users/${b.dataset.ureactivate}/reactivate`);
+      toast('Reactivated'); return render();
+    }
+    if (b.dataset.usave) {
+      const full_name = elv('u-edit-name'), email = elv('u-edit-email');
+      await api('PATCH', `/platform/users/${b.dataset.usave}`, { full_name, email });
+      toast('Profile saved'); return render();
+    }
+    if (b.dataset.uroleadd) {
+      const [id, slug] = b.dataset.uroleadd.split('|');
+      await api('POST', `/platform/users/${id}/roles`, { role_slug: slug });
+      toast(`Role added: ${slug}`); return render();
+    }
+    if (b.dataset.urolerem) {
+      const [id, slug] = b.dataset.urolerem.split('|');
+      await api('DELETE', `/platform/users/${id}/roles/${slug}`);
+      toast(`Role removed: ${slug}`); return render();
+    }
     if (b.id === 'a-go') {
       const r = await api('GET', '/production/assets/search?semantic=' + encodeURIComponent($('#a-search').value));
       $('#a-results').innerHTML = `<div class="agrid" style="margin-top:10px">` + (r.items.map(a =>
@@ -2280,6 +2373,20 @@ document.addEventListener('change', (e) => {
     return render();
   }
   if (t.id === 'mk-transcript') { MAKE.transcriptId = t.value; }
+});
+
+// Individual permission overrides (0027_user_permission_overrides.sql): the
+// select commits on change, no separate save button, since a matrix of ~40
+// rows each needing its own Save click would be worse than acting
+// immediately the way the role add/remove buttons already do.
+document.addEventListener('change', async (e) => {
+  const t = e.target;
+  if (!t.dataset?.upermset) return;
+  const [id, slug] = t.dataset.upermset.split('|');
+  try {
+    await api('POST', `/platform/users/${id}/permissions`, { permission_slug: slug, effect: t.value || null });
+    toast(`${slug}: ${t.value || 'default'}`); render();
+  } catch (ex) { toast(ex.message, true); render(); }
 });
 
 document.addEventListener('click', async (e) => {

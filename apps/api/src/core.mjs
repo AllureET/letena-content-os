@@ -69,13 +69,24 @@ export async function login(email, password, totp) {
   return { token, user: { id: u.id, email: u.email, full_name: u.full_name, roles, permissions: perms } };
 }
 
+// Effective permissions = the union of every role the user holds, with
+// per-user overrides applied last (0027_user_permission_overrides.sql).
+// REVOKE always wins over a role grant for the same slug; GRANT adds a
+// permission none of the user's roles carry. This runs on every request
+// (permissions are not cached in the JWT), so an override takes effect
+// immediately, no re-login needed.
 export async function userPermissions(userId) {
   const r = await q(
-    `SELECT DISTINCT p.slug FROM lcos.permissions p
-     JOIN lcos.role_permissions rp ON rp.permission_id = p.id
-     JOIN lcos.user_roles ur ON ur.role_id = rp.role_id
-     WHERE ur.user_id = $1`, [userId]);
-  return r.rows.map(x => x.slug);
+    `SELECT p.slug,
+            bool_or(rp.permission_id IS NOT NULL) AS from_role,
+            (SELECT effect FROM lcos.user_permission_overrides upo
+             WHERE upo.user_id = $1 AND upo.permission_id = p.id) AS override
+     FROM lcos.permissions p
+     LEFT JOIN lcos.role_permissions rp ON rp.permission_id = p.id
+       AND rp.role_id IN (SELECT role_id FROM lcos.user_roles WHERE user_id = $1)
+     GROUP BY p.id, p.slug`, [userId]);
+  return r.rows.filter(x => x.override === 'REVOKE' ? false : x.override === 'GRANT' ? true : x.from_role)
+    .map(x => x.slug);
 }
 export async function userRoles(userId) {
   const r = await q(

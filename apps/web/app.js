@@ -1077,11 +1077,12 @@ const screens = {
         ${['DRAFT','VALIDATION_FAILED'].includes(s.status) && can('script.write') ?
           `<button data-scriptvalidate="${s.id}">Re-run validation</button>` : ''}
         ${['VALIDATION_FAILED','NEEDS_KNOWLEDGE'].includes(s.status) && can('script.write') ?
-          `<button data-scripttx="${s.id}|DRAFT">Back to draft</button>
-           <button class="danger" data-scripttx-reason="${s.id}|REJECTED">Reject</button>` : ''}
+          `<button data-scripttx="${s.id}|DRAFT">Back to draft</button>` : ''}
         ${s.status === 'REJECTED' && can('script.write') ?
           `<button class="danger" data-scriptdelete="${s.id}">Delete permanently</button>
            <span class="muted" style="font-size:12px;align-self:center">Removes it for good, not just from view. Only possible because it is already rejected.</span>` : ''}
+        ${!['REJECTED','SUPERSEDED','CLINICAL_REVIEW'].includes(s.status) && can('script.write') ?
+          `<button class="danger" data-scripttx-reason="${s.id}|REJECTED">Reject</button>` : ''}
         ${s.status === 'APPROVED' && can('production.request') && s.production_path !== 'NONE' ?
           `<a class="btn" href="#/produce/${esc(s.id)}">Plan production (see the cost first)</a>` : ''}
       </div>`;

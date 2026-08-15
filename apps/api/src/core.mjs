@@ -334,6 +334,18 @@ export const machines = {
           }
         }] },
       'DRAFT>NEEDS_KNOWLEDGE': { perm: 'script.write' },
+      // Universal reject, added 15 Aug 2026 after Nate hit three APPROVED
+      // scripts with no way to kill them: "I don't care if it's been
+      // approved. I should be able to bring it back." Every non-terminal
+      // status gets the same REJECTED exit NEEDS_KNOWLEDGE/VALIDATION_FAILED
+      // already had, all using rejectScript so the reason is recorded the
+      // same way regardless of where in the pipeline the piece was.
+      // Rejecting an APPROVED script does not touch anything already
+      // produced or published; it only stops it being picked up for
+      // production going forward. Deleting it afterward still goes through
+      // the REJECTED-only DELETE route, which itself still refuses if
+      // production/publishing rows already reference it.
+      'DRAFT>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')], apply: rejectScript },
       'NEEDS_KNOWLEDGE>DRAFT': { perm: 'script.write' },
       // A piece the writer stopped on because it needed a fact that is not
       // an approved claim can sit here indefinitely with no way to close it
@@ -350,11 +362,13 @@ export const machines = {
           }
         }] },
       'VALIDATING>VALIDATION_FAILED': { perm: 'script.write' },
+      'VALIDATING>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')], apply: rejectScript },
       'VALIDATION_FAILED>DRAFT': { perm: 'script.write' },
       'VALIDATION_FAILED>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')],
         apply: rejectScript },
       'VALIDATED>LOCALIZING': { perm: 'script.write' },
       'VALIDATED>CLINICAL_REVIEW': { perm: 'script.write' },
+      'VALIDATED>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')], apply: rejectScript },
       'VALIDATED>APPROVED': { perm: 'script.approve_editorial',
         guards: [G.reviewerIsNotAuthor, G.contentHashMatches,
           async ({ object }) => {
@@ -367,6 +381,7 @@ export const machines = {
           }],
         apply: approveScript },
       'LOCALIZING>LANGUAGE_REVIEW': { perm: 'script.write' },
+      'LOCALIZING>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')], apply: rejectScript },
       'LANGUAGE_REVIEW>CLINICAL_REVIEW': { perm: 'script.approve_language' },
       'LANGUAGE_REVIEW>APPROVED': { perm: 'script.approve_language',
         guards: [G.contentHashMatches, async ({ object }) => {
@@ -376,6 +391,7 @@ export const machines = {
         }],
         apply: approveScript },
       'LANGUAGE_REVIEW>DRAFT': { perm: 'script.approve_language', guards: [G.hasReason('changesNeedReason')] },
+      'LANGUAGE_REVIEW>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')], apply: rejectScript },
       'CLINICAL_REVIEW>APPROVED': { perm: 'script.approve_clinical',
         guards: [G.reviewerIsNotAuthor, G.contentHashMatches,
           async ({ object, ctx, client }) => {
@@ -403,6 +419,7 @@ export const machines = {
       'CLINICAL_REVIEW>REJECTED': { perm: 'script.approve_clinical', guards: [G.hasReason('rejectNeedsReason')],
         apply: rejectScript },
       'APPROVED>SUPERSEDED': { perm: 'script.write' },
+      'APPROVED>REJECTED': { perm: 'script.write', guards: [G.hasReason('rejectNeedsReason')], apply: rejectScript },
     },
   },
 };

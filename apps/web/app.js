@@ -435,6 +435,25 @@ function shell(active, content) {
   </div>`;
 }
 
+// Video Studio format catalog (18 Aug 2026). The backend's `format` column
+// is free text with no enum/check constraint (studio.mjs just defaults it
+// to 'ai_story' when omitted) -- there is no real vocabulary to validate
+// against yet. This list exists purely so the New project form offers
+// meaningful, labeled choices instead of a raw text box pre-filled with
+// the DB's own internal default value. Slugs loosely follow the playbook's
+// named format templates (section 23); 'ai_story' is kept as the default
+// so it still reads clearly rather than as a stray underscored code.
+const STUDIO_FORMATS = [
+  { value: 'ai_story', label: 'General AI story', desc: 'A narrated or character-driven short with no fixed template -- the default for anything that does not fit a more specific format below.' },
+  { value: 'ad', label: 'Ad', desc: 'A short performance or product ad built around a single message and a clear call to action.' },
+  { value: 'psa', label: 'PSA', desc: 'A public service message: a health or safety fact delivered plainly, usually ending on the Letena door/CTA.' },
+  { value: 'explainer', label: 'Explainer', desc: 'Walks through how something works or what to expect, step by step.' },
+  { value: 'fable', label: 'Fable', desc: 'An animal or storybook tale with a moral, told through a character arc.' },
+  { value: 'social_short', label: 'Social short', desc: 'A quick vertical clip built for one platform feed, hook-first.' },
+  { value: 'interview', label: 'Interview', desc: 'A talking-head Q&A format, real or scripted.' },
+  { value: 'promo', label: 'Promo', desc: 'Announces or launches something -- a service, an event, a new offering.' },
+];
+
 // ---------- screens ----------
 const screens = {
   // Today and Board, merged (15 Aug 2026): tiles as a compact strip up top,
@@ -1369,7 +1388,10 @@ const screens = {
         <div class="grid2">
           <div>
             <label>Title</label><input id="st-title" placeholder="e.g. Maya's first visit">
-            <label>Format</label><input id="st-format" value="ai_story">
+            <label>Format</label><select id="st-format">
+              ${STUDIO_FORMATS.map(f => `<option value="${esc(f.value)}"${f.value === 'ai_story' ? ' selected' : ''}>${esc(f.label)}</option>`).join('')}
+            </select>
+            <div class="muted" id="st-format-desc" style="font-size:12px;margin-top:4px">${esc(STUDIO_FORMATS.find(f => f.value === 'ai_story').desc)}</div>
           </div>
           <div>
             <label>Aspect ratio</label><select id="st-aspect">
@@ -2688,6 +2710,14 @@ const has = (id) => !!document.getElementById(id);
 // The Make screen's selections live in MAKE so a re-render keeps them.
 document.addEventListener('change', (e) => {
   const t = e.target;
+  // Video Studio's format description updates in place, deliberately NOT
+  // via render() -- a full re-render would wipe whatever the user already
+  // typed into Title/Budget on the same form.
+  if (t.id === 'st-format') {
+    const desc = document.getElementById('st-format-desc');
+    if (desc) desc.textContent = STUDIO_FORMATS.find(f => f.value === t.value)?.desc ?? '';
+    return;
+  }
   if (t.id === 'mk-card') { MAKE.cardId = t.value; return render(); }
   if (t.name === 'mk-aud') { MAKE.audience = t.value; return render(); }
   if (t.name === 'mk-path') { MAKE.path = t.value; return render(); }

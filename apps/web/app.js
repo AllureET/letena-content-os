@@ -1664,20 +1664,23 @@ const screens = {
           <td class="muted" style="font-size:11.5px">${esc(p.format_notes ?? '')}</td></tr>`).join('')
         || '<tr><td colspan=6 class="empty">No specs seeded yet.</td></tr>'}</table></div>`;
     } catch { /* publish.read missing; hide */ }
-    // AI budget cap and backlog notify threshold (15 Aug 2026). Replaces the
-    // old always-on background classify sweep: nothing calls the AI on its
-    // own timer anymore. This cap is the real backstop against a big manual
-    // batch overshooting, and the threshold controls when the dashboard
-    // banner speaks up.
+    // AI spend cap and backlog notify threshold (15-16 Aug 2026). The cap
+    // setting (ai.daily_spend_cap_usd) already existed and was already
+    // labeled "hard stop," but nothing actually enforced it against real
+    // AI calls -- found live 16 Aug 2026. It is wired up for real now, in
+    // ai/gateway.mjs. The old always-on background classify sweep is also
+    // gone: nothing calls the AI on its own timer anymore, so this cap is
+    // the backstop for a manual batch pull, and the threshold controls
+    // when the dashboard banner speaks up.
     const budgetHtml = can('settings.manage') ? (() => {
-      const capRaw = r.items.find(s => s.key === 'ai.daily_budget_cap_usd')?.value;
+      const capRaw = r.items.find(s => s.key === 'ai.daily_spend_cap_usd')?.value;
       const capVal = (capRaw === null || capRaw === undefined) ? '' : capRaw;
       const threshold = Number(r.items.find(s => s.key === 'demand.backlog_notify_threshold')?.value ?? 50);
       return `<div class="card"><div class="eyebrow">AI spend and backlog alerts</div>
-        <div class="sub" style="margin-bottom:10px">There is no automatic AI calling anymore. Classification only runs when someone clicks "Classify pending questions." This cap is the backstop for that click; the threshold controls when the dashboard tells you it is time to click it.</div>
+        <div class="sub" style="margin-bottom:10px">This cap now actually stops AI calls once today's real spend reaches it; before 16 Aug it was shown on the production plan screen but never enforced. There is no automatic AI calling anymore either, classification only runs when someone clicks "Classify pending questions," so this cap is really the backstop for that click. The threshold below controls when the dashboard tells you it is time to click it.</div>
         <div class="flex" style="flex-wrap:wrap;gap:18px">
           <div>
-            <label class="muted" style="font-size:12px;display:block;margin-bottom:4px">Daily AI budget cap (USD, blank = no cap)</label>
+            <label class="muted" style="font-size:12px;display:block;margin-bottom:4px">Daily AI spend cap (USD, blank = no cap)</label>
             <div class="flex"><input type="number" min="0" step="0.01" id="budget-cap" style="max-width:140px" value="${esc(String(capVal))}" placeholder="no cap">
               <button class="primary" id="budget-save">Save</button></div>
           </div>
@@ -2174,8 +2177,8 @@ document.addEventListener('click', async (e) => {
     if (b.id === 'budget-save') {
       const raw = $('#budget-cap').value.trim();
       const value = raw === '' ? null : Number(raw);
-      await api('PUT', '/platform/settings', { key: 'ai.daily_budget_cap_usd', value });
-      toast(value === null ? 'No daily AI budget cap.' : `Daily AI budget cap saved: $${value}`);
+      await api('PUT', '/platform/settings', { key: 'ai.daily_spend_cap_usd', value });
+      toast(value === null ? 'No daily AI spend cap. AI calls will never be refused for budget.' : `Daily AI spend cap saved: $${value}. This is now enforced, not just displayed.`, value === null ? 'warn' : false);
       return render();
     }
     if (b.id === 'threshold-save') {

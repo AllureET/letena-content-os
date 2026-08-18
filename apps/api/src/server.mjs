@@ -515,15 +515,17 @@ export async function buildServer() {
             `content.tone_preset must be an active tone preset key (e.g. LETENA_DEFAULT)`));
         }
       }
-      // ai.daily_budget_cap_usd: the real-dollar backstop added 15 Aug 2026
-      // after the background classify sweep ran up spend with nothing able
-      // to stop it (see the removed sweep in modules/demand.mjs and the cap
-      // check in ai/gateway.mjs). null/blank means no cap, matching the
-      // historical behavior; anything else must be a non-negative number.
-      if (key === 'ai.daily_budget_cap_usd') {
+      // ai.daily_spend_cap_usd: pre-existing setting (default 40, "Hard stop
+      // for AI spend per day") that turned out not to actually stop
+      // anything -- found live 16 Aug 2026 that it was read-and-displayed
+      // only, never enforced against real invokeAgent() calls. Fixed in
+      // ai/gateway.mjs's aiDailyBudgetStatus(), which now genuinely gates
+      // every call. null/blank means no cap; anything else must be a
+      // non-negative number.
+      if (key === 'ai.daily_spend_cap_usd') {
         if (value !== null && value !== '' && (typeof value !== 'number' || value < 0)) {
           return reply.code(422).send(err(422, 'VALIDATION_ERROR',
-            'ai.daily_budget_cap_usd must be a non-negative number, or blank for no cap'));
+            'ai.daily_spend_cap_usd must be a non-negative number, or blank for no cap'));
         }
         if (value === '') value = null;
       }

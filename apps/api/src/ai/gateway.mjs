@@ -389,18 +389,25 @@ export function buildAgentSystemPrompt(basePrompt, toneInstructions) {
   return [HOUSE_STYLE_RULES, toneBlock, basePrompt].filter(Boolean).join('\n\n');
 }
 
-// Daily AI spend cap. Setting key 'ai.daily_budget_cap_usd': blank/unset
-// means no cap (the historical behavior). When set, sums today's real
-// cost_usd from ai_invocations (UTC calendar day, matching occurred_at's
-// timestamptz default) and compares against the cap. Added 15 Aug 2026
-// after a background sweep ran up real spend with nothing able to stop it
-// (see the removed sweep in modules/demand.mjs) -- this is the backstop so
-// that can never happen silently again, cap or no cap: even a large manual
-// batch pull now checks this before every call in the batch, not just once
-// at the start, so it stops mid-batch the moment the cap is crossed rather
-// than overshooting by a full batch's worth of spend.
+// Daily AI spend cap. Setting key 'ai.daily_spend_cap_usd' (NOT a new key:
+// this setting already existed, default 40, labeled "Hard stop for AI spend
+// per day" -- but found live 16 Aug 2026 that nothing ever actually
+// enforced it as a hard stop. production.mjs's spendToday() read it and
+// displayed it on the production plan screen, and runProductionJob() only
+// ever checked the separate render.daily_spend_cap_usd before a render;
+// the AI figure was informational only. This is the fix: the same setting
+// now actually gates every invokeAgent() call. Blank/unset means no cap.
+// Sums today's real cost_usd from ai_invocations (UTC calendar day,
+// matching occurred_at's timestamptz default) and compares against the
+// cap. Added 15-16 Aug 2026 after a background sweep ran up real spend
+// with nothing able to stop it (see the removed sweep in
+// modules/demand.mjs) -- this is the backstop so that can never happen
+// silently again, cap or no cap: even a large manual batch pull now
+// checks this before every call in the batch, not just once at the start,
+// so it stops mid-batch the moment the cap is crossed rather than
+// overshooting by a full batch's worth of spend.
 export async function aiDailyBudgetStatus() {
-  const capRaw = await setting('ai.daily_budget_cap_usd', null);
+  const capRaw = await setting('ai.daily_spend_cap_usd', 40);
   const cap = capRaw === null || capRaw === '' ? null : Number(capRaw);
   const r = await one(
     `SELECT COALESCE(sum(cost_usd),0)::numeric(12,4) AS spent

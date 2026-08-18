@@ -42,6 +42,8 @@ export const CRED_REGISTRY = [
     hint: 'Image generation.' },
   { key: 'CANVA_ACCESS_TOKEN', label: 'Canva access token', group: 'Production services', secret: true,
     hint: 'Carousels and statics.' },
+  { key: 'SUNO_API_KEY', label: 'Suno API key', group: 'Production services', secret: true,
+    hint: 'Music and score generation for Video Studio projects.' },
   { key: 'TELEGRAM_BOT_TOKEN', label: 'Telegram bot token', group: 'Publishing', secret: true,
     hint: 'Publishes approved videos to the channel.' },
   { key: 'TELEGRAM_CHANNEL', label: 'Telegram channel', group: 'Publishing', secret: false,

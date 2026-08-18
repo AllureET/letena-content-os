@@ -336,6 +336,7 @@ const SECTIONS = [
                                 ['transcripts', 'Transcripts'],
                                 ['concepts', 'Concepts'], ['families', 'Families']]],
   ['production', 'Production', [['production', 'Progress'], ['assets', 'Assets']]],
+  ['studio',     'Video Studio', [['studio', 'Projects']]],
   ['publishing', 'Publishing', [['calendar', 'Calendar'], ['published', 'Published']]],
   ['insights',   'Insights',   [['analytics', 'Performance'], ['experiments', 'Experiments'],
                                 ['costs', 'Costs']]],
@@ -348,7 +349,7 @@ const SECTIONS = [
 const DETAIL_SECTION = {
   question: 'questions', card: 'knowledge', script: 'content', render: 'production',
   amharic: 'content', produce: 'production', transcript: 'content',
-  board: 'today',
+  board: 'today', 'studio-project': 'studio',
 };
 
 // route id -> [sectionId, sectionLabel, tabs]
@@ -393,13 +394,14 @@ const NAV_ICON = {
   knowledge: '<path d="M4 3.5A1.5 1.5 0 0 1 5.5 2H15v14H5.5A1.5 1.5 0 0 0 4 17.5z"/><path d="M4 3.5v14"/>',
   content: '<rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="M2.5 7h15M6.5 3.5v3.5"/>',
   production: '<path d="M2.5 6.5 10 2.5l7.5 4v7L10 17.5l-7.5-4z"/><path d="M2.5 6.5 10 10.5l7.5-4M10 10.5v7"/>',
+  studio: '<path d="M2.5 6h11v8h-11z"/><path d="M13.5 8.5 17.5 6v8l-4-2.5z"/><path d="M2.5 6l1-2.5h2l-1 2.5M6.5 6l1-2.5h2l-1 2.5M10.5 6l1-2.5h2l-1 2.5"/>',
   publishing: '<path d="M17 3 2 9.5l6 2 2 6z"/><path d="M17 3 10 11.5"/>',
   insights: '<path d="M3 17V3M3 17h14"/><path d="M6 14V9M10 14V6M14 14v-3"/>',
   admin: '<circle cx="10" cy="10" r="2.5"/><path d="M10 3v2M10 15v2M17 10h-2M5 10H3M15.1 4.9l-1.4 1.4M6.3 13.7l-1.4 1.4M15.1 15.1l-1.4-1.4M6.3 6.3 4.9 4.9"/>',
 };
 const NAV_GROUPS = [
   ['Work', ['today', 'plan']],
-  ['Pipeline', ['questions', 'knowledge', 'content', 'production', 'publishing']],
+  ['Pipeline', ['questions', 'knowledge', 'content', 'production', 'studio', 'publishing']],
   ['System', ['insights', 'admin']],
 ];
 function shell(active, content) {
@@ -1337,6 +1339,217 @@ const screens = {
           </div>
         </div>`).join('') || '<div class="card empty" style="grid-column:1/-1">Nothing matches. Clear the filters, or add the first asset above.</div>'}
       </div>`;
+  },
+
+  // ---------- Video Studio (18 Aug 2026) ----------
+  // Standalone AI video production pipeline (Postgres schema `studio`,
+  // apps/api/src/modules/studio.mjs), deliberately separate from the
+  // quick send_it/save_it Kling render path already covered by the
+  // Production section above. Continuity locks, shot-by-shot generation
+  // with automated QC, then assembly into a rough cut. Two other engineers
+  // are extending the backend concurrently (budget guardrails, retry,
+  // assembly) tonight, so every field read off the project/shot/asset
+  // payloads here is optional-chained: a field that does not exist yet
+  // just does not render, rather than throwing.
+  async studio() {
+    const r = await api('GET', '/studio/projects');
+    const items = r.items ?? [];
+    return `<h1>Video Studio</h1><div class="sub">The standalone AI video pipeline: continuity-locked characters and environments, shot-by-shot generation with automated QC, then assembly. Separate from the quick renders under Production.</div>
+      <div class="card"><table>
+      <tr><th>Code</th><th>Title</th><th>Format</th><th>State</th><th>Aspect</th><th>Created</th></tr>
+      ${items.map(p => `<tr class="rowlink" data-nav="studio-project/${esc(p.id)}" tabindex="0">
+        <td class="mono"><b>${esc(p.code)}</b></td>
+        <td>${esc(p.title)}</td>
+        <td>${esc(p.format)}</td>
+        <td>${pill(p.state)}</td>
+        <td class="mono">${esc(p.aspect_ratio)}</td>
+        <td class="muted">${dt(p.created_at)}</td></tr>`).join('') || empty(6, 'No Video Studio projects yet. Start one below.')}
+      </table></div>
+      ${can('studio.write') ? `<div class="card"><div class="eyebrow">New project</div>
+        <div class="grid2">
+          <div>
+            <label>Title</label><input id="st-title" placeholder="e.g. Maya's first visit">
+            <label>Format</label><input id="st-format" value="ai_story">
+          </div>
+          <div>
+            <label>Aspect ratio</label><select id="st-aspect">
+              <option value="9:16" selected>9:16 (vertical)</option>
+              <option value="16:9">16:9 (widescreen)</option>
+              <option value="1:1">1:1 (square)</option></select>
+            <label>Language</label><select id="st-lang">
+              <option value="am" selected>Amharic</option>
+              <option value="en">English</option></select>
+            <label>Budget cap (USD, optional)</label>
+            <input id="st-budget" type="number" min="0" step="0.01" placeholder="leave blank for no cap">
+          </div>
+        </div>
+        <div style="margin-top:12px"><button class="primary" id="st-newproj-go">Create project</button></div>
+      </div>` : ''}`;
+  },
+
+  async 'studio-project'(id) {
+    let p;
+    try { p = await api('GET', `/studio/projects/${id}`); }
+    catch (ex) {
+      return `<a class="backlink" href="#/studio">&larr; All Video Studio projects</a>
+        <h1>Project not found</h1>
+        <div class="sub">${esc(ex.message)}</div>
+        <div class="card empty">Nothing to show here. Head back to the project list.</div>`;
+    }
+    const locks = Array.isArray(p.locks) ? p.locks : [];
+    const shots = Array.isArray(p.shots) ? p.shots : [];
+    const events = Array.isArray(p.events) ? p.events : [];
+
+    // Budget: only shown when a cap was actually set. budget_pct/budget_warning
+    // are speculative fields another engineer's concurrent guardrail work may
+    // add tonight; shown only if present, never assumed.
+    let budgetHtml = '';
+    if (p.budget_cap_usd != null) {
+      const spent = Number(p.spent_usd ?? 0);
+      const cap = Number(p.budget_cap_usd);
+      const pct = Math.min(100, Math.round((spent / (cap || 1)) * 100));
+      budgetHtml = `<div style="max-width:380px;margin-top:10px">
+        <div class="flex" style="justify-content:space-between">
+          <span style="font-size:12px">Budget</span>
+          <span class="mono" style="font-size:12px">$${spent.toFixed(2)} of $${cap.toFixed(2)} spent</span></div>
+        <div class="meter"><div class="meter-fill ${pct >= 100 ? 'full' : pct >= 75 ? 'warn' : ''}" style="width:${pct}%"></div></div>
+        ${p.budget_pct != null ? `<div class="muted" style="font-size:11px;margin-top:4px">${esc(String(p.budget_pct))}% of cap</div>` : ''}
+        ${p.budget_warning ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">${esc(p.budget_warning)}</div>` : ''}
+      </div>`;
+    }
+
+    const locksHtml = locks.length ? locks.map(l => `<div class="card" style="margin-bottom:8px">
+        <div class="flex">
+          <span class="mono">${esc(l.entity_type)} &middot; ${esc(l.entity_code)}</span>
+          <span class="muted">v${esc(String(l.version ?? 1))}</span>
+          ${l.approved_at ? `<span class="pill p-APPROVED"><span class="d"></span>approved</span>`
+            : `<span class="pill p-PENDING"><span class="d"></span>pending approval</span>`}
+          <span class="spacer"></span>
+          ${can('studio.approve') && !l.approved_at ? `<button class="approve" data-stlockapprove="${esc(l.id)}">Approve</button>` : ''}
+          ${can('studio.generate') ? `<button data-stlockref="${esc(l.id)}">Generate reference image</button>` : ''}
+        </div>
+      </div>`).join('') : '<div class="card empty">No locks yet.</div>';
+
+    const newLockHtml = can('studio.write') ? `<div class="card"><div class="eyebrow">New lock</div>
+      <div class="grid2">
+        <div>
+          <label>Level</label><select id="st-lock-level">
+            <option value="L0_PROJECT">L0_PROJECT</option>
+            <option value="L1_ENTITY" selected>L1_ENTITY</option>
+            <option value="L2_STATE">L2_STATE</option>
+            <option value="L3_SEQUENCE">L3_SEQUENCE</option></select>
+          <label>Entity type</label><select id="st-lock-entitytype">
+            <option value="STYLE">STYLE</option>
+            <option value="CHARACTER" selected>CHARACTER</option>
+            <option value="ENVIRONMENT">ENVIRONMENT</option>
+            <option value="PROP">PROP</option></select>
+          <label>Entity code</label><input id="st-lock-entitycode" placeholder="e.g. CHR-MAYA">
+        </div>
+        <div>
+          <label>Lock data (JSON)</label>
+          <textarea id="st-lock-data" placeholder='{"description": "Maya, 24, braided hair, yellow scarf"}'></textarea>
+        </div>
+      </div>
+      <div style="margin-top:12px"><button class="primary" data-stlockcreate="${esc(id)}">Create lock</button></div>
+    </div>` : '';
+
+    const acceptedMark = (s) => s.has_accepted_asset
+      ? '<span style="color:var(--risk-routine);font-weight:600">&check; accepted</span>'
+      : '<span class="muted">&mdash;</span>';
+    const shotsHtml = shots.length ? `<div class="card"><table>
+      <tr><th>Shot</th><th>Beat</th><th>Status</th><th>Duration (s)</th><th>Asset</th><th></th></tr>
+      ${shots.map(s => {
+        const beat = s.story?.beat ?? '';
+        const editable = ['DRAFT', 'STALE'].includes(s.status);
+        return `<tr>
+          <td class="mono"><b>${esc(s.shot_code)}</b><div class="muted" style="font-size:11px">#${esc(String(s.order_index ?? ''))}</div></td>
+          <td style="max-width:240px">${esc(beat)}</td>
+          <td>${pill(s.status)}</td>
+          <td class="mono">${esc(String(s.duration_target_s ?? ''))}</td>
+          <td>${acceptedMark(s)}</td>
+          <td style="min-width:220px">
+            <div class="flex" style="flex-wrap:wrap">
+              ${can('studio.generate') ? `<button data-stshotgenerate="${esc(s.id)}">Generate</button>` : ''}
+              ${can('studio.generate') ? `<button data-stshotvoiceshow="${esc(s.id)}">Add voice</button>` : ''}
+              <button data-stassets="${esc(s.id)}">Assets &amp; QC</button>
+            </div>
+            ${editable && can('studio.write') ? `<div class="claimrow" style="margin-top:8px">
+              <label>Duration target (s)</label>
+              <input id="stedit-dur-${esc(s.id)}" type="number" min="1" value="${esc(String(s.duration_target_s ?? 5))}">
+              <label>Story beat</label><textarea id="stedit-beat-${esc(s.id)}">${esc(beat)}</textarea>
+              <button style="margin-top:6px" data-stshotedit="${esc(s.id)}">Save changes</button>
+            </div>` : ''}
+            <div id="stvoice-${esc(s.id)}" hidden style="margin-top:8px">
+              <label>Voice line</label>
+              <textarea id="stvoicetext-${esc(s.id)}" placeholder="The spoken line for this shot"></textarea>
+              <button style="margin-top:6px" data-stshotvoice="${esc(s.id)}">Send voice</button>
+            </div>
+            <div id="stassetsbox-${esc(s.id)}" hidden></div>
+          </td>
+        </tr>`;
+      }).join('')}
+      </table></div>` : '<div class="card empty">No shots yet. Add the first one below.</div>';
+
+    const newShotHtml = can('studio.write') ? `<div class="card"><div class="eyebrow">New shot</div>
+      <div class="grid2">
+        <div>
+          <label>Shot code</label><input id="st-shot-code" placeholder="e.g. SH-010">
+          <label>Order index</label><input id="st-shot-order" type="number" min="0" value="${shots.length}">
+          <label>Duration target (s)</label><input id="st-shot-dur" type="number" min="1" value="5">
+        </div>
+        <div>
+          <label>Story beat</label><textarea id="st-shot-beat" placeholder="What happens in this shot"></textarea>
+          <label>Continuity characters (comma separated entity codes)</label>
+          <input id="st-shot-chars" placeholder="e.g. CHR-MAYA, CHR-SAM">
+          <label>Camera movement (optional)</label><input id="st-shot-camera" placeholder="e.g. slow push in">
+          <label>Action subject (optional)</label><input id="st-shot-action" placeholder="e.g. Maya opens the door">
+        </div>
+      </div>
+      <div style="margin-top:12px"><button class="primary" data-stshotcreate="${esc(id)}">Add shot</button></div>
+    </div>` : '';
+
+    const musicHtml = can('studio.generate') ? `<div class="card"><div class="eyebrow">Project music</div>
+      <label>Brief (required)</label>
+      <textarea id="st-music-prompt" placeholder="e.g. gentle, hopeful, acoustic guitar underscore"></textarea>
+      <div class="grid2">
+        <div><label>Tempo (BPM, optional)</label><input id="st-music-tempo" type="number" min="1"></div>
+        <div><label>Duration (s, optional)</label><input id="st-music-duration" type="number" min="1"></div>
+      </div>
+      <div style="margin-top:12px"><button class="primary" data-stmusic="${esc(id)}">Generate music</button></div>
+    </div>` : '';
+
+    const assembleHtml = can('studio.approve') ? `<div class="card"><div class="eyebrow">Assemble</div>
+      <div class="sub" style="margin-bottom:8px">Stitches every accepted shot asset (plus music, if given) into the rough cut. Every shot needs an accepted asset first.</div>
+      <div class="grid2">
+        <div><label>Transition (optional)</label><select id="st-assemble-transition">
+          <option value="cut" selected>Cut</option>
+          <option value="crossfade">Crossfade</option></select></div>
+        <div><label>Music asset ID (optional)</label>
+          <input id="st-assemble-music" placeholder="paste a MUSIC asset id, if any"></div>
+      </div>
+      <div style="margin-top:12px"><button class="primary" data-stassemble="${esc(id)}">Assemble rough cut</button></div>
+    </div>` : '';
+
+    const eventsHtml = events.length ? `<div class="card"><div class="eyebrow">Recent events</div>
+      <div class="kv">${events.slice(0, 50).map(ev =>
+        `<div>${dt(ev.at)} &mdash; ${esc(ev.note ?? ev.event ?? ev.type ?? '')}${ev.actor_id ? ` <span class="muted">(${esc(ev.actor_id)})</span>` : ''}</div>`).join('')}</div>
+    </div>` : '';
+
+    return `<a class="backlink" href="#/studio">&larr; All Video Studio projects</a>
+      <div class="eyebrow">Video Studio project</div>
+      <h1>${esc(p.code)} &middot; ${esc(p.title)}</h1>
+      <div class="sub flex">${pill(p.state)}
+        <span class="muted">${esc(p.aspect_ratio ?? '')} &middot; ${esc(String(p.fps ?? ''))} fps &middot; ${esc(p.language ?? '')}</span></div>
+      ${budgetHtml}
+      <div class="eyebrow" style="margin-top:20px">Locks</div>
+      ${locksHtml}
+      ${newLockHtml}
+      <div class="eyebrow" style="margin-top:20px">Shots</div>
+      ${shotsHtml}
+      ${newShotHtml}
+      ${musicHtml}
+      ${assembleHtml}
+      ${eventsHtml}`;
   },
 
   async published() {
@@ -2749,6 +2962,165 @@ document.addEventListener('click', async (e) => {
         { title: elv(`as-title-${id}`) ?? '', tags: (elv(`as-tags-${id}`) ?? '').split(',').map(x => x.trim()).filter(Boolean) });
       toast(r.message ?? 'Saved to the library.');
       return render();
+    }
+  } catch (ex) { toast(ex.message, true); render(); }
+});
+
+// ---------- Video Studio actions (18 Aug 2026) ----------
+// A third delegated listener, kept separate for the same reason as the
+// Part 2 one above: Video Studio (apps/api/src/modules/studio.mjs) is a new,
+// independent backend module and folding its ids into either existing
+// selector string would only make those harder to read. No overlap: every
+// id/attribute here is new.
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],#st-newproj-go');
+  if (!b) return;
+  e.preventDefault();
+  try {
+    if (b.id === 'st-newproj-go') {
+      const title = elv('st-title')?.trim();
+      if (!title) return toast('Give the project a title first.', 'warn');
+      const budgetRaw = elv('st-budget')?.trim();
+      b.disabled = true; b.textContent = 'Creating…';
+      const p = await api('POST', '/studio/projects', {
+        title,
+        format: elv('st-format')?.trim() || 'ai_story',
+        aspect_ratio: elv('st-aspect') || '9:16',
+        language: elv('st-lang') || 'am',
+        budget_cap_usd: budgetRaw ? Number(budgetRaw) : null,
+      });
+      toast('Project created');
+      location.hash = '#/studio-project/' + p.id;
+      return;
+    }
+    if (b.dataset.stlockcreate) {
+      const projectId = b.dataset.stlockcreate;
+      const entityCode = elv('st-lock-entitycode')?.trim();
+      if (!entityCode) return toast('Give the lock an entity code first.', 'warn');
+      let data;
+      try { data = JSON.parse(elv('st-lock-data') || '{}'); }
+      catch { return toast('Invalid JSON in lock data', true); }
+      b.disabled = true; b.textContent = 'Creating…';
+      await api('POST', `/studio/projects/${projectId}/locks`,
+        { level: elv('st-lock-level'), entity_type: elv('st-lock-entitytype'), entity_code: entityCode, data });
+      toast('Lock created'); return render();
+    }
+    if (b.dataset.stlockapprove) {
+      b.disabled = true; b.textContent = 'Approving…';
+      await api('POST', `/studio/locks/${b.dataset.stlockapprove}/approve`, {});
+      toast('Lock approved'); return render();
+    }
+    if (b.dataset.stlockref) {
+      b.disabled = true; b.textContent = 'Generating…';
+      await api('POST', `/studio/locks/${b.dataset.stlockref}/reference`, {});
+      toast('Reference image generated'); return render();
+    }
+    if (b.dataset.stshotcreate) {
+      const projectId = b.dataset.stshotcreate;
+      const shotCode = elv('st-shot-code')?.trim();
+      if (!shotCode) return toast('Give the shot a code first.', 'warn');
+      const chars = (elv('st-shot-chars') ?? '').split(',').map(x => x.trim()).filter(Boolean);
+      const camera = elv('st-shot-camera')?.trim();
+      const action = elv('st-shot-action')?.trim();
+      b.disabled = true; b.textContent = 'Adding…';
+      await api('POST', `/studio/projects/${projectId}/shots`, {
+        shot_code: shotCode,
+        order_index: Number(elv('st-shot-order')) || 0,
+        duration_target_s: Number(elv('st-shot-dur')) || 5,
+        continuity: { characters: chars },
+        story: { beat: elv('st-shot-beat') ?? '' },
+        ...(camera ? { camera: { movement: camera } } : {}),
+        ...(action ? { action: { subject: action } } : {}),
+      });
+      toast('Shot added'); return render();
+    }
+    if (b.dataset.stshotedit) {
+      const id = b.dataset.stshotedit;
+      const durRaw = elv(`stedit-dur-${id}`);
+      b.disabled = true; b.textContent = 'Saving…';
+      await api('PATCH', `/studio/shots/${id}`, {
+        ...(durRaw !== '' && durRaw != null ? { duration_target_s: Number(durRaw) } : {}),
+        story: { beat: elv(`stedit-beat-${id}`) ?? '' },
+      });
+      toast('Shot updated'); return render();
+    }
+    if (b.dataset.stshotgenerate) {
+      const id = b.dataset.stshotgenerate;
+      b.disabled = true; b.textContent = 'Generating…';
+      const r = await api('POST', `/studio/shots/${id}/generate`, {});
+      toast(`QC: ${r.qc_report?.disposition ?? 'done'}`);
+      return render();
+    }
+    if (b.dataset.stshotvoiceshow) {
+      const box = document.getElementById('stvoice-' + b.dataset.stshotvoiceshow);
+      if (box) box.hidden = !box.hidden;
+      return;
+    }
+    if (b.dataset.stshotvoice) {
+      const id = b.dataset.stshotvoice;
+      const text = elv(`stvoicetext-${id}`)?.trim();
+      if (!text) return toast('Write the voice line first.', 'warn');
+      b.disabled = true; b.textContent = 'Sending…';
+      await api('POST', `/studio/shots/${id}/voice`, { text });
+      toast('Voice line sent'); return render();
+    }
+    if (b.dataset.stassets) {
+      const id = b.dataset.stassets;
+      const box = document.getElementById('stassetsbox-' + id);
+      if (!box) return;
+      if (box.dataset.loaded) { box.hidden = !box.hidden; return; }
+      box.hidden = false;
+      box.innerHTML = '<div class="muted" style="font-size:12px;margin-top:6px">Loading…</div>';
+      try {
+        const r = await api('GET', `/studio/shots/${id}/assets`);
+        const items = r.items ?? [];
+        box.innerHTML = items.length ? items.map(a => `<div class="claimrow" style="margin-top:8px">
+          <div class="flex"><b>${esc(a.kind ?? '')}</b>${pill(a.status)}
+            <span class="muted">${esc(a.generator?.provider ?? '')}</span>
+            <span class="spacer"></span>
+            ${can('studio.approve') && a.status !== 'ACCEPTED'
+              ? (a.status === 'QC_BLOCKED'
+                ? `<button disabled title="QC blocked this asset. It cannot be accepted until it is regenerated and passes QC.">Accept</button>`
+                : `<button class="approve" data-stassetaccept="${esc(a.id)}">Accept</button>`)
+              : ''}</div>
+          ${(a.qc_reports ?? []).map(q => `<div style="margin-top:6px">
+            ${pill(q.disposition)}
+            ${(q.technical?.issues ?? []).length ? `<div class="muted" style="font-size:12px;margin-top:4px">Issues: ${q.technical.issues.map(x => esc(x)).join('; ')}</div>` : ''}
+            ${q.continuity?.notes ? `<div class="muted" style="font-size:12px;margin-top:2px">Continuity: ${esc(q.continuity.notes)}</div>` : ''}
+          </div>`).join('')}
+        </div>`).join('') : '<div class="muted" style="font-size:12px;margin-top:6px">No assets generated for this shot yet.</div>';
+        box.dataset.loaded = '1';
+      } catch (ex) {
+        box.innerHTML = `<div class="muted" style="font-size:12px;margin-top:6px">${esc(ex.message)}</div>`;
+      }
+      return;
+    }
+    if (b.dataset.stassetaccept) {
+      b.disabled = true; b.textContent = 'Accepting…';
+      await api('POST', `/studio/assets/${b.dataset.stassetaccept}/accept`, {});
+      toast('Asset accepted'); return render();
+    }
+    if (b.dataset.stmusic) {
+      const projectId = b.dataset.stmusic;
+      const promptText = elv('st-music-prompt')?.trim();
+      if (!promptText) return toast('Write a brief for the music first.', 'warn');
+      const brief = { prompt: promptText };
+      const tempo = elv('st-music-tempo'); if (tempo) brief.tempo_bpm = Number(tempo);
+      const dur = elv('st-music-duration'); if (dur) brief.duration_s = Number(dur);
+      b.disabled = true; b.textContent = 'Generating…';
+      await api('POST', `/studio/projects/${projectId}/music`, { brief });
+      toast('Music generated'); return render();
+    }
+    if (b.dataset.stassemble) {
+      const projectId = b.dataset.stassemble;
+      const body = {};
+      const transition = document.getElementById('st-assemble-transition')?.value;
+      if (transition && transition !== 'cut') body.transition = transition;
+      const musicId = elv('st-assemble-music')?.trim();
+      if (musicId) body.music_asset_id = musicId;
+      b.disabled = true; b.textContent = 'Assembling…';
+      await api('POST', `/studio/projects/${projectId}/assemble`, body);
+      toast('Rough cut assembled'); return render();
     }
   } catch (ex) { toast(ex.message, true); render(); }
 });

@@ -25,6 +25,10 @@ export const storage = {
     return { storage_key: key, local_path: path };
   },
   url(key) { return `file://${join(STORE, key)}`; },
+  // Local filesystem path for a storage key (Video Studio phase 1, 18 Aug
+  // 2026): ffprobe/ffmpeg need a real path, not a file:// URL string, and
+  // no other module had reason to reconstruct one before now.
+  localPath(key) { return join(STORE, key); },
 };
 
 // ---------- render: Creatomate ----------
@@ -266,6 +270,60 @@ export const gemini = {
     let segments;
     try { segments = JSON.parse(jsonText); } catch { segments = [{ start_s: 0, end_s: null, speaker: 'doctor', text }]; }
     return { status: 'SUCCEEDED', segments, cost_usd: null };
+  },
+  // Video Studio automated continuity QC (playbook 19.2, phase 1, 18 Aug
+  // 2026). This is the honest version of "AI checks continuity": a vision
+  // model comparing one candidate frame against the locked reference
+  // image(s) and returning a verdict plus its reasoning, NOT a numeric
+  // identity-similarity score from a trained embedding model (LCOS has no
+  // such model wired in). Treat the verdict as a second opinion a human
+  // QC reviewer would still want to see, not a pass/fail oracle.
+  async compareContinuity({ candidateImageBase64, referenceImageBase64s, checklist, assetId }) {
+    if (MOCK()) {
+      return { status: 'SUCCEEDED', verdict: 'CONSISTENT', confidence: 0.5,
+        notes: 'MOCK mode: no real comparison was run.', cost_usd: 0 };
+    }
+    const parts = [
+      { text: `Compare the CANDIDATE frame against the REFERENCE image(s) of the same locked character/environment/prop. Checklist: ${(checklist ?? []).join('; ') || 'general identity, wardrobe, and setting consistency'}. Return strict JSON: {"verdict": "CONSISTENT" or "DRIFT_DETECTED", "confidence": 0-1, "notes": "what matches or what drifted, specifically"}.` },
+      { text: 'CANDIDATE:' }, { inlineData: { mimeType: 'image/png', data: candidateImageBase64 } },
+      ...(referenceImageBase64s ?? []).flatMap((b64, i) => [
+        { text: `REFERENCE ${i + 1}:` }, { inlineData: { mimeType: 'image/png', data: b64 } }]),
+    ];
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${need('GEMINI_API_KEY')}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts }] }),
+    });
+    if (!res.ok) throw new Error(`gemini continuity compare ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const d = await res.json();
+    const text = d.candidates?.[0]?.content?.parts?.map(p => p.text).join('') ?? '{}';
+    const jsonText = text.replace(/^```json?\s*/i, '').replace(/```\s*$/, '');
+    let parsed;
+    try { parsed = JSON.parse(jsonText); } catch { parsed = { verdict: 'DRIFT_DETECTED', confidence: 0, notes: `unparseable model response: ${text.slice(0, 300)}` }; }
+    return { status: 'SUCCEEDED', ...parsed, cost_usd: null };
+  },
+};
+
+// ---------- music: Suno (Video Studio phase 1, 18 Aug 2026) ----------
+// Music briefs (playbook 16.2) are structured, not a one-line mood word;
+// the adapter takes the same instrumentation/tempo/structure shape the
+// playbook's music brief uses so the caller never has to translate.
+export const suno = {
+  async generateMusic({ prompt, tempoBpm, durationS, assetId }) {
+    if (MOCK()) {
+      const key = `assets/generated/${assetId}/music.mp3`;
+      await storage.put(key, Buffer.from(`MOCK-SUNO ${prompt.slice(0, 120)}`));
+      return { status: 'SUCCEEDED', storage_key: key, provider_job_id: `mock-suno-${assetId.slice(0, 8)}`, cost_usd: 0 };
+    }
+    const res = await fetch('https://api.sunoapi.org/api/v1/generate', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${need('SUNO_API_KEY')}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, instrumental: true,
+        tags: tempoBpm ? `${tempoBpm} bpm` : undefined, duration_seconds: durationS }),
+    });
+    if (!res.ok) throw new Error(`suno ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const d = await res.json();
+    return { status: 'SUBMITTED', provider_job_id: d.data?.taskId ?? d.taskId ?? null, storage_key: null };
   },
 };
 

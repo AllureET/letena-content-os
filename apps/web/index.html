@@ -113,13 +113,13 @@ tr.rowlink{cursor:pointer} tr.rowlink:hover td{background:var(--surface-2)}
    else keeps the quieter tint. Same class hooks as before, no markup change. */
 .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-size:var(--fs-2xs);font-weight:500;font-family:var(--font-ui)}
 .pill .d{width:6px;height:6px;border-radius:50%;background:currentColor}
-.risk-high,.p-TIER_4,.p-EMERGENCY,.p-HIGH,.p-FAIL,.p-REJECTED,.p-FAILED,.p-VALIDATION_FAILED,.p-QUARANTINED,.p-RETIRED{
+.risk-high,.p-TIER_4,.p-EMERGENCY,.p-HIGH,.p-FAIL,.p-REJECTED,.p-FAILED,.p-VALIDATION_FAILED,.p-QUARANTINED,.p-RETIRED,.p-QC_BLOCKED{
   color:#fff;background:var(--risk-high);box-shadow:0 1px 4px rgba(185,28,28,.35);font-weight:600}
-.risk-high .d,.p-TIER_4 .d,.p-EMERGENCY .d,.p-HIGH .d,.p-FAIL .d,.p-REJECTED .d,.p-FAILED .d,.p-VALIDATION_FAILED .d,.p-QUARANTINED .d,.p-RETIRED .d{background:#fff}
-.risk-mod,.p-TIER_3,.p-MODERATE,.p-CLINICAL_REVIEW,.p-LANGUAGE_REVIEW,.p-IN_REVIEW,.p-NEEDS_UPDATE,.p-NEEDS_KNOWLEDGE,.p-SCHEDULED,.p-PENDING_DEID{color:var(--risk-mod);background:var(--risk-mod-bg)}
-.risk-routine,.p-TIER_1,.p-TIER_2,.p-ROUTINE,.p-LOW,.p-APPROVED,.p-PASS,.p-PUBLISHED,.p-SUCCEEDED,.p-RENDERED,.p-LIVE,.p-CLUSTERED,.p-ACTIVE{color:var(--risk-routine);background:var(--risk-routine-bg)}
-.p-DRAFT,.p-PROPOSED,.p-QUEUED,.p-DEIDENTIFIED,.p-PENDING{color:var(--st-new);background:var(--st-new-bg)}
-.p-VALIDATED,.p-SELECTED,.p-VALIDATING,.p-LOCALIZING{color:var(--st-review);background:var(--st-review-bg)}
+.risk-high .d,.p-TIER_4 .d,.p-EMERGENCY .d,.p-HIGH .d,.p-FAIL .d,.p-REJECTED .d,.p-FAILED .d,.p-VALIDATION_FAILED .d,.p-QUARANTINED .d,.p-RETIRED .d,.p-QC_BLOCKED .d{background:#fff}
+.risk-mod,.p-TIER_3,.p-MODERATE,.p-CLINICAL_REVIEW,.p-LANGUAGE_REVIEW,.p-IN_REVIEW,.p-NEEDS_UPDATE,.p-NEEDS_KNOWLEDGE,.p-SCHEDULED,.p-PENDING_DEID,.p-NEEDS_REVIEW,.p-STALE,.p-QC_REWORK,.p-QC_PASS_WITH_NOTES{color:var(--risk-mod);background:var(--risk-mod-bg)}
+.risk-routine,.p-TIER_1,.p-TIER_2,.p-ROUTINE,.p-LOW,.p-APPROVED,.p-PASS,.p-PUBLISHED,.p-SUCCEEDED,.p-RENDERED,.p-LIVE,.p-CLUSTERED,.p-ACTIVE,.p-ACCEPTED,.p-QC_PASS,.p-LOCKS_APPROVED,.p-ROUGH_CUT_VALIDATED{color:var(--risk-routine);background:var(--risk-routine-bg)}
+.p-DRAFT,.p-PROPOSED,.p-QUEUED,.p-DEIDENTIFIED,.p-PENDING,.p-GENERATED,.p-REQUEST{color:var(--st-new);background:var(--st-new-bg)}
+.p-VALIDATED,.p-SELECTED,.p-VALIDATING,.p-LOCALIZING,.p-GENERATING{color:var(--st-review);background:var(--st-review-bg)}
 .p-CLOSED,.p-SUPERSEDED,.p-CANCELLED,.p-ARCHIVED{color:var(--st-closed);background:var(--st-closed-bg)}
 .ch{display:inline-block;padding:2px 8px;border-radius:var(--r-xs);font-size:var(--fs-2xs);color:#fff;font-weight:500}
 .ch-TELEGRAM{background:var(--telegram)}.ch-WHATSAPP{background:var(--whatsapp)}

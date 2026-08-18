@@ -154,14 +154,26 @@ export function trigramContainment(needle, haystack) {
   return inter / N.size;
 }
 
-export function validatorOverlay({ scriptText, claims, card, riskTier, cta, presenterLabel }) {
+// canonicalBlocks (added 18 Aug 2026): the standard, pre-approved Amharic
+// door/CTA text a script is instructed to copy byte for byte (see the
+// script_writer prompt's "THE CTA, every format" section). These are
+// constants owned by the caller (apps/api/src/letena_canon.mjs), passed in
+// rather than imported here, so this package stays dependency-free per its
+// own header comment. A number or CTA phrase that only ever appears because
+// it's part of a correctly-copied canonical block is not an alteration; the
+// two checks below treat canonicalBlocks as pre-approved, not as text that
+// still needs to independently satisfy the claims-derived checks.
+export function validatorOverlay({ scriptText, claims, card, riskTier, cta, presenterLabel, canonicalBlocks }) {
   const findings = [];
   const claimText = claims.map(c => c.claim_text_en).join(' ');
+  const canonText = (canonicalBlocks ?? []).join(' ');
 
-  // Numbers in script must be a subset of numbers in claims.
+  // Numbers in script must be a subset of numbers in claims OR in a
+  // canonical block (the door/onscreen blocks carry the real phone number).
   const claimNums = new Set(extractNumbers(claimText));
+  const canonNums = new Set(extractNumbers(canonText));
   for (const n of new Set(extractNumbers(scriptText))) {
-    if (!claimNums.has(n)) {
+    if (!claimNums.has(n) && !canonNums.has(n)) {
       findings.push({ code: 'NUMBER_ALTERED', severity: 'BLOCKER',
         statement: `number "${n}"`,
         explanation: `The number ${n} appears in the script but in no approved claim.` });
@@ -258,10 +270,17 @@ export function validatorOverlay({ scriptText, claims, card, riskTier, cta, pres
         explanation: 'Script uses absolute language no ESTABLISHED claim uses.' });
     }
   }
-  // CTA must be on the approved list.
-  if (cta && card?.approved_ctas?.length) {
-    const ok = card.approved_ctas.some(a => trigramSimilarity(cta, a) >= 0.5);
-    if (!ok) {
+  // CTA must be on the approved list, OR be (built from) a canonical Letena
+  // door/CTA block. card.approved_ctas is a vestigial English-only list from
+  // before the canonical bilingual Amharic door blocks existed; a correct
+  // script_writer output copies those blocks byte for byte, so a plain
+  // trigramSimilarity against the English list can never pass a genuine
+  // canonical CTA. Treat containment of a canonical block as an equally
+  // valid pass condition instead of tightening the English-list check.
+  if (cta && (card?.approved_ctas?.length || (canonicalBlocks ?? []).length)) {
+    const okByCard = card?.approved_ctas?.some(a => trigramSimilarity(cta, a) >= 0.5) ?? false;
+    const okByCanon = (canonicalBlocks ?? []).some(b => trigramContainment(b, cta) >= 0.6);
+    if (!okByCard && !okByCanon) {
       findings.push({ code: 'CTA_CONTRADICTION', severity: 'MAJOR',
         statement: cta, explanation: 'CTA is not on the card approved list.' });
     }

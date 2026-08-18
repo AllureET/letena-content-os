@@ -1010,7 +1010,7 @@ const screens = {
 
     const editorHtml = can('script.write') && v ? `
       <div class="card"><div class="eyebrow">${esc(fmtLabelTxt)} · edit in place</div>
-        ${inp('ed-hook', v.hook, 'Hook')}
+        ${inp('ed-hook', v.hook, 'Hook', true)}
         ${bodyEditor}
         ${extrasEditor}
         ${inp('ed-cta', v.cta, 'CTA (ends at the door; the phone number comes from the canonical block, never retyped)', true)}

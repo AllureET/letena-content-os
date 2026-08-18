@@ -6,7 +6,7 @@ import { invokeAgent, embed } from '../ai/gateway.mjs';
 import { lintStyle } from '../ai/style_lint.mjs';
 import { validatorOverlay, overallResult, computeRiskTier } from '../../../../packages/scoring/src/index.mjs';
 import { formatOf, bodyTextOf } from '../formats.mjs';
-import { isAbortionAdjacent } from '../letena_canon.mjs';
+import { isAbortionAdjacent, LETENA_AMHARIC_BLOCKS, assembleCta } from '../letena_canon.mjs';
 import { classifyEdit } from '../pipeline_rules.mjs';
 import { signGate, invalidateMedicalSignoff, signerRoleFor } from './pipeline.mjs';
 import { containsForbidden } from '../../../../packages/deid/src/index.mjs';
@@ -522,6 +522,7 @@ export default async function routes(app) {
       }
       const sc = out.script;
       requireFormatBody(fmtRow, sc);
+      applyDeterministicCta(fmtRow, sc);
       const bodyText = bodyTextOf(sc);
       const bodyHash = sha(bodyText);
       const styleWarnings = lintStyle([bodyText, sc.caption].filter(Boolean).join('\n'),
@@ -1091,6 +1092,37 @@ export function requireFormatBody(fmtRow, sc) {
   }
 }
 
+// Deterministic CTA/door assembly (18 Aug 2026). The script_writer prompt
+// already instructs the model to copy the canonical door/CTA blocks byte
+// for byte, but "the model copies it correctly" is a hope, not a
+// guarantee: a bad generation or a careless manual edit can silently
+// corrupt the one thing that must never change, the real WhatsApp number
+// and the private-message door. Root cause of the 18 Aug CTA regression.
+// Rather than keep trusting free text, overwrite it here from the
+// registry's cta_spec via assembleCta(), the same canonical-block
+// assembler the validator overlay now also checks CTAs against. The
+// model's own cta/onscreen-door text becomes a draft; this is what
+// actually ships. Formats with no CTA (cta_spec blocks/actions/deep_link/
+// contact all empty, e.g. app_copy, while_you_wait) get assembled=null and
+// are left exactly as the model wrote them.
+export function applyDeterministicCta(fmtRow, sc) {
+  const assembled = assembleCta(fmtRow?.cta_spec);
+  if (assembled) sc.cta = assembled;
+  // The video formats' door card is the beat tagged role:'DOOR' (18 Aug
+  // 2026 schema addition); scripts written before that field existed have
+  // no role tag at all, so fall back to "the final beat", matching the
+  // registry heading order ("...Door beat (canonical Amharic door)" always
+  // comes last). Swap in the exact onscreen block, keeping the model's own
+  // timing, emphasis and any color/icon production-design fields.
+  if (fmtRow?.body_kind === 'VIDEO' && fmtRow?.cta_spec?.blocks?.includes('onscreen')
+      && Array.isArray(sc.onscreen_text) && sc.onscreen_text.length) {
+    const doorIdx = sc.onscreen_text.findIndex(t => t?.role === 'DOOR');
+    const idx = doorIdx >= 0 ? doorIdx : sc.onscreen_text.length - 1;
+    sc.onscreen_text[idx].text = LETENA_AMHARIC_BLOCKS.onscreen;
+  }
+  return sc;
+}
+
 // The writer call for one concept, shared by first generation and by
 // single-piece regeneration (Part 2, 14 Aug 2026: "Regenerate one piece,
 // not the whole run, and let him steer it"). Returns the writer output plus
@@ -1229,6 +1261,7 @@ export async function generateScript({ concept, family, card, cardVersion, claim
   // Fails closed: a missing required field is a generation failure, never a
   // silently thinner piece.
   requireFormatBody(fmtRow, sc);
+  applyDeterministicCta(fmtRow, sc);
   // Hash and lint the piece's ACTUAL body. Both used to read spoken_script,
   // which is empty for a carousel, a static graphic or a post now that each
   // fills its own body, so both would have been operating on a hook and a
@@ -1325,10 +1358,21 @@ export async function validateScript(scriptId, { actor }) {
       summary: 'validator unavailable' };
   }
 
-  // Deterministic overlay: can only ADD findings.
+  // Deterministic overlay: can only ADD findings. canonicalBlocks carries
+  // the standard Amharic door/CTA text (letena_canon.mjs) so the overlay
+  // can recognize a correctly-copied canonical block as legitimate, rather
+  // than flagging its own approved phone number as an invented NUMBER_
+  // ALTERED, or its own approved wording as a CTA_CONTRADICTION against
+  // card.approved_ctas (a separate, older, English-only list that a real
+  // bilingual canonical block was never going to trigram-match). Found live
+  // 18 Aug 2026: this exact gap turned a correct script_writer CTA into a
+  // false BLOCKER twice in a row, and a well-meaning manual "fix" of the
+  // false positive then deleted the real phone number and the friend-share
+  // line rather than the wrong finding.
   const overlay = validatorOverlay({
     scriptText: bodyTextOf(v),
-    claims, card: cardVersion, riskTier: s.risk_tier, cta: v.cta });
+    claims, card: cardVersion, riskTier: s.risk_tier, cta: v.cta,
+    canonicalBlocks: Object.values(LETENA_AMHARIC_BLOCKS) });
   const findings = [...agentOut.findings, ...overlay];
   const result = overallResult(agentOut.statements, findings);
 

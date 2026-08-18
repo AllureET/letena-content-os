@@ -129,6 +129,43 @@ test('prohibited-claim check still catches the qualitative claim when actually m
   assert.ok(f.some(x => x.code === 'PROHIBITED_CLAIM' && x.severity === 'BLOCKER'), JSON.stringify(f));
 });
 
+const CANON_BLOCKS = [
+  'በሚስጥር በቀጥታ ጻፊልን፦ ዋትስአፕ 0908 182 838፣ ቴሌግራም ወይም ሜሴንጀር። ማንም አያይም። ነፃ። በስልክ ማውራት ከመረጥሽ ደግሞ ደውዪ።',
+  'በሚስጥር በቀጥታ ጻፊልን     ዋትስአፕ 0908 182 838 · ቴሌግራም · ሜሴንጀር     ማንም አያይም · ነፃ     ለጓደኛሽ በግል ላኪላት',
+];
+
+test('overlay does not flag the real WhatsApp number when it comes from a canonical block', () => {
+  const f = validatorOverlay({
+    scriptText: `${PREG_CLAIMS[0].claim_text_en} ${CANON_BLOCKS[0]}`,
+    claims: PREG_CLAIMS, card: PREG_CARD, riskTier: 'TIER_3',
+    cta: PREG_CARD.approved_ctas[0], canonicalBlocks: CANON_BLOCKS });
+  assert.ok(!f.some(x => x.code === 'NUMBER_ALTERED'), JSON.stringify(f));
+});
+
+test('overlay still flags a number with no claim or canonical-block backing', () => {
+  const f = validatorOverlay({
+    scriptText: `${PREG_CLAIMS[0].claim_text_en} It works 97 percent of the time.`,
+    claims: PREG_CLAIMS, card: PREG_CARD, riskTier: 'TIER_3',
+    cta: PREG_CARD.approved_ctas[0], canonicalBlocks: CANON_BLOCKS });
+  assert.ok(f.some(x => x.code === 'NUMBER_ALTERED'), JSON.stringify(f));
+});
+
+test('overlay does not flag CTA_CONTRADICTION for a genuine canonical Amharic CTA block', () => {
+  const f = validatorOverlay({
+    scriptText: PREG_CLAIMS[0].claim_text_en,
+    claims: PREG_CLAIMS, card: PREG_CARD, riskTier: 'TIER_3',
+    cta: CANON_BLOCKS[1], canonicalBlocks: CANON_BLOCKS });
+  assert.ok(!f.some(x => x.code === 'CTA_CONTRADICTION'), JSON.stringify(f));
+});
+
+test('overlay still flags CTA_CONTRADICTION for a CTA matching neither the approved list nor a canonical block', () => {
+  const f = validatorOverlay({
+    scriptText: PREG_CLAIMS[0].claim_text_en,
+    claims: PREG_CLAIMS, card: PREG_CARD, riskTier: 'TIER_3',
+    cta: 'Buy our supplement today for fast results', canonicalBlocks: CANON_BLOCKS });
+  assert.ok(f.some(x => x.code === 'CTA_CONTRADICTION' && x.severity === 'MAJOR'), JSON.stringify(f));
+});
+
 test('tier 4 without referral phrase is blocked', () => {
   const f = validatorOverlay({
     scriptText: 'This is very serious information about your safety only.',

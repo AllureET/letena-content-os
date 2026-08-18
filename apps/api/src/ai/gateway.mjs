@@ -79,14 +79,32 @@ const S = {
         .optional().default('VIDEO'),
       hook: z.string().max(160),
       spoken_script: z.string().max(6000).optional().default(''),
+      // role/color/icon/font_size_px (18 Aug 2026, ported from the June 15
+      // brief's production-design layer): optional so every script written
+      // before this stays valid. role lets the door/CTA beat be identified
+      // by tag instead of by array position (applyDeterministicCta in
+      // modules/content.mjs falls back to "last beat" when role is absent).
+      // color/icon/font_size_px are production-design intent for the editor,
+      // not validated content; a beat with no visual design still renders,
+      // it just uses house defaults.
       onscreen_text: z.array(z.object({ at_second: z.number(), text: z.string().max(90),
-        emphasis: z.enum(['NORMAL','STRONG','WARNING']).optional() })).optional().default([]),
+        emphasis: z.enum(['NORMAL','STRONG','WARNING']).optional(),
+        role: z.enum(['HOOK','SUBSTANCE','TURN','SHARE','WARNING','DOOR']).optional(),
+        color: z.string().max(60).optional(),
+        icon: z.string().max(160).optional(),
+        font_size_px: z.number().optional() })).optional().default([]),
       scene_plan: z.array(z.object({ index: z.number().int(), start_s: z.number(), end_s: z.number(),
         visual_brief: z.string(), asset_requirement: z.object({ kind: z.string(),
           tags: z.array(z.string()), must_be_ethiopian: z.boolean().optional() }) })).optional().default([]),
       // CAROUSEL: real slides, not caption cues timed to video seconds.
+      // tier/icon (18 Aug 2026, ported from the Format Writing Guide's
+      // tiered Save-It pattern, green/amber/red): optional. Only meaningful
+      // for formats whose craft rules call for a tiered card (save_it); a
+      // format that doesn't use tiers simply never sets it.
       carousel_slides: z.array(z.object({ index: z.number().int(), title: z.string().max(90),
-        body: z.string().max(300) })).optional().default([]),
+        body: z.string().max(300),
+        tier: z.enum(['GREEN','AMBER','RED']).optional(),
+        icon: z.string().max(160).optional() })).optional().default([]),
       // STATIC: one image, so one headline and one supporting line.
       static_graphic: z.object({ headline: z.string().max(90), body: z.string().max(300),
         footer: z.string().max(120).nullable().optional() }).nullable().optional(),

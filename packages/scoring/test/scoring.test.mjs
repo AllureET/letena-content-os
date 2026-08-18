@@ -100,6 +100,35 @@ test('prohibited-claim check catches the actual 100% overclaim', () => {
   assert.ok(f.some(x => x.code === 'PROHIBITED_CLAIM' && x.severity === 'BLOCKER'), JSON.stringify(f));
 });
 
+// Regression case for the 2026-08-18 fix, a real false positive hit live
+// producing a pregnancy video (card PREG-002, chat-story reel): the
+// correct, approved denial of the guardrail ("testing the day after sex
+// will not give an accurate result") was blocked because a qualitative
+// prohibited claim (no number, no ABSOLUTES word) fell back to raw
+// topical trigram containment with no notion of negation.
+const PREG_CARD = {
+  prohibited_claims: [{ reason: 'basics library', statement: 'Never say a test is reliable the day after sex' }],
+  approved_ctas: ['Message Letena on Telegram for a free private consultation'],
+  referral_conditions: [],
+};
+const PREG_CLAIMS = [
+  { claim_text_en: 'You can carry out most pregnancy tests from the first day of a missed period.', certainty: 'ESTABLISHED' },
+];
+
+test('prohibited-claim check does not flag the correct denial of a qualitative guardrail', () => {
+  const f = validatorOverlay({
+    scriptText: 'That is why testing the day after sex will not give you an accurate result.',
+    claims: PREG_CLAIMS, card: PREG_CARD, riskTier: 'TIER_3', cta: PREG_CARD.approved_ctas[0] });
+  assert.ok(!f.some(x => x.code === 'PROHIBITED_CLAIM'), JSON.stringify(f));
+});
+
+test('prohibited-claim check still catches the qualitative claim when actually made', () => {
+  const f = validatorOverlay({
+    scriptText: 'A test is reliable the day after sex, so you can trust it right away.',
+    claims: PREG_CLAIMS, card: PREG_CARD, riskTier: 'TIER_3', cta: PREG_CARD.approved_ctas[0] });
+  assert.ok(f.some(x => x.code === 'PROHIBITED_CLAIM' && x.severity === 'BLOCKER'), JSON.stringify(f));
+});
+
 test('tier 4 without referral phrase is blocked', () => {
   const f = validatorOverlay({
     scriptText: 'This is very serious information about your safety only.',

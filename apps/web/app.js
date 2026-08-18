@@ -6,6 +6,32 @@ let ME = JSON.parse(sessionStorage.getItem('lcos_me') || 'null');
 
 const $ = (s, el = document) => el.querySelector(s);
 const app = $('#app');
+// Auto-grow textareas so a long bilingual line (Amharic + English together,
+// the normal shape of a script field) is fully visible without an internal
+// scrollbar. Rudy flagged 18 Aug 2026 that she had to scroll inside the
+// Hook/Spoken script/CTA boxes on the script editor to read both languages
+// at once — a fixed-height textarea is the wrong control for text whose
+// length is unpredictable and often doubles because of the bilingual
+// convention. Grows on typing, and on every screen render, since screens
+// are swapped wholesale via innerHTML rather than individual textareas
+// being mounted/unmounted, so a plain one-time pass at load would miss
+// every navigation after the first.
+function autoGrowTextarea(el) {
+  el.style.height = 'auto';
+  el.style.height = (el.scrollHeight + 2) + 'px';
+}
+document.addEventListener('input', (e) => {
+  if (e.target.tagName === 'TEXTAREA') autoGrowTextarea(e.target);
+});
+new MutationObserver((mutations) => {
+  for (const m of mutations) {
+    for (const node of m.addedNodes) {
+      if (node.nodeType !== 1) continue;
+      if (node.tagName === 'TEXTAREA') autoGrowTextarea(node);
+      node.querySelectorAll?.('textarea').forEach(autoGrowTextarea);
+    }
+  }
+}).observe(app, { childList: true, subtree: true });
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const pill = (v) => v ? `<span class="pill p-${esc(v)}"><span class="d"></span>${esc(String(v).replace(/_/g, ' '))}</span>` : '';
 const chan = (v) => v ? `<span class="ch ch-${esc(v)}">${esc(v.replace('_COMMENT',''))}</span>` : '';

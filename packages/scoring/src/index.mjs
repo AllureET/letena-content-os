@@ -91,6 +91,28 @@ const TIME_RE = /\b(\d+)\s*(hour|hr|day|week|month|year|ሰዓት|ቀን|ሳም�
 const ABSOLUTES = /\b(always|never|guaranteed|100\s*%|completely safe|impossible|ምንም ጊዜ|ሁልጊዜ|በፍጹም)\b/i;
 const CREDENTIAL_RE = /\b(dr\.?|doctor|physician|ሐኪም|ዶክተር)\b/i;
 
+// Qualitative-predicate anchors: the words a prohibited claim most often
+// hangs on when it has no number and no ABSOLUTES word (e.g. "Never say a
+// test is reliable the day after sex"). Added 18 Aug 2026 after a live
+// false positive: the correct, approved phrasing of that same guardrail
+// ("testing the day after sex will not give you an accurate result") was
+// blocked, because with no anchor at all the code fell back to raw topical
+// trigram containment, which has no notion of negation. See the
+// PROHIBITED_CLAIM block below for how this is used and guarded.
+const QUALITATIVE_ANCHORS = /\b(reliable|accurate|effective|safe|works|guaranteed|trustworthy|certain|definite|conclusive|dependable)\b/i;
+const NEGATION_RE = /\b(not|n't|never|no|won't|isn't|doesn't|didn't|cannot|can't|without)\b/i;
+
+// True if a negation marker appears within `windowChars` before the given
+// anchor word's first occurrence in `sentenceLower`. English negation
+// typically precedes the predicate it governs ("will not give ... an
+// accurate result", "is not reliable"), often with a few words between
+// ("not give you an accurate"), hence the generous window.
+export function isNegatedBefore(sentenceLower, anchorLower, windowChars = 40) {
+  const idx = sentenceLower.indexOf(anchorLower);
+  if (idx === -1) return false;
+  return NEGATION_RE.test(sentenceLower.slice(Math.max(0, idx - windowChars), idx));
+}
+
 export function extractNumbers(text) {
   return [...(text.matchAll(NUM_RE))].map(m => m[0].replace(',', '.'));
 }
@@ -176,22 +198,41 @@ export function validatorOverlay({ scriptText, claims, card, riskTier, cta, pres
   // When the core assertion has one of those, the sentence must contain
   // that same anchor to be flagged at all, on top of a moderate topical
   // floor so a stray, unrelated "100" elsewhere can't trigger it alone.
-  // When the assertion has no such anchor (e.g. "lubricant type does not
-  // matter"), there is nothing precise to anchor on, so it falls back to
-  // trigram containment of the core assertion at the original 0.6 bar.
+  // When the assertion has no numeric/absolute anchor (e.g. "lubricant type
+  // does not matter"), the next-best anchor is a qualitative predicate word
+  // (reliable, accurate, effective, safe, ...), checked below with a
+  // negation guard so a sentence that asserts the OPPOSITE of the predicate
+  // is not treated as making the claim. The two anchor kinds are tiered,
+  // not combined: a claim with a numeric/absolute anchor (e.g. "100%
+  // effective") is judged on that number alone, exactly as before, so a
+  // correct lower percentage that happens to share the word "effective"
+  // still is not flagged. Qualitative anchoring only kicks in when there is
+  // no numeric/absolute anchor at all. When neither kind of anchor exists,
+  // this falls back to raw trigram containment of the core assertion at the
+  // original 0.6 bar.
   for (const entry of card?.prohibited_claims ?? []) {
     const p = typeof entry === 'string' ? entry : entry?.statement;
     if (!p) continue;
     const core = coreProhibitedAssertion(p);
-    const anchors = [...extractNumbers(core),
+    const numericAbsoluteAnchors = [...extractNumbers(core),
       ...(core.match(new RegExp(ABSOLUTES.source, 'gi')) ?? [])]
       .map(a => a.toLowerCase().replace(/\s+/g, ''));
+    const qualitativeAnchors = numericAbsoluteAnchors.length ? [] : [...new Set(
+      (core.match(new RegExp(QUALITATIVE_ANCHORS.source, 'gi')) ?? []).map(a => a.toLowerCase()))];
     for (const sentence of scriptText.split(/(?<=[.!?።])\s+/)) {
       if (sentence.length <= 15) continue;
       const containment = trigramContainment(core, sentence);
-      const matches = anchors.length
-        ? anchors.some(a => sentence.toLowerCase().replace(/\s+/g, '').includes(a)) && containment >= 0.35
-        : containment >= 0.6;
+      const sentenceLower = sentence.toLowerCase();
+      const compact = sentenceLower.replace(/\s+/g, '');
+      let matches;
+      if (numericAbsoluteAnchors.length) {
+        matches = numericAbsoluteAnchors.some(a => compact.includes(a)) && containment >= 0.35;
+      } else if (qualitativeAnchors.length) {
+        matches = qualitativeAnchors.some(a =>
+          sentenceLower.includes(a) && !isNegatedBefore(sentenceLower, a)) && containment >= 0.35;
+      } else {
+        matches = containment >= 0.6;
+      }
       if (matches) {
         findings.push({ code: 'PROHIBITED_CLAIM', severity: 'BLOCKER',
           statement: sentence.slice(0, 200),

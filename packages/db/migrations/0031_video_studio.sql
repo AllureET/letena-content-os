@@ -191,8 +191,14 @@ ALTER TABLE shots ADD CONSTRAINT shots_accepted_asset_fk
 
 -- ===========================================================================
 -- Permissions. New domain 'studio', granted to the roles that already do
--- production/creative work; admin gets everything via the existing
--- wildcard grant.
+-- production/creative work. CORRECTION (0032_studio_admin_permissions.sql):
+-- there is no "existing wildcard grant" for admin -- that claim here was
+-- wrong. Admin's permission rows were seeded once, in 0001_init.sql, from
+-- whatever existed in `permissions` at that moment; every permission added
+-- since has needed its own explicit admin grant, and this migration never
+-- added one for studio.*, which left admin accounts getting a flat 403 on
+-- every /studio/... route. See 0032 for the fix. Left as history here
+-- rather than silently rewritten, since 0031 already shipped.
 -- ===========================================================================
 SET search_path = lcos, public;
 

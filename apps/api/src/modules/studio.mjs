@@ -561,8 +561,10 @@ export default async function routes(app) {
   // -------------------------------------------------------------------
   // Projects
   // -------------------------------------------------------------------
-  app.get('/studio/projects', { preHandler: requirePerm('studio.read') }, async () => {
-    const r = await q(`SELECT * FROM studio.projects ORDER BY created_at DESC`);
+  app.get('/studio/projects', { preHandler: requirePerm('studio.read') }, async (req) => {
+    const includeArchived = ['1', 'true'].includes(String(req.query?.include_archived ?? ''));
+    const r = await q(
+      `SELECT * FROM studio.projects ${includeArchived ? '' : 'WHERE archived_at IS NULL'} ORDER BY created_at DESC`);
     return { items: r.rows };
   });
 
@@ -609,6 +611,35 @@ export default async function routes(app) {
     await q(`INSERT INTO studio.events (project_id, from_state, to_state, actor_id, note) VALUES ($1,$2,$3,$4,$5)`,
       [p.id, p.state, to, req.actor?.id ?? null, req.body?.note ?? null]);
     return { id: p.id, from_state: p.state, to_state: to };
+  });
+
+  // Archive / unarchive (19 Aug 2026). Reversible: hides the project from
+  // the default list without touching its locks/shots/assets/events. Gated
+  // on studio.approve, same tier as /state and /assemble, since removing a
+  // whole project from view is a project-level decision, not a working edit.
+  app.post('/studio/projects/:id/archive', { preHandler: requirePerm('studio.approve') }, async (req, reply) => {
+    const p = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+    if (p.archived_at) return { id: p.id, archived_at: p.archived_at };
+    const updated = await one(
+      `UPDATE studio.projects SET archived_at=now(), updated_at=now() WHERE id=$1 RETURNING archived_at`, [p.id]);
+    await q(`INSERT INTO studio.events (project_id, from_state, to_state, actor_id, note) VALUES ($1,$2,$2,$3,$4)`,
+      [p.id, p.state, req.actor?.id ?? null, req.body?.note ?? 'project archived']);
+    await audit(null, { actor: req.actor, action: 'studio.project.archive', objectType: 'STUDIO_PROJECT',
+      objectId: p.id, objectCode: p.code });
+    return { id: p.id, archived_at: updated.archived_at };
+  });
+
+  app.post('/studio/projects/:id/unarchive', { preHandler: requirePerm('studio.approve') }, async (req, reply) => {
+    const p = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+    if (!p.archived_at) return { id: p.id, archived_at: null };
+    await q(`UPDATE studio.projects SET archived_at=NULL, updated_at=now() WHERE id=$1`, [p.id]);
+    await q(`INSERT INTO studio.events (project_id, from_state, to_state, actor_id, note) VALUES ($1,$2,$2,$3,$4)`,
+      [p.id, p.state, req.actor?.id ?? null, 'project unarchived']);
+    await audit(null, { actor: req.actor, action: 'studio.project.unarchive', objectType: 'STUDIO_PROJECT',
+      objectId: p.id, objectCode: p.code });
+    return { id: p.id, archived_at: null };
   });
 
   // -------------------------------------------------------------------

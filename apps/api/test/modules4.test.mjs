@@ -57,31 +57,28 @@ test('retention sweep denied to developer', async () => {
   assert.equal(r.statusCode, 200);
 });
 
-test('asset binding: a matching active library asset lands in the render payload', async () => {
-  // Upload a library asset that matches the mock script's scene brief
-  const up = await call('POST', '/api/v1/production/assets', tokens.producer, {
-    title: 'Addis evening calm street b-roll', kind: 'VIDEO', origin: 'SHOT_IN_HOUSE',
-    mime_type: 'video/mp4', content_base64: Buffer.from('broll').toString('base64'),
-    tags: ['city:addis', 'emotion:calm', 'time:evening'] });
-  assert.equal(up.statusCode, 201, up.body);
-  // Take an approved VIDEO script from the earlier suites and run a fresh
-  // job. The format filter matters since Run One: the registry tests also
-  // approve POST/ARTICLE scripts, which have no scene plan and therefore
-  // never bind assets, and "latest approved" could land on one of those.
+// Scene-asset binding into a render payload was a Creatomate-only feature:
+// modifications like Scene_1 only ever meant anything to a template render.
+// HeyGen and Creatomate are retired for good (19 Aug 2026, owner's
+// decision), video no longer renders through this module at all, so a
+// VIDEO-kind script -- even an APPROVED one -- can no longer start a
+// production job here at all, regardless of what the library holds. Scene
+// binding for generated video now lives in Video Studio.
+test('a VIDEO-kind script cannot start a production job here', async () => {
+  // Take an approved VIDEO script from the earlier suites, if one exists.
+  // The format filter matters since Run One: the registry tests also
+  // approve POST/ARTICLE scripts, which have no scene plan at all.
   const script = await one(
     `SELECT s.id FROM lcos.scripts s
      JOIN lcos.script_versions sv ON sv.script_id=s.id AND sv.version=s.current_version
      WHERE s.status='APPROVED' AND sv.format='VIDEO'
      ORDER BY s.created_at DESC LIMIT 1`);
   if (!script) return; // e2e suite provides one when run together
-  const job = (await call('POST', '/api/v1/production/jobs', tokens.producer,
-    { script_id: script.id })).json();
-  const run = await call('POST', `/api/v1/production/jobs/${job.id}/run`, tokens.producer);
-  assert.equal(run.statusCode, 200, run.body);
-  const jobRow = await one(`SELECT asset_plan FROM lcos.production_jobs WHERE id=$1`, [job.id]);
-  assert.ok(Array.isArray(jobRow.asset_plan) && jobRow.asset_plan.length >= 1,
-    `asset bound: ${JSON.stringify(jobRow.asset_plan)}`);
-  assert.ok(jobRow.asset_plan[0].asset_code.startsWith('AST-') || jobRow.asset_plan[0].asset_code.startsWith('GEN-'));
+  const job = await call('POST', '/api/v1/production/jobs', tokens.producer,
+    { script_id: script.id });
+  assert.equal(job.statusCode, 422, job.body);
+  assert.equal(job.json().guard, 'videoMovedToStudio');
+  assert.match(job.json().detail, /Video Studio/);
 });
 
 test('experiment conclude auto-attaches the primary metric from performance', async () => {

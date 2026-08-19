@@ -147,8 +147,22 @@ test('a carousel plan is entirely included: rendered from an HTML template on ou
   assert.ok(plan.cost_note.includes('nothing'));
 });
 
-test('plan choices persist on the job; inactive assets and unapproved medical illustrations refuse to bind', async () => {
+test('a VIDEO-kind script cannot enter production here; it points to Video Studio instead', async () => {
   const s = await genOne('send_it');
+  await call('POST', '/api/v1/reviews/batch-approve', tokens.admin, { script_ids: [s.id] });
+  const res = await call('POST', '/api/v1/production/jobs', tokens.producer, { script_id: s.id });
+  assert.equal(res.statusCode, 422, res.body);
+  assert.equal(res.json().guard, 'videoMovedToStudio');
+  assert.match(res.json().detail, /Video Studio/);
+});
+
+test('plan choices persist on the job; inactive assets and unapproved medical illustrations refuse to bind', async () => {
+  // save_it (CAROUSEL), not send_it: video no longer enters production
+  // through this pipeline (HeyGen/Creatomate retired 19 Aug 2026, video
+  // moves through Video Studio instead), but the job-level plan endpoint
+  // (engine slot, subtitle preset, asset-binding guards) is exercised the
+  // same way regardless of the underlying format.
+  const s = await genOne('save_it');
   await call('POST', '/api/v1/reviews/batch-approve', tokens.admin, { script_ids: [s.id] });
   const job = (await call('POST', '/api/v1/production/jobs', tokens.producer, { script_id: s.id })).json();
   const saved = await call('POST', `/api/v1/production/jobs/${job.id}/plan`, tokens.producer,
@@ -178,7 +192,10 @@ test('plan choices persist on the job; inactive assets and unapproved medical il
 });
 
 test('the daily render cap refuses politely at the door, before any money moves', async () => {
-  const s = await genOne('send_it');
+  // save_it (CAROUSEL): the cap check runs for every engine, not just video,
+  // and video-kind scripts can no longer create a production job at all
+  // (see production.mjs createProductionJob).
+  const s = await genOne('save_it');
   await call('POST', '/api/v1/reviews/batch-approve', tokens.admin, { script_ids: [s.id] });
   const job = (await call('POST', '/api/v1/production/jobs', tokens.producer, { script_id: s.id })).json();
   const set = await call('PUT', '/api/v1/platform/settings', tokens.admin,

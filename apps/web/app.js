@@ -1401,19 +1401,23 @@ const screens = {
   // payloads here is optional-chained: a field that does not exist yet
   // just does not render, rather than throwing.
   async studio() {
-    const r = await api('GET', '/studio/projects');
-    const items = r.items ?? [];
+    const qp = new URLSearchParams((location.hash.split('?')[1] ?? ''));
+    const showArchived = qp.get('archived') === '1';
+    const r = await api('GET', `/studio/projects${showArchived ? '?include_archived=1' : ''}`);
+    const items = (r.items ?? []).filter(p => showArchived || !p.archived_at);
     return `<h1>Video Studio</h1><div class="sub">The standalone AI video pipeline: continuity-locked characters and environments, shot-by-shot generation with automated QC, then assembly. Separate from the quick renders under Production.</div>
       <div class="card"><table>
       <tr><th>Code</th><th>Title</th><th>Format</th><th>State</th><th>Aspect</th><th>Created</th></tr>
       ${items.map(p => `<tr class="rowlink" data-nav="studio-project/${esc(p.id)}" tabindex="0">
         <td class="mono"><b>${esc(p.code)}</b></td>
-        <td>${esc(p.title)}</td>
+        <td>${esc(p.title)}${p.archived_at ? ' <span class="pill p-QC_BLOCKED"><span class="d"></span>archived</span>' : ''}</td>
         <td>${esc(p.format)}</td>
         <td>${pill(p.state)}</td>
         <td class="mono">${esc(p.aspect_ratio)}</td>
-        <td class="muted">${dt(p.created_at)}</td></tr>`).join('') || empty(6, 'No Video Studio projects yet. Start one below.')}
-      </table></div>
+        <td class="muted">${dt(p.created_at)}</td></tr>`).join('') || empty(6, showArchived ? 'No archived projects.' : 'No Video Studio projects yet. Start one below.')}
+      </table>
+      <div style="margin-top:10px"><a href="#/studio${showArchived ? '' : '?archived=1'}" class="muted" style="font-size:12px">${showArchived ? 'Hide archived projects' : 'Show archived projects'}</a></div>
+      </div>
       ${can('studio.write') ? `<div class="card"><div class="eyebrow">New project</div>
         <div class="grid2">
           <div>
@@ -1597,7 +1601,14 @@ const screens = {
       <div class="eyebrow">Video Studio project</div>
       <h1>${esc(p.code)} &middot; ${esc(p.title)}</h1>
       <div class="sub flex">${pill(p.state)}
-        <span class="muted">${esc(p.aspect_ratio ?? '')} &middot; ${esc(String(p.fps ?? ''))} fps &middot; ${esc(p.language ?? '')}</span></div>
+        ${p.archived_at ? `<span class="pill p-QC_BLOCKED"><span class="d"></span>archived</span>` : ''}
+        <span class="muted">${esc(p.aspect_ratio ?? '')} &middot; ${esc(String(p.fps ?? ''))} fps &middot; ${esc(p.language ?? '')}</span>
+        <span class="spacer"></span>
+        ${can('studio.approve') ? (p.archived_at
+          ? `<button data-stunarchive="${esc(p.id)}">Unarchive project</button>`
+          : `<button data-starchive="${esc(p.id)}" style="color:var(--risk-high)">Archive project</button>`) : ''}
+      </div>
+      ${p.archived_at ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">This project is archived and hidden from the Video Studio list. Nothing about its locks, shots, or generated assets was deleted -- unarchive to bring it back into view.</div>` : ''}
       ${budgetHtml}
       <div class="eyebrow" style="margin-top:20px">Locks</div>
       ${locksHtml}
@@ -3058,7 +3069,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3231,6 +3242,19 @@ document.addEventListener('click', async (e) => {
       b.disabled = true; b.textContent = 'Assembling…';
       await api('POST', `/studio/projects/${projectId}/assemble`, body);
       toast('Rough cut assembled'); return render();
+    }
+    if (b.dataset.starchive) {
+      const projectId = b.dataset.starchive;
+      if (!confirm('Archive this project? It will be hidden from the Video Studio list. Nothing is deleted, and you can unarchive it any time from the project page.')) return;
+      b.disabled = true; b.textContent = 'Archiving…';
+      await api('POST', `/studio/projects/${projectId}/archive`);
+      toast('Project archived'); return render();
+    }
+    if (b.dataset.stunarchive) {
+      const projectId = b.dataset.stunarchive;
+      b.disabled = true; b.textContent = 'Unarchiving…';
+      await api('POST', `/studio/projects/${projectId}/unarchive`);
+      toast('Project unarchived'); return render();
     }
   } catch (ex) { toast(ex.message, true); render(); }
 });

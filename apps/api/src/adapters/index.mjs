@@ -1,10 +1,12 @@
 // External service adapters. Interface + mock + production skeleton for each.
 // The rest of the application never sees a vendor response shape.
-// Production stack (what Letena actually uses):
-//   CREATOMATE  template video render     HEYGEN      presenter avatar
-//   KLING       generative b-roll video   ELEVENLABS  Amharic-capable TTS
-//   GEMINI      image generation          CANVA       carousels + statics
-//   TELEGRAM/META/YOUTUBE/TIKTOK          publishing
+// Production stack (what Letena actually uses, 19 Aug 2026 -- HeyGen and
+// Creatomate are retired, no templated-render engine and no presenter-avatar
+// engine remain):
+//   KLING/VEO   generative, continuity-locked video (Video Studio)
+//   ELEVENLABS/AZURE  TTS, Amharic-capable                  GEMINI  images
+//   CANVA       carousels + statics
+//   TELEGRAM/META/YOUTUBE/TIKTOK                     publishing
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import crypto from 'node:crypto';
@@ -29,57 +31,6 @@ export const storage = {
   // 2026): ffprobe/ffmpeg need a real path, not a file:// URL string, and
   // no other module had reason to reconstruct one before now.
   localPath(key) { return join(STORE, key); },
-};
-
-// ---------- render: Creatomate ----------
-export const creatomate = {
-  async submit({ templateExternalId, modifications, renderId }) {
-    if (MOCK()) {
-      // Deterministic mock: immediately "renders" an mp4 placeholder.
-      const key = `renders/${renderId}/output.mp4`;
-      await storage.put(key, Buffer.from(`MOCK-MP4 ${renderId} ${JSON.stringify(modifications).slice(0, 500)}`));
-      return { external_render_id: `mock-crea-${renderId.slice(0, 8)}`, status: 'SUCCEEDED',
-        storage_key: key, duration_s: 30, cost_usd: 0 };
-    }
-    const res = await fetch('https://api.creatomate.com/v1/renders', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${need('CREATOMATE_API_KEY')}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ template_id: templateExternalId, modifications }),
-    });
-    if (!res.ok) throw new Error(`creatomate ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    const [r] = await res.json();
-    return { external_render_id: r.id, status: 'SUBMITTED', storage_key: null, cost_usd: null };
-  },
-  async poll(externalId) {
-    if (MOCK()) return { status: 'SUCCEEDED' };
-    const res = await fetch(`https://api.creatomate.com/v1/renders/${externalId}`, {
-      headers: { Authorization: `Bearer ${need('CREATOMATE_API_KEY')}` } });
-    const r = await res.json();
-    return { status: { succeeded: 'SUCCEEDED', failed: 'FAILED' }[r.status] ?? 'PROCESSING', url: r.url };
-  },
-};
-
-// ---------- render: HeyGen presenter ----------
-export const heygen = {
-  async submit({ avatarId, audioUrl, script, renderId }) {
-    if (MOCK()) {
-      const key = `renders/${renderId}/presenter.mp4`;
-      await storage.put(key, Buffer.from(`MOCK-HEYGEN ${renderId}`));
-      return { external_render_id: `mock-hey-${renderId.slice(0, 8)}`, status: 'SUCCEEDED',
-        storage_key: key, cost_usd: 0 };
-    }
-    const res = await fetch('https://api.heygen.com/v2/video/generate', {
-      method: 'POST',
-      headers: { 'X-Api-Key': need('HEYGEN_API_KEY'), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        video_inputs: [{ character: { type: 'avatar', avatar_id: avatarId ?? need('HEYGEN_AVATAR_ID') },
-          voice: audioUrl ? { type: 'audio', audio_url: audioUrl } : { type: 'text', input_text: script } }],
-        dimension: { width: 1080, height: 1920 } }),
-    });
-    if (!res.ok) throw new Error(`heygen ${res.status}`);
-    const d = await res.json();
-    return { external_render_id: d.data.video_id, status: 'SUBMITTED' };
-  },
 };
 
 // ---------- generative b-roll: Kling ----------

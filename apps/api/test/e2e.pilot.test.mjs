@@ -55,7 +55,7 @@ after(async () => {
 });
 
 // ---------------------------------------------------------------- pipeline
-let questionId, familyId, scriptIds = [], renderId, publishedId;
+let questionId, familyId, scriptIds = [], postScriptId, renderId, publishedId;
 
 test('STEP 1-2: ingest sanitizes and stores the Postpill question', async () => {
   const res = await call('POST', '/api/v1/ingest/questions', tokens.intake, {
@@ -243,14 +243,18 @@ test('STEP 13: consulting doctor approves the Tier 3 script', async () => {
   assert.equal(res.json().status, 'APPROVED');
 });
 
-test('GOVERNANCE: AI voice holds while the Amharic translation is unapproved', async () => {
-  const jobRes = await call('POST', '/api/v1/production/jobs', tokens.producer,
+// HeyGen and Creatomate are retired for good (owner's decision, 19 Aug
+// 2026): this pipeline no longer renders VIDEO-kind pieces at all, so a
+// V01_QUESTION_EXPLAINER script -- even a fully doctor-approved TIER_3 one
+// -- fails closed at the door instead of silently trying a dead adapter.
+// Video production for this piece now happens as a Video Studio project,
+// started from this same approved script, outside this pipeline entirely.
+test('GOVERNANCE: video production is retired from this pipeline; it points to Video Studio instead', async () => {
+  const res = await call('POST', '/api/v1/production/jobs', tokens.producer,
     { script_id: scriptIds[0] });
-  assert.equal(jobRes.statusCode, 201, jobRes.body);
-  const runRes = await call('POST', `/api/v1/production/jobs/${jobRes.json().id}/run`, tokens.producer);
-  assert.equal(runRes.statusCode, 200, runRes.body);
-  assert.equal(runRes.json().status, 'VOICE_PENDING');
-  assert.match(runRes.json().reason, /language-approved/);
+  assert.equal(res.statusCode, 422, res.body);
+  assert.equal(res.json().guard, 'videoMovedToStudio');
+  assert.match(res.json().detail, /Video Studio/);
 });
 
 test('STEP 12b: language editor approves the Amharic', async () => {
@@ -259,18 +263,35 @@ test('STEP 12b: language editor approves the Amharic', async () => {
   assert.equal(r.statusCode, 200, r.body);
 });
 
-test('STEP 14-16: production routes and renders through the mock adapter', async () => {
+// The rest of this suite (production through publish, lineage, analytics)
+// walks a companion telegram_post piece from the SAME EC-004/EC-005
+// knowledge card and family, since video no longer produces anything here
+// to walk forward. scriptIds[0] already carried the full doctor + language
+// review journey above; this companion piece is force-approved directly
+// (the same fixture shortcut formats_registry.test.mjs and modules4.test.mjs
+// use) because that review journey is not what these later steps are
+// testing -- production, publish, lineage and analytics are format-agnostic
+// once a script is APPROVED.
+test('STEP 14-16: a companion telegram_post script from the same card produces through the mock adapter (video no longer produces here)', async () => {
+  const family = await one(`SELECT knowledge_card_id FROM lcos.content_families WHERE id=$1`, [familyId]);
+  const gen = await call('POST', '/api/v1/content/generate', tokens.admin,
+    { card_id: family.knowledge_card_id, formats: ['telegram_post'], languages: ['EN'] });
+  assert.equal(gen.statusCode, 202, gen.body);
+  postScriptId = gen.json().scripts[0].script_id ?? gen.json().scripts[0].id;
+  const admin = await one(`SELECT id FROM lcos.users WHERE email='admin@letena.local'`);
+  await q(`UPDATE lcos.scripts SET status='APPROVED', approved_by=$2, approved_at=now(),
+             approved_version=current_version WHERE id=$1`, [postScriptId, admin.id]);
+
   const jobRes = await call('POST', '/api/v1/production/jobs', tokens.producer,
-    { script_id: scriptIds[0] });
+    { script_id: postScriptId });
   assert.equal(jobRes.statusCode, 201, jobRes.body);
   const job = jobRes.json();
-  assert.equal(job.engine, 'CREATOMATE');
+  assert.equal(job.engine, 'MANUAL_UPLOAD');
   const runRes = await call('POST', `/api/v1/production/jobs/${job.id}/run`, tokens.producer);
   assert.equal(runRes.statusCode, 200, runRes.body);
   const run = runRes.json();
   assert.equal(run.status, 'RENDERED');
   renderId = run.render_id;
-  assert.ok(run.preview_url, 'preview exists');
 });
 
 test('a script that is not APPROVED cannot enter production', async () => {
@@ -289,7 +310,7 @@ test('STEP 17-18: reviewer approves the finished render', async () => {
 test('publishing without final render approval is blocked', async () => {
   // second render with no approval
   const job2 = (await call('POST', '/api/v1/production/jobs', tokens.producer,
-    { script_id: scriptIds[0] })).json();
+    { script_id: postScriptId })).json();
   const run2 = (await call('POST', `/api/v1/production/jobs/${job2.id}/run`, tokens.producer)).json();
   const res = await call('POST', '/api/v1/distribution/jobs', tokens.social,
     { render_id: run2.render_id, platform: 'TELEGRAM' });

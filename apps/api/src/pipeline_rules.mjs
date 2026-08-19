@@ -9,9 +9,13 @@
 // stages its piece's production_path removes. 'produce' was added 14 Aug
 // 2026 (owner: "it should default to digital production with our
 // piepleine"): on the DIGITAL path a single produce stage covers the
-// adapter pipeline (Gemini, Kling, ElevenLabs, Creatomate, Canva) and
-// replaces shoot+edit; the LIVE path keeps shoot and edit for real shoots
-// and the AUA live; NONE (text and app surfaces) has no production at all.
+// adapter pipeline (Gemini, Kling, ElevenLabs, Canva) and replaces
+// shoot+edit; the LIVE path keeps shoot and edit for real shoots and the
+// AUA live; NONE (text and app surfaces) has no production at all. HeyGen
+// and Creatomate, both referenced in this pipeline's original design, were
+// retired 19 Aug 2026 (owner's decision); DIGITAL video production now
+// runs through Video Studio (apps/api/src/modules/studio.mjs), not this
+// adapter pipeline.
 export const STAGES = Object.freeze([
   'plan', 'script', 'medical_review', 'produce', 'shoot', 'edit',
   'approve', 'publish', 'repurpose', 'measure',

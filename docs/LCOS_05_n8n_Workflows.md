@@ -463,6 +463,9 @@ Weights live in `settings.priority.weights` and must sum to 1, asserted at load.
 2  Log Start
 3  HTTP: GET /content/scripts/{id}?include=version,concept,family,segment
 4  Function: choose engine and template
+      SUPERSEDED 19 Aug 2026 -- see the note at the top of WF13 and WF14.
+      This CREATOMATE/HEYGEN routing table is retired; video production now
+      runs through Video Studio (Kling/Veo), not through this router.
       V01 QUESTION_EXPLAINER      → CREATOMATE  LETENA_QA_30S_V1
       V02 CHAT_STORY              → CREATOMATE  LETENA_CHAT_35S_V1
       V03 ILLUSTRATED_SCENARIO    → CREATOMATE  LETENA_STORY_40S_V1  (needs illustrations)
@@ -544,6 +547,18 @@ Weights live in `settings.priority.weights` and must sum to 1, asserted at load.
 
 ## WF13 Presenter Generation
 
+> **SUPERSEDED 19 Aug 2026 (Nate's decision).** HeyGen and Creatomate are
+> retired from LCOS entirely -- not paused, not disabled, removed from the
+> codebase (adapters, ROUTE table, credential fields). This workflow is kept
+> below as historical design record only; it does not run and nothing in the
+> live system calls HeyGen anymore. Video production now runs through Video
+> Studio (`apps/api/src/modules/studio.mjs`): continuity-locked characters
+> generated with Kling/Veo, assembled with ffmpeg. Every format's job inside
+> LCOS itself is now writing the script -- Amharic and English, with a human
+> reviewing and editing the Amharic -- and tracking it through approval.
+> Actual production happens either through a Video Studio project or a real
+> shoot by the team, both outside this workflow.
+
 | Field | Value |
 |---|---|
 | Trigger | Webhook `production_job.presenter_required` |
@@ -578,6 +593,18 @@ Weights live in `settings.priority.weights` and must sum to 1, asserted at load.
 ---
 
 ## WF14 Video Rendering
+
+> **SUPERSEDED 19 Aug 2026 (Nate's decision).** HeyGen and Creatomate are
+> retired from LCOS entirely -- not paused, not disabled, removed from the
+> codebase (adapters, ROUTE table, credential fields). This workflow is kept
+> below as historical design record only; it does not run and nothing in the
+> live system calls Creatomate anymore. Video production now runs through
+> Video Studio (`apps/api/src/modules/studio.mjs`): continuity-locked
+> characters generated with Kling/Veo, assembled with ffmpeg. Every format's
+> job inside LCOS itself is now writing the script -- Amharic and English,
+> with a human reviewing and editing the Amharic -- and tracking it through
+> approval. Actual production happens either through a Video Studio project
+> or a real shoot by the team, both outside this workflow.
 
 | Field | Value |
 |---|---|

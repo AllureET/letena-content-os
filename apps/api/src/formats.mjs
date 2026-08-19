@@ -16,8 +16,9 @@
 // the video renderer with no template. All three also generated an AI
 // voiceover first, because nothing asked whether the format has audio.
 //
-// video_family is a render-routing key (which Creatomate template, which
-// engine). This is the orthogonal question the system never asked: what kind
+// video_family is a render-routing key (historically which Creatomate
+// template, which engine; HeyGen and Creatomate were retired 19 Aug 2026,
+// see production.mjs). This is the orthogonal question the system never asked: what kind
 // of thing is this, and therefore what does the writer need to write.
 
 // The body kinds a script_versions row can carry. A registry format maps to

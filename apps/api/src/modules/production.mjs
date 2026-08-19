@@ -1,7 +1,7 @@
 // Production module: assets, production jobs, router, renders via adapters.
 import crypto from 'node:crypto';
 import { q, one, audit, requirePerm, err, setting } from '../core.mjs';
-import { creatomate, heygen, kling, tts, gemini, canva, storage, videoEngine } from '../adapters/index.mjs';
+import { kling, tts, gemini, canva, storage, videoEngine } from '../adapters/index.mjs';
 import { formatOf, hasAudio } from '../formats.mjs';
 import { embed, toVectorLiteral } from '../ai/gateway.mjs';
 
@@ -38,7 +38,7 @@ export const SUBTITLE_PRESETS = Object.freeze([
 ]);
 
 // Plain-language production step descriptions per engine key, with honest
-// costs: only Gemini, Kling/Veo, Azure and HeyGen meter. Assembly, cutting,
+// costs: only Gemini and Kling/Veo meter (Video Studio). Assembly, cutting,
 // subtitling and carousel rendering run with FFmpeg / an HTML template on
 // the Hetzner box Letena already pays for, so they are INCLUDED, never a
 // fake dollar figure (owner, Part 2 brief, 14 Aug 2026).
@@ -47,9 +47,13 @@ function money(estimates, key, count = 1) {
   return { est_cost_usd: Math.round(per * count * 100) / 100, metered: per > 0 && count > 0 };
 }
 
-// Format -> engine routing. Kling/Gemini generate b-roll assets, never the
-// final render; Canva handles carousel/static; Creatomate assembles video;
-// HeyGen only for the presenter family and never at TIER_4.
+// Format -> engine routing. VIDEO-kind formats (V01-V06, and any
+// registry-driven format whose body_kind is VIDEO) are not routed here at
+// all: video production moved to Video Studio (apps/api/src/modules/studio.mjs)
+// on 19 Aug 2026, when HeyGen and Creatomate were retired for good (owner's
+// decision). createProductionJob() blocks a VIDEO-kind script before it ever
+// reaches this table. What remains here is the MANUAL_UPLOAD family: Canva
+// carousels and statics, and the plain Telegram post.
 // Pre-0018 scripts have no post_text, so fall back to what a post would have
 // been assembled from before the format work.
 function bodyFallbackForPost(v) {
@@ -57,12 +61,6 @@ function bodyFallbackForPost(v) {
 }
 
 const ROUTE = {
-  V01_QUESTION_EXPLAINER: { engine: 'CREATOMATE', template: 'LETENA_QA_30S_V1' },
-  V02_CHAT_STORY: { engine: 'CREATOMATE', template: 'LETENA_CHAT_35S_V1' },
-  V03_ILLUSTRATED_SCENARIO: { engine: 'CREATOMATE', template: 'LETENA_STORY_40S_V1', gen: 'GEMINI' },
-  V04_MEDICAL_VISUAL_EXPLAINER: { engine: 'CREATOMATE', template: 'LETENA_MEDVIS_45S_V1', libraryOnly: true },
-  V05_DIGITAL_PRESENTER: { engine: 'HEYGEN', template: 'LETENA_PRESENTER_V1', blockTier: 'TIER_4' },
-  V06_REAL_ETHIOPIA_HYBRID: { engine: 'CREATOMATE', template: 'LETENA_BROLL_30S_V1', gen: 'KLING' },
   C01_CAROUSEL: { engine: 'MANUAL_UPLOAD', design: 'CANVA' },
   C02_STATIC_GRAPHIC: { engine: 'MANUAL_UPLOAD', design: 'CANVA' },
   C03_TELEGRAM_POST: { engine: 'MANUAL_UPLOAD' },
@@ -86,8 +84,13 @@ export default async function routes(app) {
       return reply.code(422).send(err(422, 'GUARD_FAILED',
         'Only APPROVED scripts enter production.', { guard: 'scriptApproved' }));
     }
-    const job = await createProductionJob(s, req.actor);
-    return reply.code(201).send(job);
+    try {
+      const job = await createProductionJob(s, req.actor);
+      return reply.code(201).send(job);
+    } catch (e) {
+      const status = e.status ?? 500;
+      return reply.code(status).send(err(status, e.code ?? 'INTERNAL', e.message, e.guard ? { guard: e.guard } : {}));
+    }
   });
 
   app.post('/production/jobs/:id/run', async (req, reply) => {
@@ -374,11 +377,28 @@ export default async function routes(app) {
 
 export async function createProductionJob(script, actor) {
   const concept = await one(`SELECT * FROM lcos.content_concepts WHERE id=$1`, [script.concept_id]);
-  const route = ROUTE[concept.video_family] ?? ROUTE.V01_QUESTION_EXPLAINER;
-  if (route.blockTier && script.risk_tier === route.blockTier) {
-    throw Object.assign(new Error(`${concept.video_family} is not permitted at ${script.risk_tier}`),
-      { status: 422, code: 'GUARD_FAILED' });
+  // The plan defaults (Part 2): the format's own subtitle preset, and the
+  // format's engine override when one exists (NULL resolves to the
+  // production.video_engine setting at run time, so swapping the system
+  // default later applies to queued jobs too). body_kind is also read from
+  // here first, falling back to the legacy video_family mapping, because
+  // it is the authoritative shape for registry-driven formats (Run One).
+  const fmtRow = concept.format_code
+    ? await one(`SELECT body_kind, subtitle_preset, video_engine FROM lcos.content_formats WHERE code=$1`,
+        [concept.format_code]) : null;
+  const bodyKind = fmtRow?.body_kind ?? formatOf(concept.video_family);
+  // Video production moved to Video Studio on 19 Aug 2026 (owner's decision:
+  // HeyGen and Creatomate are retired for good). This pipeline never rendered
+  // anything but VIDEO-kind pieces through those two engines, so a VIDEO-kind
+  // script fails closed here, at the door, with an honest redirect, instead
+  // of creating a job this module has no way to run.
+  if (bodyKind === 'VIDEO') {
+    throw Object.assign(new Error(
+      'Video production now runs through Video Studio, not this pipeline. Approve this script, ' +
+      'then start a Video Studio project from it instead.'),
+      { status: 422, code: 'GUARD_FAILED', guard: 'videoMovedToStudio' });
   }
+  const route = ROUTE[concept.video_family] ?? { engine: 'MANUAL_UPLOAD' };
   const template = route.template
     ? await one(`SELECT * FROM lcos.video_templates WHERE code=$1 AND status='APPROVED'`, [route.template]) : null;
   const aiVoiceTiers = await setting('voice.ai_allowed_tiers', ['TIER_1', 'TIER_2']);
@@ -388,19 +408,12 @@ export async function createProductionJob(script, actor) {
   // surface would ever play.
   const voice = !hasAudio(concept.video_family) ? 'NONE'
     : script.language === 'AM' && !aiVoiceTiers.includes(script.risk_tier) ? 'HUMAN' : 'AI_TTS';
-  // The plan defaults (Part 2): the format's own subtitle preset, and the
-  // format's engine override when one exists (NULL resolves to the
-  // production.video_engine setting at run time, so swapping the system
-  // default later applies to queued jobs too).
-  const fmtRow = concept.format_code
-    ? await one(`SELECT subtitle_preset, video_engine FROM lcos.content_formats WHERE code=$1`,
-        [concept.format_code]) : null;
   const job = await one(
     `INSERT INTO lcos.production_jobs (code, script_id, family_id, template_id, engine, status,
        routing_reason, voice_source, requested_by, subtitle_preset, video_engine)
      VALUES ($1,$2,$3,$4,$5::lcos.render_engine,'QUEUED',$6,$7,$8,$9,$10) RETURNING *`,
     [code('PJ'), script.id, script.family_id, template?.id ?? null, route.engine,
-     `${concept.video_family} -> ${route.engine}${route.libraryOnly ? ' (library-only assets)' : ''}`,
+     `${concept.video_family} -> ${route.engine}`,
      voice, actor?.id ?? null, fmtRow?.subtitle_preset ?? null, fmtRow?.video_engine ?? null]);
   await audit(null, { actor, action: 'production_job.create', objectType: 'PRODUCTION_JOB',
     objectId: job.id, objectCode: job.code });
@@ -457,9 +470,15 @@ export async function runProductionJob(jobId, actor) {
 
   try {
     let result;
-    if (job.engine === 'HEYGEN') {
-      result = await heygen.submit({ script: v.spoken_script, audioUrl: voiceKey ? storage.url(voiceKey) : null,
-        renderId: render.id });
+    if (formatOf(concept.video_family) === 'VIDEO') {
+      // Video production moved to Video Studio on 19 Aug 2026 (HeyGen and
+      // Creatomate are retired for good). createProductionJob() already
+      // refuses to create a fresh VIDEO-kind job, so the only way this branch
+      // is reached is a job that was queued before that change (engine
+      // CREATOMATE or HEYGEN in the historical data). Fail closed, honestly,
+      // rather than calling either retired adapter.
+      throw new Error('Video production now runs through Video Studio, not this pipeline. ' +
+        'This job predates that change; start a Video Studio project from the approved script instead.');
     } else if (formatOf(concept.video_family) === 'CAROUSEL') {
       // Slides now come from carousel_slides, written as slides. They used to
       // be built from onscreen_text, which the writer produces as captions
@@ -490,57 +509,10 @@ export async function runProductionJob(jobId, actor) {
         external_render_id: `post-${render.id.slice(0, 8)}`,
         post_text: v.post_text ?? bodyFallbackForPost(v) };
     } else {
-      const modifications = {
-        Question_Text: v.hook, Answer_Text: v.onscreen_text?.[1]?.text ?? v.onscreen_text?.[0]?.text ?? '',
-        CTA_Text: v.cta, Voiceover: voiceKey ? storage.url(voiceKey) : null,
-      };
-      // Asset binding (WF12): for each scene that needs a visual, search the
-      // ACTIVE library semantically. Library first; typography fallback;
-      // MEDICAL_ILLUSTRATION binds only clinically approved assets.
-      const scenes = Array.isArray(v.scene_plan) ? v.scene_plan : [];
-      const bound = [];
-      // Bindings Girum CHOSE on the production plan win over the automatic
-      // search (Part 2: pull from the library while generating; generating
-      // is the fallback, not the default). Guarded again at use: the plan
-      // endpoint validated them, but an asset can be deactivated between
-      // plan and run.
-      const chosen = new Map((job.plan?.asset_bindings ?? []).map(b => [Number(b.scene), b.asset_id]));
-      for (const scene of scenes.slice(0, 3)) {
-        const reqmt = scene.asset_requirement ?? {};
-        if (!reqmt.kind || reqmt.kind === 'TYPOGRAPHY_ONLY') continue;
-        if (chosen.has(Number(scene.index))) {
-          const a = await one(
-            `SELECT id, code, storage_key FROM lcos.assets
-             WHERE id=$1 AND is_active AND storage_key IS NOT NULL
-               AND (kind <> 'MEDICAL_ILLUSTRATION' OR clinically_approved)`,
-            [chosen.get(Number(scene.index))]);
-          if (a) {
-            modifications[`Scene_${scene.index}`] = storage.url(a.storage_key);
-            bound.push({ scene: scene.index, asset_code: a.code, similarity: null, chosen: true });
-            continue;
-          }
-        }
-        const vec = toVectorLiteral(await embed(
-          `${scene.visual_brief ?? ''} ${(reqmt.tags ?? []).join(' ')}`));
-        const hit = await one(
-          `SELECT id, code, storage_key, 1 - (embedding <=> $1::vector) AS sim
-           FROM lcos.assets
-           WHERE is_active AND embedding IS NOT NULL AND storage_key IS NOT NULL
-             AND ($2::text IS NULL OR kind = $2::lcos.asset_kind)
-             AND (kind <> 'MEDICAL_ILLUSTRATION' OR clinically_approved)
-           ORDER BY embedding <=> $1::vector LIMIT 1`,
-          [vec, reqmt.kind === 'VIDEO' ? 'VIDEO' : null]);
-        if (hit && hit.sim >= 0.25) {
-          modifications[`Scene_${scene.index}`] = storage.url(hit.storage_key);
-          bound.push({ scene: scene.index, asset_code: hit.code, similarity: Math.round(hit.sim * 100) / 100 });
-        }
-      }
-      if (bound.length) {
-        await q(`UPDATE lcos.production_jobs SET asset_plan=$2 WHERE id=$1`,
-          [job.id, JSON.stringify(bound)]);
-      }
-      result = await creatomate.submit({ templateExternalId: template?.external_template_id,
-        modifications, renderId: render.id });
+      // No known production path for this body kind. VIDEO is caught above;
+      // CAROUSEL, STATIC and POST are the only other shapes this pipeline
+      // has ever rendered, so reaching here means an unrecognised video_family.
+      throw new Error(`No production path for video_family ${concept.video_family}.`);
     }
     const done = result.status === 'SUCCEEDED';
     // Test-mode renders (script.is_test_content, per the admin approval-override

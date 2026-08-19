@@ -167,8 +167,22 @@ function fontFamilyName(dataFontFamily) {
 // character count -- generous enough for Ethiopic glyphs, which tend to be
 // wider than Latin ones. Good enough for sizing a background box; it is
 // never used for anything pixel-critical.
+// Ethiopic (Ge'ez) glyphs sit close to full em-square width -- noticeably
+// wider on average than Latin's mixed ascender/x-height/descender mix, which
+// is what the original single 0.62 ratio was tuned for. Found via the 19 Aug
+// 2026 live-content test (the real "Spotting on the Pill" brief): at the
+// brief's own specified font sizes, the title card and keyword label
+// overflowed their background pill and ran off the canvas edge on real
+// Amharic text, while short Latin/short-Amharic labels (the share label,
+// door card lines) happened to stay inside their boxes and hid the bug.
+// Detects Ethiopic script (U+1200-U+137F core block, U+1380-U+139F
+// syllable/punctuation extensions) and widens the estimate accordingly;
+// non-Ethiopic text keeps the original ratio.
+const ETHIOPIC_RANGE = /[ሀ-᎟]/;
 function estimateTextWidthPx(text, fontSizePx) {
-  return Math.max(1, String(text ?? '').length) * Number(fontSizePx ?? 28) * 0.62;
+  const s = String(text ?? '');
+  const ratio = ETHIOPIC_RANGE.test(s) ? 0.92 : 0.62;
+  return Math.max(1, s.length) * Number(fontSizePx ?? 28) * ratio;
 }
 
 function resolveAnchorXY(anchor, insetPx, boxW, boxH, canvasW, canvasH) {
@@ -190,22 +204,88 @@ function resolveAnchorXY(anchor, insetPx, boxW, boxH, canvasW, canvasH) {
 // WHOLE image (fade alpha, or slide the whole frame in from off-canvas),
 // which lands the box at exactly this resting position without the SVG
 // itself needing to know about the animation.
+// Greedy word-wrap into at most `maxLines` lines, each measured against
+// `maxWidthPx` via estimateTextWidthPx. Never splits inside a word --
+// Amharic title cards wrap word by word, same as the brief format itself
+// writes a "two lines" title card. The last allowed line absorbs every
+// remaining word even if it is still too wide; compileCardSvg's caller is
+// responsible for shrinking the font afterward if that happens, not this
+// function (kept pure/measurement-only so it stays trivially testable).
+function wrapTextLines(text, fontSizePx, maxWidthPx, maxLines = 2) {
+  const words = String(text ?? '').trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return [''];
+  const lines = [];
+  let current = '';
+  for (const word of words) {
+    if (lines.length === maxLines - 1) { current = current ? `${current} ${word}` : word; continue; }
+    const trial = current ? `${current} ${word}` : word;
+    if (current && estimateTextWidthPx(trial, fontSizePx) > maxWidthPx) {
+      lines.push(current);
+      current = word;
+    } else {
+      current = trial;
+    }
+  }
+  lines.push(current);
+  return lines;
+}
+
 function compileCardSvg(data, canvasW, canvasH, boldB64, regB64) {
   const d = data ?? {};
-  const fontSize = Number(d.font_size_px ?? 28);
-  const padX = Math.round(fontSize * 0.9);
-  const padY = Math.round(fontSize * 0.55);
+  let fontSize = Number(d.font_size_px ?? 28);
   const inset = Number(d.position?.inset_px ?? 24);
-  const textW = estimateTextWidthPx(d.text, fontSize);
-  const boxW = Math.max(1, Math.min(canvasW - 2 * inset, Math.round(textW + padX * 2)));
-  const boxH = Math.round(fontSize + padY * 2);
+  const maxBoxW = Math.max(1, canvasW - 2 * inset);
+  const padXFor = (fs) => Math.round(fs * 0.9);
+  const MIN_FONT_RATIO = 0.55;
+
+  // Real two-line wrapping (added 19 Aug 2026 after the live-content test
+  // above, which first showed real Amharic text overflowing a single-line
+  // card, then -- once that overflow was fixed by shrinking the font --
+  // showed the shrunk single line looking cramped where the brief format
+  // itself calls for "two lines"). Try one line first (the common,
+  // already-fits case pays no extra cost); only wrap when it does not fit.
+  let lines = [String(d.text ?? '')];
+  let widest = estimateTextWidthPx(lines[0], fontSize);
+  if (widest + padXFor(fontSize) * 2 > maxBoxW) {
+    const maxLineWidth = maxBoxW - padXFor(fontSize) * 2;
+    const wrapped = wrapTextLines(d.text, fontSize, maxLineWidth, 2);
+    const wrappedWidest = Math.max(...wrapped.map(l => estimateTextWidthPx(l, fontSize)));
+    if (wrappedWidest + padXFor(fontSize) * 2 <= maxBoxW) {
+      lines = wrapped;
+      widest = wrappedWidest;
+    } else {
+      // Shrink-to-fit safety net: even two lines don't fit the requested
+      // font size (an unusually long phrase, or a narrow anchor). Shrink
+      // just enough that the WIDEST wrapped line fits, down to a floor of
+      // 55% of the requested size -- below that a card reads as "broken"
+      // rather than "smaller than asked for", so it stays at the floor and
+      // may look tight, but this still guarantees no overflow off the
+      // canvas regardless of how long the real text turns out to be.
+      const scale = Math.max(MIN_FONT_RATIO, maxLineWidth / wrappedWidest);
+      fontSize = Math.max(1, Math.round(fontSize * scale));
+      const rewrapped = wrapTextLines(d.text, fontSize, maxBoxW - padXFor(fontSize) * 2, 2);
+      lines = rewrapped;
+      widest = Math.max(...rewrapped.map(l => estimateTextWidthPx(l, fontSize)));
+    }
+  }
+
+  const padX = padXFor(fontSize);
+  const padY = Math.round(fontSize * 0.55);
+  const lineHeight = Math.round(fontSize * 1.3);
+  const boxW = Math.max(1, Math.min(maxBoxW, Math.round(widest + padX * 2)));
+  const boxH = Math.round(lines.length * lineHeight + padY * 2 - (lineHeight - fontSize));
   const { x, y } = resolveAnchorXY(d.position?.anchor ?? 'top', inset, boxW, boxH, canvasW, canvasH);
   const rx = Number(d.corner_radius_px ?? 12);
   const bgOpacity = d.background_opacity ?? 1;
+  const textCX = x + boxW / 2;
+  const blockTop = y + (boxH - lines.length * lineHeight) / 2;
+  const textEls = lines.map((line, i) =>
+    `<text x="${textCX}" y="${blockTop + i * lineHeight + lineHeight / 2 + fontSize * 0.34}" font-family="${fontFamilyName(d.font_family)}" font-size="${fontSize}" fill="${d.text_color ?? '#FFFFFF'}" text-anchor="middle">${escapeXml(line)}</text>`
+  ).join('\n');
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasW}" height="${canvasH}">
 ${fontFaceDefs(boldB64, regB64)}
 <rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="${rx}" fill="${d.background_color ?? '#16103F'}" fill-opacity="${bgOpacity}"/>
-<text x="${x + boxW / 2}" y="${y + boxH / 2 + fontSize * 0.34}" font-family="${fontFamilyName(d.font_family)}" font-size="${fontSize}" fill="${d.text_color ?? '#FFFFFF'}" text-anchor="middle">${escapeXml(d.text)}</text>
+${textEls}
 </svg>`;
 }
 

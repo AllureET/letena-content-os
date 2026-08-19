@@ -7,7 +7,7 @@
 //   ELEVENLABS/AZURE  TTS, Amharic-capable                  GEMINI  images
 //   CANVA       carousels + statics
 //   TELEGRAM/META/YOUTUBE/TIKTOK                     publishing
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import crypto from 'node:crypto';
 import { cred } from '../creds.mjs';
@@ -173,16 +173,29 @@ export const elevenlabs = {
 
 // ---------- images: Gemini ----------
 export const gemini = {
-  async generateImage({ prompt, assetId }) {
+  // referenceImageKeys (Video Studio character+environment composition,
+  // 19 Aug 2026): an optional array of 0-2 existing storage keys to hand
+  // to Gemini alongside the text prompt, so it composes FROM those images
+  // (e.g. "put this locked character into this locked background")
+  // instead of generating from text alone. Purely additive -- every
+  // existing caller (lock reference generation) omits referenceImageKeys
+  // and gets byte-for-byte the same text-to-image call as before. Per
+  // Gemini's actual multi-image API shape, each reference is sent as an
+  // inlineData part BEFORE the text part.
+  async generateImage({ prompt, assetId, referenceImageKeys }) {
+    const refCount = referenceImageKeys?.length ?? 0;
     if (MOCK()) {
       const key = `assets/generated/${assetId}/image.png`;
-      await storage.put(key, Buffer.from(`MOCK-GEMINI-PNG ${prompt.slice(0, 120)}`));
+      await storage.put(key, Buffer.from(`MOCK-GEMINI-PNG refs=${refCount} ${prompt.slice(0, 100)}`));
       return { status: 'SUCCEEDED', storage_key: key, cost_usd: 0 };
     }
+    const imageParts = (referenceImageKeys ?? []).map((k) =>
+      ({ inlineData: { mimeType: 'image/png', data: readFileSync(storage.localPath(k)).toString('base64') } }));
+    const parts = [...imageParts, { text: prompt }];
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${need('GEMINI_API_KEY')}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      body: JSON.stringify({ contents: [{ parts }] }),
     });
     if (!res.ok) throw new Error(`gemini ${res.status}`);
     const d = await res.json();

@@ -76,6 +76,7 @@ const ESTIMATED_COST_USD = {
   KLING_VIDEO_PER_S: 0.35,       // Kling generative video, per second of output
   VEO_VIDEO_PER_S: 0.50,         // Veo generative video, per second of output
   GEMINI_REFERENCE_IMAGE: 0.04,  // Gemini reference/keyframe still, flat per image
+  GEMINI_COMPOSE_IMAGE: 0.04,    // Gemini character+environment composite still, flat per image
   SUNO_MUSIC_TRACK: 0.20,        // Suno music bed, flat per generated track
   AZURE_TTS_PER_CHAR: 0.000016,  // Azure neural TTS, per character of input text
 };
@@ -107,6 +108,34 @@ export function compileStillPrompt(lock) {
   if (d.composition) lines.push(`[COMPOSITION] ${d.composition}`);
   if (d.lighting) lines.push(`[LIGHTING] ${d.lighting}`);
   if (d.aspect_ratio) lines.push(`[ASPECT] ${d.aspect_ratio}`);
+  lines.push('Positive, visual description only. No embedded text, subtitles, logos, or watermark.');
+  return lines.join('\n');
+}
+
+// Composition prompt grammar (Video Studio "character into background"
+// step, 19 Aug 2026): a still-image prompt that places a locked
+// character's subject description into a locked environment's setting
+// description, for use with gemini.generateImage's referenceImageKeys --
+// the model gets both this text prompt AND the two locks' own reference
+// images, and the text spells out that both must be preserved exactly as
+// locked, not reinterpreted. Reuses compileStillPrompt's own
+// [STYLE]/[SUBJECT]/[ENVIRONMENT]/[LIGHTING] bracket-label grammar rather
+// than inventing a second one, and ends with the same no-embedded-text
+// rule. Pure function, no I/O, same discipline as compileStillPrompt and
+// compileMotionPrompt above.
+export function compileComposePrompt(characterLock, environmentLock, styleLock) {
+  const cd = characterLock.data ?? {};
+  const ed = environmentLock.data ?? {};
+  const lines = [];
+  const styleSummary = styleLock?.data?.style_summary ?? cd.style_summary ?? ed.style_summary;
+  if (styleSummary) lines.push(`[STYLE] ${styleSummary}`);
+  lines.push(`[SUBJECT] ${cd.name ?? characterLock.entity_code}: ${[cd.apparent_age, cd.silhouette, cd.face, cd.hair]
+    .filter(Boolean).join('; ')}`);
+  if (cd.wardrobe_variants?.default) lines.push(`[WARDROBE] ${cd.wardrobe_variants.default}`);
+  lines.push(`[ENVIRONMENT] ${[ed.architecture, ed.palette, ed.time, ed.weather].filter(Boolean).join('; ')}`);
+  lines.push(`[COMPOSITION] Place the [SUBJECT] into the [ENVIRONMENT], preserving the character's identity, wardrobe, and physical features EXACTLY as locked, and preserving the environment's architecture, palette, and setting EXACTLY as locked. Do not invent a different character or a different place -- this is the same character, this is the same place, seen together for the first time.`);
+  if (ed.lighting || cd.lighting) lines.push(`[LIGHTING] ${ed.lighting ?? cd.lighting}`);
+  if (styleLock?.data?.motion_grammar) lines.push(`STYLE OF MOTION: ${styleLock.data.motion_grammar}`);
   lines.push('Positive, visual description only. No embedded text, subtitles, logos, or watermark.');
   return lines.join('\n');
 }
@@ -1224,6 +1253,96 @@ export default async function routes(app) {
     sets.push('status=\'DRAFT\'', 'updated_at=now()');
     const updated = await one(`UPDATE studio.shots SET ${sets.join(', ')} WHERE id=$1 RETURNING *`, vals);
     return updated;
+  });
+
+  // Compose a shot's first frame from its locked CHARACTER + ENVIRONMENT
+  // (Video Studio "step by step" shot generation, 19 Aug 2026): Letena's
+  // real doctor-presenter Instagram content is the same doctor across two
+  // different backdrops -- character identity fixed, background swapped --
+  // and this route is the step that was missing to build that first frame
+  // deliberately instead of leaving image_to_video's first_frame_asset_id
+  // for a human to hand-assemble outside the system. It does NOT generate
+  // video and does NOT touch shot.status; it only produces one composed
+  // still and points the shot's generation block at it, so the existing
+  // /generate route picks it up as an image_to_video first frame exactly
+  // as it already knows how to.
+  app.post('/studio/shots/:shotId/compose-first-frame', { preHandler: requirePerm('studio.generate') }, async (req, reply) => {
+    const shot = await one(`SELECT * FROM studio.shots WHERE id=$1`, [req.params.shotId]);
+    if (!shot) return reply.code(404).send(err(404, 'NOT_FOUND', 'shot not found'));
+    const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [shot.project_id]);
+    const locks = (await q(`SELECT * FROM studio.locks WHERE id = ANY($1)`, [shot.locked_lock_ids])).rows;
+    const characterLock = locks.find(l => l.entity_type === 'CHARACTER');
+    const environmentLock = locks.find(l => l.entity_type === 'ENVIRONMENT');
+    const styleLock = locks.find(l => l.entity_type === 'STYLE');
+
+    if (!characterLock) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        'this shot has no CHARACTER lock attached -- attach one before composing a first frame'));
+    }
+    if (!environmentLock) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        'this shot has no ENVIRONMENT lock attached -- attach one before composing a first frame'));
+    }
+    if (!characterLock.approved_at) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        'the CHARACTER lock on this shot is not approved yet -- approve it before composing a first frame'));
+    }
+    if (!environmentLock.approved_at) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        'the ENVIRONMENT lock on this shot is not approved yet -- approve it before composing a first frame'));
+    }
+    if (!characterLock.reference_asset_ids?.length) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        'the CHARACTER lock has no reference image yet -- generate one via POST /studio/locks/:lockId/reference first'));
+    }
+    if (!environmentLock.reference_asset_ids?.length) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        'the ENVIRONMENT lock has no reference image yet -- generate one via POST /studio/locks/:lockId/reference first'));
+    }
+
+    const estimatedCost = ESTIMATED_COST_USD.GEMINI_COMPOSE_IMAGE;
+    let budget;
+    try {
+      budget = await checkAndSpendBudget(project, estimatedCost, req.actor, req.body?.override_budget === true);
+    } catch (e) {
+      if (!(e instanceof BudgetExceededError)) throw e;
+      return reply.code(422).send(err(422, 'BUDGET_EXCEEDED', e.message));
+    }
+
+    // reference_asset_ids is appended-to (array_append), so the LAST entry
+    // is the most recently generated -- and presumably best -- reference.
+    const characterRefId = characterLock.reference_asset_ids[characterLock.reference_asset_ids.length - 1];
+    const environmentRefId = environmentLock.reference_asset_ids[environmentLock.reference_asset_ids.length - 1];
+    const [characterRef, environmentRef] = await Promise.all([
+      one(`SELECT storage_key FROM studio.assets WHERE id=$1`, [characterRefId]),
+      one(`SELECT storage_key FROM studio.assets WHERE id=$1`, [environmentRefId]),
+    ]);
+
+    const assetId = crypto.randomUUID();
+    const prompt = compileComposePrompt(characterLock, environmentLock, styleLock);
+    const gen = await gemini.generateImage({ prompt, assetId,
+      referenceImageKeys: [characterRef.storage_key, environmentRef.storage_key] });
+    const asset = await one(
+      `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings)
+       VALUES ($1,$2,$3,'KEYFRAME','GENERATED',$4,$5,$6,$7) RETURNING *`,
+      [assetId, project.id, shot.id, gen.storage_key,
+       JSON.stringify({ provider: 'GEMINI', model: 'gemini-2.5-flash-image',
+         composed_from: { character_lock_id: characterLock.id, environment_lock_id: environmentLock.id } }),
+       code('JOB'), JSON.stringify({ prompt })]);
+
+    // Point the shot's generation block at the new first frame, preserving
+    // every other existing key already in shot.generation -- same
+    // field-merge discipline as PATCH /studio/shots/:shotId, applied
+    // directly here since that route also re-flips status to DRAFT, which
+    // this step should not do.
+    await q(`UPDATE studio.shots SET generation = generation || $2::jsonb, updated_at=now() WHERE id=$1`,
+      [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: 'image_to_video' })]);
+
+    await spendBudget(project.id, resolveSpendAmount(gen, estimatedCost));
+
+    return { asset, character_lock: { id: characterLock.id, entity_code: characterLock.entity_code },
+      environment_lock: { id: environmentLock.id, entity_code: environmentLock.entity_code },
+      ...(budget.warning ? { budget_warning: budget.warning } : {}) };
   });
 
   // Generate a candidate for a shot: compile the prompt, run it through the

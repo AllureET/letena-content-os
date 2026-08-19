@@ -1687,6 +1687,47 @@ const screens = {
     const acceptedMark = (s) => s.accepted_asset_id
       ? '<span style="color:var(--risk-routine);font-weight:600">&check; accepted</span>'
       : '<span class="muted">&mdash;</span>';
+
+    // Step-by-step first frame (19 Aug 2026): Letena's real Instagram
+    // doctor-presenter content is the same doctor (CHARACTER lock) across
+    // different backdrops (ENVIRONMENT lock) -- so before the single
+    // opaque "Generate" call, a shot can compose its first frame from
+    // those two locks explicitly. This block sits ABOVE Generate and never
+    // replaces it: a text_to_video shot with no locks attached renders
+    // "not attached" for both steps and Generate below still works exactly
+    // as before.
+    const lockById = new Map(locks.map(l => [l.id, l]));
+    const lockReady = (l) => !!(l && l.approved_at && (l.reference_asset_ids ?? []).length);
+    const stepLine = (num, label, lock) => {
+      if (!lock) return `<div style="font-size:11px;margin-top:2px">Step ${num} &middot; ${esc(label)}: <span class="muted">not attached</span> &mdash; <button type="button" data-stscrolltolocks="1" style="font-size:11px;padding:2px 8px">Attach or create one</button></div>`;
+      const approved = lock.approved_at
+        ? '<span style="color:var(--risk-routine)">approved</span>'
+        : '<span style="color:var(--risk-mod)">not approved</span>';
+      const hasRef = (lock.reference_asset_ids ?? []).length
+        ? '<span style="color:var(--risk-routine)">has reference image</span>'
+        : '<span style="color:var(--risk-mod)">no reference image yet</span>';
+      return `<div style="font-size:11px;margin-top:2px">Step ${num} &middot; ${esc(label)}: <span class="mono">${esc(lock.entity_code)}</span> &middot; ${approved} &middot; ${hasRef}</div>`;
+    };
+    const composeStepHtml = (s) => {
+      if (!can('studio.generate')) return '';
+      const attached = (s.locked_lock_ids ?? []).map(lid => lockById.get(lid)).filter(Boolean);
+      const charLock = attached.find(l => l.entity_type === 'CHARACTER');
+      const envLock = attached.find(l => l.entity_type === 'ENVIRONMENT');
+      const ready = lockReady(charLock) && lockReady(envLock);
+      const alreadySet = s.generation?.first_frame_asset_id && s.generation?.mode_preference === 'image_to_video';
+      return `<div class="claimrow" style="margin-bottom:8px">
+        <div style="font-size:11px;font-weight:600;margin-bottom:2px">Step-by-step first frame (optional)</div>
+        ${stepLine(1, 'Character', charLock)}
+        ${stepLine(2, 'Background', envLock)}
+        <button style="margin-top:6px" ${ready ? '' : 'disabled'} title="${ready
+          ? 'Compose the locked character into the locked background as this shot&#39;s first frame'
+          : 'Attach an approved CHARACTER lock and an approved ENVIRONMENT lock, each with a reference image, before composing'}"
+          data-stshotcompose="${esc(s.id)}">Step 3 &middot; Compose first frame</button>
+        ${alreadySet ? `<div class="muted" style="font-size:11px;margin-top:4px">&check; first frame set -- Generate below will run image_to_video using it.</div>` : ''}
+        <div id="stcomposebox-${esc(s.id)}"></div>
+      </div>`;
+    };
+
     const shotsHtml = shots.length ? `<div class="card"><table>
       <tr><th>Shot</th><th>Beat</th><th>Status</th><th>Duration (s)</th><th>Asset</th><th></th></tr>
       ${shots.map(s => {
@@ -1699,6 +1740,7 @@ const screens = {
           <td class="mono">${esc(String(s.duration_target_s ?? ''))}</td>
           <td>${acceptedMark(s)}</td>
           <td style="min-width:220px">
+            ${composeStepHtml(s)}
             <div class="flex" style="flex-wrap:wrap">
               ${can('studio.generate') ? `<button data-stshotgenerate="${esc(s.id)}">Generate</button>` : ''}
               ${can('studio.generate') ? `<button data-stshotvoiceshow="${esc(s.id)}">Add voice</button>` : ''}
@@ -1823,7 +1865,7 @@ const screens = {
       ${p.archived_at ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">This project is archived and hidden from the Video Studio list. Nothing about its locks, shots, or generated assets was deleted -- unarchive to bring it back into view.</div>` : ''}
       ${budgetHtml}
       ${importBriefHtml}
-      <div class="eyebrow" style="margin-top:20px">Locks</div>
+      <div class="eyebrow" style="margin-top:20px" id="st-locks-anchor">Locks</div>
       ${locksHtml}
       ${newLockHtml}
       <div class="eyebrow" style="margin-top:20px">Shots</div>
@@ -3316,7 +3358,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3411,6 +3453,31 @@ document.addEventListener('click', async (e) => {
         story: { beat: elv(`stedit-beat-${id}`) ?? '' },
       });
       toast('Shot updated'); return render();
+    }
+    if (b.dataset.stscrolltolocks) {
+      document.getElementById('st-locks-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
+    if (b.dataset.stshotcompose) {
+      const id = b.dataset.stshotcompose;
+      const box = document.getElementById(`stcomposebox-${id}`);
+      b.disabled = true; b.textContent = 'Composing…';
+      try {
+        const r = await api('POST', `/studio/shots/${id}/compose-first-frame`, {});
+        if (box) {
+          box.innerHTML = `<div class="claimrow" style="margin-top:8px">
+            <div style="font-size:12px"><b>&check; First frame composed</b> from
+              ${esc(r.character_lock?.entity_code ?? '')} + ${esc(r.environment_lock?.entity_code ?? '')}.
+              This shot is now set to image_to_video mode using this frame -- click Generate below to render the video from it.</div>
+            <img class="ath" style="margin-top:6px;max-width:200px" src="${esc(mediaUrl(r.asset?.storage_key))}"
+              alt="composed first frame" loading="lazy" onerror="assetImgError(this,'KEYFRAME')">
+          </div>`;
+        }
+        toast('First frame composed. This shot now uses image_to_video mode.');
+      } finally {
+        b.disabled = false; b.textContent = 'Step 3 · Compose first frame';
+      }
+      return;
     }
     if (b.dataset.stshotgenerate) {
       const id = b.dataset.stshotgenerate;

@@ -53,6 +53,8 @@ import { join } from 'node:path';
 import { q, one, audit, requirePerm, err } from '../core.mjs';
 import { storage, videoEngine, gemini, suno, azureSpeech } from '../adapters/index.mjs';
 import { invokeAgent } from '../ai/gateway.mjs';
+import { OVERLAY_KINDS, validateOverlayData, describeOverlayCollision, buildOverlayFilterGraph,
+  compileOverlayLayerSvg, resolveCanvasSizeForAspect, loadEthiopicFontsBase64 } from './studio_overlays.mjs';
 
 const execFileP = promisify(execFile);
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -643,6 +645,154 @@ export default async function routes(app) {
   });
 
   // -------------------------------------------------------------------
+  // Brief import (19 Aug 2026): the real gap "Spotting on the Pill" (a
+  // 25s Send-It format brief) exposed -- Nate had to retype an entire
+  // structured brief by hand into a lock, one shot, and several overlays,
+  // one field at a time. POST /import-brief turns a free-text brief into
+  // a structured DRAFT via the studio_brief_importer agent (gateway.mjs);
+  // exactly like /studio/locks/draft above, this SAVES NOTHING -- the
+  // human reviews the draft, then either edits it and calls .../apply, or
+  // makes their own manual create-shot/create-overlay calls same as
+  // before this endpoint existed.
+  //
+  // THE ONE-SHOT RULE: a Send-It brief like this is ONE continuous
+  // presenter take -- a single person talking to camera for the whole
+  // runtime -- with several SCRIPT/OVERLAY timing beats (a hook, a share
+  // moment, a caveat, a door card, and so on) layered on top of that one
+  // take, not six separate camera setups. The draft always contains
+  // exactly one presenter_shot, however many timed beats the brief
+  // names; see the studio_brief_importer prompt (0036 migration) for the
+  // same rule spelled out for a real model.
+  // -------------------------------------------------------------------
+  app.post('/studio/projects/:id/import-brief', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const p = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+    const freeText = req.body?.free_text;
+    if (!freeText || !String(freeText).trim()) {
+      return reply.code(422).send(err(422, 'VALIDATION', 'free_text is required'));
+    }
+    const out = await invokeAgent('studio_brief_importer',
+      { free_text: freeText, project_aspect_ratio: p.aspect_ratio, project_language: p.language },
+      { objectType: 'STUDIO_BRIEF_IMPORT', objectId: p.id, workflowCode: 'studio' });
+    return out;
+  });
+
+  // Applies a (possibly human-edited) draft from the endpoint above: this
+  // is the one place in the whole Video Studio vertical where reviewed,
+  // structured data becomes real rows in a single call -- a human still
+  // had to look at and submit the draft object (nothing here is
+  // triggered automatically off the free-text call above), this just
+  // collapses the mechanical "now type each field back into five
+  // separate forms" step the brief's format made painfully obvious.
+  // Creates the one presenter shot, creates every overlay that has
+  // valid, complete data, and updates whichever project fields are still
+  // unset (title/format/aspect_ratio/language are all NOT NULL with a
+  // factory default on this table today, so in practice this only ever
+  // fires for a future nullable project field -- documented rather than
+  // silently dead code, so a later migration that adds one gets this for
+  // free without another engineer having to rediscover the pattern).
+  // Overlays this cannot safely create -- an ICON with no asset_id
+  // (drafted that way on purpose, see studio_brief_importer's own rule:
+  // it never invents an asset id), or any row that fails
+  // validateOverlayData, or one whose entity_code lock does not
+  // resolve -- are SKIPPED and reported by kind/timing/reason, never
+  // silently dropped and never allowed to create a broken row that
+  // points at nothing.
+  app.post('/studio/projects/:id/import-brief/apply', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const p = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+    const draft = req.body ?? {};
+    if (!draft.presenter_shot || typeof draft.presenter_shot !== 'object') {
+      return reply.code(422).send(err(422, 'VALIDATION', 'draft.presenter_shot is required'));
+    }
+
+    const projField = { title: 'title', format: 'format', aspect_ratio: 'aspect_ratio', language: 'language' };
+    const projectUpdates = {};
+    for (const [draftKey, col] of Object.entries(projField)) {
+      const val = draft.project?.[draftKey];
+      if (val != null && String(val).trim() !== '' && p[col] == null) projectUpdates[col] = val;
+    }
+    if (Object.keys(projectUpdates).length) {
+      const sets = Object.keys(projectUpdates).map((c, i) => `${c}=$${i + 2}`);
+      await q(`UPDATE studio.projects SET ${sets.join(', ')}, updated_at=now() WHERE id=$1`,
+        [p.id, ...Object.values(projectUpdates)]);
+    }
+
+    // The one presenter shot. Mirrors POST /studio/projects/:id/shots'
+    // own field reads exactly (story/continuity/camera/action/audio/
+    // generation), so a shot created here behaves identically to one a
+    // human typed into that form by hand.
+    const ps = draft.presenter_shot;
+    const shotCode = (ps.shot_code && String(ps.shot_code).trim()) || code('SH');
+    const continuity = ps.continuity ?? {};
+    const entityCodes = [...(continuity.characters ?? []), continuity.environment, ...(continuity.props ?? [])].filter(Boolean);
+    const lockRows = entityCodes.length
+      ? (await q(`SELECT id FROM studio.locks WHERE project_id=$1 AND entity_code = ANY($2) AND is_active`,
+          [p.id, entityCodes])).rows
+      : [];
+    const existingCount = (await one(`SELECT count(*)::int AS n FROM studio.shots WHERE project_id=$1`, [p.id])).n;
+    const shot = await one(
+      `INSERT INTO studio.shots (project_id, shot_code, order_index, duration_target_s, story, continuity,
+         camera, action, audio, graphics, generation, acceptance, locked_lock_ids)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [p.id, shotCode, existingCount, ps.duration_target_s ?? 25,
+       JSON.stringify(ps.story ?? {}), JSON.stringify(continuity), JSON.stringify(ps.camera ?? {}),
+       JSON.stringify(ps.action ?? {}), JSON.stringify(ps.audio ?? {}), JSON.stringify({}),
+       JSON.stringify(ps.generation ?? {}), JSON.stringify({}), lockRows.map(l => l.id)]);
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [p.id, req.actor?.id ?? null, `shots/${shot.shot_code}`, `created presenter shot ${shot.shot_code} from an imported brief`]);
+
+    // Overlays: skip -- never crash, never guess -- anything that cannot
+    // validate as a real, complete overlay row. Runs the exact same
+    // validateOverlayData/describeOverlayCollision/asset-kind checks
+    // POST /studio/projects/:id/overlays itself uses, so an overlay that
+    // gets created here is held to the identical bar as one a human
+    // typed in by hand.
+    const createdOverlays = [];
+    const skippedOverlays = [];
+    const collisionPool = (await q(`SELECT id, kind, start_s, end_s, data FROM studio.overlays WHERE project_id=$1`, [p.id])).rows;
+    for (const ov of (draft.overlays ?? [])) {
+      const reasons = [];
+      if (!OVERLAY_KINDS.includes(ov?.kind)) reasons.push(`kind must be one of ${OVERLAY_KINDS.join(', ')}`);
+      if (typeof ov?.start_s !== 'number' || typeof ov?.end_s !== 'number' || !(ov.end_s > ov.start_s)) {
+        reasons.push('start_s and end_s are required numbers, and end_s must be greater than start_s');
+      }
+      if (!reasons.length) reasons.push(...validateOverlayData(ov.kind, ov.data));
+      if (!reasons.length && ov.kind === 'ICON') {
+        const iconAsset = ov.data?.asset_id ? await one(`SELECT id, kind FROM lcos.assets WHERE id=$1`, [ov.data.asset_id]) : null;
+        if (!iconAsset) reasons.push(`data.asset_id ${ov.data?.asset_id ?? '(none)'} does not resolve to an existing asset -- upload the icon image to the asset library first, then set asset_id and create this overlay directly`);
+        else if (iconAsset.kind !== 'ICON') reasons.push(`data.asset_id ${ov.data.asset_id} resolves to a ${iconAsset.kind} asset, not ICON`);
+      }
+      if (!reasons.length) {
+        const collision = describeOverlayCollision([...collisionPool, ...createdOverlays], ov.kind, ov.data, ov.start_s, ov.end_s);
+        if (collision) reasons.push(collision);
+      }
+      if (reasons.length) {
+        skippedOverlays.push({ kind: ov?.kind ?? null, start_s: ov?.start_s ?? null, end_s: ov?.end_s ?? null,
+          reason: reasons.join('; ') });
+        continue;
+      }
+      const saved = await one(
+        `INSERT INTO studio.overlays (project_id, kind, start_s, end_s, order_index, data, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+        [p.id, ov.kind, ov.start_s, ov.end_s, ov.order_index ?? 0, JSON.stringify(ov.data ?? {}), req.actor?.id ?? null]);
+      createdOverlays.push(saved);
+    }
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [p.id, req.actor?.id ?? null, `shots/${shot.shot_code}`,
+       `applied brief import: ${createdOverlays.length} overlay(s) created` +
+       (skippedOverlays.length ? `, ${skippedOverlays.length} overlay(s) skipped (see response)` : '')]);
+
+    // caption_draft is passed straight through, never saved: nothing in
+    // Video Studio currently stores caption/publishing text (see
+    // studio_brief_importer's own prompt on why) -- it is the one part
+    // of this draft a human still has to place manually, same as before
+    // this endpoint existed.
+    return { project_updates: projectUpdates, shot, overlays_created: createdOverlays,
+      overlays_skipped: skippedOverlays, caption_draft: draft.caption_draft ?? null };
+  });
+
+  // -------------------------------------------------------------------
   // Locks (playbook section 10)
   // -------------------------------------------------------------------
   app.get('/studio/projects/:id/locks', { preHandler: requirePerm('studio.read') }, async (req) => {
@@ -1036,6 +1186,102 @@ export default async function routes(app) {
   });
 
   // -------------------------------------------------------------------
+  // Overlays (0035_studio_overlays.sql, 19 Aug 2026): burned-in title
+  // cards, on-screen labels, the closing door/CTA card, and icon moments
+  // -- the real gap the "Spotting on the Pill" brief exposed, since
+  // assemble() below had zero capability to burn anything in before
+  // tonight. Reviewable structured data, same continuity-lock philosophy
+  // as studio.locks: apps/api/src/modules/studio_overlays.mjs compiles the
+  // actual SVG/ffmpeg burn-in deterministically from these APPROVED rows
+  // inside assemble()'s final pass, never generated fresh at render time.
+  // -------------------------------------------------------------------
+  app.get('/studio/projects/:id/overlays', { preHandler: requirePerm('studio.read') }, async (req) => {
+    const r = await q(`SELECT * FROM studio.overlays WHERE project_id=$1 ORDER BY start_s, order_index`, [req.params.id]);
+    return { items: r.rows };
+  });
+
+  app.post('/studio/projects/:id/overlays', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const p = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+    const b = req.body ?? {};
+    if (!OVERLAY_KINDS.includes(b.kind)) {
+      return reply.code(422).send(err(422, 'VALIDATION', `kind must be one of ${OVERLAY_KINDS.join(', ')}`));
+    }
+    if (typeof b.start_s !== 'number' || typeof b.end_s !== 'number' || !(b.end_s > b.start_s)) {
+      return reply.code(422).send(err(422, 'VALIDATION', 'start_s and end_s are required numbers, and end_s must be greater than start_s'));
+    }
+    const dataErrors = validateOverlayData(b.kind, b.data);
+    if (dataErrors.length) return reply.code(422).send(err(422, 'VALIDATION', dataErrors.join('; ')));
+    if (b.kind === 'ICON') {
+      const iconAsset = await one(`SELECT id, kind FROM lcos.assets WHERE id=$1`, [b.data.asset_id]);
+      if (!iconAsset) return reply.code(422).send(err(422, 'VALIDATION', `data.asset_id ${b.data.asset_id} does not resolve to an existing asset`));
+      if (iconAsset.kind !== 'ICON') return reply.code(422).send(err(422, 'VALIDATION', `data.asset_id ${b.data.asset_id} resolves to a ${iconAsset.kind} asset, not ICON`));
+    }
+    const existing = (await q(`SELECT id, kind, start_s, end_s, data FROM studio.overlays WHERE project_id=$1`, [p.id])).rows;
+    const collision = describeOverlayCollision(existing, b.kind, b.data, b.start_s, b.end_s);
+    if (collision) return reply.code(422).send(err(422, 'GUARD_FAILED', collision));
+    const overlay = await one(
+      `INSERT INTO studio.overlays (project_id, kind, start_s, end_s, order_index, data, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [p.id, b.kind, b.start_s, b.end_s, b.order_index ?? 0, JSON.stringify(b.data ?? {}), req.actor?.id ?? null]);
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [p.id, req.actor?.id ?? null, `overlays/${overlay.id}`, `created ${b.kind} overlay (${b.start_s}s-${b.end_s}s)`]);
+    return overlay;
+  });
+
+  // Editing an overlay un-approves it, mirroring how a lock revision
+  // deactivates the prior approved version (10.8) rather than letting a
+  // change to reviewed content quietly keep its old approval.
+  app.patch('/studio/overlays/:overlayId', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const overlay = await one(`SELECT * FROM studio.overlays WHERE id=$1`, [req.params.overlayId]);
+    if (!overlay) return reply.code(404).send(err(404, 'NOT_FOUND', 'overlay not found'));
+    const b = req.body ?? {};
+    const kind = b.kind ?? overlay.kind;
+    if (b.kind != null && !OVERLAY_KINDS.includes(b.kind)) {
+      return reply.code(422).send(err(422, 'VALIDATION', `kind must be one of ${OVERLAY_KINDS.join(', ')}`));
+    }
+    const startS = b.start_s ?? overlay.start_s;
+    const endS = b.end_s ?? overlay.end_s;
+    if (!(Number(endS) > Number(startS))) {
+      return reply.code(422).send(err(422, 'VALIDATION', 'end_s must be greater than start_s'));
+    }
+    const data = b.data ?? overlay.data;
+    const dataErrors = validateOverlayData(kind, data);
+    if (dataErrors.length) return reply.code(422).send(err(422, 'VALIDATION', dataErrors.join('; ')));
+    if (kind === 'ICON' && b.data) {
+      const iconAsset = await one(`SELECT id, kind FROM lcos.assets WHERE id=$1`, [data.asset_id]);
+      if (!iconAsset) return reply.code(422).send(err(422, 'VALIDATION', `data.asset_id ${data.asset_id} does not resolve to an existing asset`));
+      if (iconAsset.kind !== 'ICON') return reply.code(422).send(err(422, 'VALIDATION', `data.asset_id ${data.asset_id} resolves to a ${iconAsset.kind} asset, not ICON`));
+    }
+    const updated = await one(
+      `UPDATE studio.overlays SET kind=$2, start_s=$3, end_s=$4, order_index=$5, data=$6,
+         approved_at=NULL, approved_by=NULL, updated_at=now()
+       WHERE id=$1 RETURNING *`,
+      [overlay.id, kind, startS, endS, b.order_index ?? overlay.order_index, JSON.stringify(data)]);
+    return updated;
+  });
+
+  app.post('/studio/overlays/:overlayId/approve', { preHandler: requirePerm('studio.approve') }, async (req, reply) => {
+    const overlay = await one(`SELECT * FROM studio.overlays WHERE id=$1`, [req.params.overlayId]);
+    if (!overlay) return reply.code(404).send(err(404, 'NOT_FOUND', 'overlay not found'));
+    const updated = await one(`UPDATE studio.overlays SET approved_at=now(), approved_by=$2 WHERE id=$1 RETURNING *`,
+      [overlay.id, req.actor?.id ?? null]);
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [overlay.project_id, req.actor?.id ?? null, `overlays/${overlay.id}`, `approved ${overlay.kind} overlay`]);
+    return updated;
+  });
+
+  // Straightforward hard delete, unlike projects: an overlay has no
+  // generated media or audit-history weight of its own -- deleting one
+  // just removes a burn-in instruction, nothing is orphaned.
+  app.delete('/studio/overlays/:overlayId', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const overlay = await one(`SELECT * FROM studio.overlays WHERE id=$1`, [req.params.overlayId]);
+    if (!overlay) return reply.code(404).send(err(404, 'NOT_FOUND', 'overlay not found'));
+    await q(`DELETE FROM studio.overlays WHERE id=$1`, [overlay.id]);
+    return { ok: true };
+  });
+
+  // -------------------------------------------------------------------
   // Assembly (playbook 18.2, phase 1 subset): concatenate every shot's
   // ACCEPTED asset, in order_index order, into one file, either as a hard
   // cut (default, ffmpeg concat/-c copy, no re-encode) or -- 18 Aug 2026,
@@ -1088,9 +1334,27 @@ export default async function routes(app) {
     const assets = await Promise.all(shots.map(s =>
       one(`SELECT * FROM studio.assets WHERE id=$1`, [s.accepted_asset_id])));
 
+    // Overlays (0035_studio_overlays.sql, 19 Aug 2026): refuse assembly
+    // outright when any overlay on this project is not yet approved,
+    // rather than silently burning in only the approved ones. An overlay
+    // a producer added but has not reviewed should never quietly end up
+    // in a cut nobody signed off on -- same "the system tells you exactly
+    // why, never silently does something you didn't ask for" ethos as the
+    // missing-accepted-asset guard just above. A project with zero
+    // overlays hits neither branch and assembles exactly as it did before
+    // tonight.
+    const allOverlays = (await q(`SELECT * FROM studio.overlays WHERE project_id=$1 ORDER BY start_s, order_index`, [p.id])).rows;
+    const unapprovedOverlays = allOverlays.filter(o => !o.approved_at);
+    if (unapprovedOverlays.length) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `every overlay needs to be approved before assembly; unapproved: ${unapprovedOverlays.map(o => `${o.kind} ${o.id} (${o.start_s}s-${o.end_s}s)`).join(', ')}`));
+    }
+    const approvedOverlays = allOverlays;
+
     const settingsBase = { shot_count: shots.length, transition,
       ...(transition === 'crossfade' ? { transition_duration_s: transitionDurationS } : {}),
-      ...(musicAsset ? { music_asset_id: musicAsset.id } : {}) };
+      ...(musicAsset ? { music_asset_id: musicAsset.id } : {}),
+      ...(approvedOverlays.length ? { overlay_count: approvedOverlays.length, overlay_ids: approvedOverlays.map(o => o.id) } : {}) };
     const generatorTool = transition === 'crossfade' ? 'ffmpeg-xfade' : 'ffmpeg-concat';
 
     if (MOCK()) {
@@ -1099,7 +1363,7 @@ export default async function routes(app) {
       // produce a real crossfaded or music-mixed file -- it only records
       // the options that were requested, the same honesty pattern
       // technicalQc/continuityQc's MOCK branches already use above.
-      const optionsNote = `transition=${transition}${transition === 'crossfade' ? `(${transitionDurationS}s)` : ''} music=${musicAsset ? musicAsset.id : 'none'}`;
+      const optionsNote = `transition=${transition}${transition === 'crossfade' ? `(${transitionDurationS}s)` : ''} music=${musicAsset ? musicAsset.id : 'none'} overlays=${approvedOverlays.length}`;
       const finalKey = `studio/${p.code}/final/assembled.mp4`;
       await storage.put(finalKey, Buffer.from(
         `MOCK-ASSEMBLE ${p.code} shots=${shots.map(s => s.shot_code).join(',')} ${optionsNote}`));
@@ -1202,6 +1466,49 @@ export default async function routes(app) {
       finalLocalPath = await mixMusicOntoVideo({ workDir, videoPath: outPath, musicAsset, hasVoice });
     }
 
+    if (approvedOverlays.length) {
+      // Overlay burn-in: a THIRD pass, deliberately last (after crossfade/
+      // concat and music mixing), so overlays always composite onto the
+      // fully-assembled cut rather than a partial one, and so a project
+      // with zero overlays never touches this code path at all -- the
+      // no-overlay invocations above stay exactly what they were before
+      // tonight's overlay work, same discipline the music pass already
+      // established for itself.
+      const probeForOverlay = await probeClip(finalLocalPath);
+      const canvasSize = (probeForOverlay.width && probeForOverlay.height)
+        ? { width: probeForOverlay.width, height: probeForOverlay.height }
+        : resolveCanvasSizeForAspect(p.aspect_ratio);
+      const fonts = await loadEthiopicFontsBase64();
+      const graph = buildOverlayFilterGraph(approvedOverlays, probeForOverlay.durationS, canvasSize.width, canvasSize.height);
+      if (graph.layers.length) {
+        const overlayById = new Map(approvedOverlays.map(o => [o.id, o]));
+        const inputArgs = [];
+        for (let i = 0; i < graph.layers.length; i++) {
+          const layer = graph.layers[i];
+          const overlay = overlayById.get(layer.overlayId);
+          let iconBase64;
+          if (overlay.kind === 'ICON') {
+            const iconAsset = await one(`SELECT storage_key FROM lcos.assets WHERE id=$1`, [overlay.data?.asset_id]);
+            if (iconAsset) iconBase64 = (await readFile(storage.localPath(iconAsset.storage_key))).toString('base64');
+          }
+          const svg = compileOverlayLayerSvg(layer, overlay, canvasSize.width, canvasSize.height, fonts.bold, fonts.regular, iconBase64);
+          const svgPath = join(workDir, `overlay-${i}.svg`);
+          await writeFile(svgPath, svg, 'utf8');
+          inputArgs.push('-itsoffset', layer.startS.toFixed(3), '-loop', '1',
+            '-t', Math.max(0.04, layer.endS - layer.startS).toFixed(3), '-i', svgPath);
+        }
+        const overlaidPath = join(workDir, 'assembled-with-overlays.mp4');
+        try {
+          await execFileP('ffmpeg', ['-y', '-i', finalLocalPath, ...inputArgs,
+            '-filter_complex', graph.filterComplex, '-map', graph.outputLabel, '-map', '0:a?',
+            '-c:v', 'libx264', '-c:a', 'copy', overlaidPath]);
+        } catch (e) {
+          return reply.code(502).send(err(502, 'ASSEMBLY_FAILED', `ffmpeg overlay burn-in failed: ${e.message}`));
+        }
+        finalLocalPath = overlaidPath;
+      }
+    }
+
     const finalKey = `studio/${p.code}/final/assembled.mp4`;
     await storage.put(finalKey, await readFile(finalLocalPath));
     const finalAsset = await one(
@@ -1212,7 +1519,7 @@ export default async function routes(app) {
       [p.id, finalAsset.id]);
     await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
       [p.id, req.actor?.id ?? null, finalAsset.id,
-       `assembled ${shots.length} shots into final cut (transition=${transition}${musicAsset ? `, music=${musicAsset.id}` : ''})`]);
+       `assembled ${shots.length} shots into final cut (transition=${transition}${musicAsset ? `, music=${musicAsset.id}` : ''}${approvedOverlays.length ? `, overlays=${approvedOverlays.length}` : ''})`]);
     return finalAsset;
   });
 }

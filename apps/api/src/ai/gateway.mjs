@@ -295,6 +295,95 @@ const S = {
     }),
     clarifying_note: z.string().nullable().optional(),
   }),
+  // Video Studio (19 Aug 2026): turns a free-text production brief -- the
+  // real trigger being "Spotting on the Pill", a 25s Send-It format clip --
+  // into a structured DRAFT that can seed one presenter shot, its overlays,
+  // and a caption, without saving anything (same intake-assist pattern as
+  // studio_lock_drafter just above: a human reviews and edits this before
+  // POST /studio/projects/:id/import-brief/apply ever writes a row).
+  //
+  // THE ONE-SHOT RULE, load-bearing: a Send-It brief like this is a SINGLE
+  // continuous presenter take -- one person talking to camera for the
+  // WHOLE runtime -- with several timed script/overlay beats (a hook, a
+  // share moment, a caveat, a door card, and so on) layered on top of that
+  // one take, not six separate camera setups. presenter_shot is therefore
+  // always exactly ONE object, spanning the brief's full duration, never
+  // an array. The timed beats belong in the SCRIPT (folded into one
+  // continuous audio.dialogue and action.temporal_beats) or in `overlays`
+  // (burned-in graphics with their own start_s/end_s) -- never split into
+  // multiple shots. Splitting a one-take format into per-beat shots would
+  // misrepresent what the footage actually is.
+  //
+  // Extract only what free_text actually states; never invent a specific
+  // hex color, font size, timing, or icon asset the text does not give.
+  // A field the brief does not specify stays null -- do not guess a
+  // plausible-looking default. Where the brief names something Video
+  // Studio's overlay system cannot currently represent (an anchor
+  // position outside top/upper-third/top-right/right-center/center, for
+  // instance), say so in that overlay's own `note` rather than forcing it
+  // into the nearest supported value. Icon overlays are the clearest case
+  // of this rule: this system has no icon-asset-from-a-URL capability, so
+  // an icon mentioned in a brief ALWAYS gets asset_id: null plus a note
+  // that a producer must upload the icon image to the asset library and
+  // fill in the real asset_id before that overlay can be approved --
+  // never invent a plausible-looking asset id. caption_draft carries
+  // platform caption/hashtag text verbatim from the brief when present,
+  // for a human to place manually; it is not written to any shot or
+  // overlay field, because nothing in Video Studio currently stores
+  // caption text. clarifying_note is the overall honesty flag, same
+  // spirit as studio_lock_drafter's: say plainly what the brief did not
+  // make clear rather than filling every field to look complete.
+  studio_brief_importer: z.object({
+    project: z.object({
+      title: z.string().nullable().optional(),
+      format: z.string().nullable().optional(),
+      aspect_ratio: z.string().nullable().optional(),
+      language: z.string().nullable().optional(),
+    }).optional().default({}),
+    presenter_shot: z.object({
+      shot_code: z.string().nullable().optional(),
+      duration_target_s: z.number().nullable().optional(),
+      story: z.object({
+        beat: z.string().nullable().optional(),
+        narration: z.string().nullable().optional(),
+      }).optional().default({}),
+      continuity: z.object({
+        characters: z.array(z.string()).optional().default([]),
+        environment: z.string().nullable().optional(),
+        props: z.array(z.string()).optional().default([]),
+      }).optional().default({}),
+      camera: z.object({
+        movement: z.string().nullable().optional(),
+        movement_intensity: z.string().nullable().optional(),
+        framing_notes: z.string().nullable().optional(),
+      }).optional().default({}),
+      action: z.object({
+        subject: z.string().nullable().optional(),
+        environment: z.string().nullable().optional(),
+        temporal_beats: z.array(z.string()).optional().default([]),
+        performance: z.string().nullable().optional(),
+      }).optional().default({}),
+      audio: z.object({
+        dialogue: z.string().nullable().optional(),
+        dialogue_en_gloss: z.string().nullable().optional(),
+      }).optional().default({}),
+      generation: z.object({
+        mode_preference: z.string().nullable().optional(),
+        first_frame_asset_id: z.string().nullable().optional(),
+      }).optional().default({}),
+      note: z.string().nullable().optional(),
+    }),
+    overlays: z.array(z.object({
+      kind: z.enum(['TITLE_CARD', 'LABEL', 'DOOR_CARD', 'ICON']),
+      start_s: z.number(),
+      end_s: z.number(),
+      order_index: z.number().int().optional().default(0),
+      data: z.record(z.any()),
+      note: z.string().nullable().optional(),
+    })).optional().default([]),
+    caption_draft: z.string().nullable().optional(),
+    clarifying_note: z.string().nullable().optional(),
+  }),
 };
 S.content_recommender = S.editorial_analyst;
 export const agentSchemas = S;

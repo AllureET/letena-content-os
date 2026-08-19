@@ -408,6 +408,283 @@ export class MockAIProvider extends BaseProvider {
     return { fields, clarifying_note: filled ? null :
       'MOCK mode: free_text did not match anything the mock drafter recognizes; a real model call would do better than this keyword stand-in.' };
   }
+
+  // Deterministic stand-in for studio_brief_importer (19 Aug 2026). Real
+  // language understanding is what a live model call is for; this is
+  // block/regex extraction tuned to the semi-structured brief shape Video
+  // Studio briefs are written in (named script beats with AM:/EN: text,
+  // `KIND (start-end): field | field | ...` overlay blocks, `- ICON: ...`
+  // lines, a CAPTION: block) -- good enough to prove the endpoint's
+  // validation/apply plumbing works offline, not a stand-in for how well a
+  // real model would read genuinely free-form prose. Same honesty rule as
+  // the real prompt: whatever this cannot confidently parse gets a `note`,
+  // never a guessed value.
+  agent_studio_brief_importer(ctx) {
+    return mockImportBrief(String(ctx.free_text ?? ''));
+  }
+}
+
+// ===========================================================================
+// studio_brief_importer MOCK parsing helpers. Pulled out of the class body
+// since these are pure functions with no `this`, easier to read and to unit
+// test in isolation this way. See agent_studio_brief_importer above for how
+// this is invoked, and 0036_studio_brief_importer.sql / the studio_brief_importer
+// system prompt for the same rules described in prose for a real model.
+// ===========================================================================
+
+// Mirrors studio_overlays.mjs's ANCHORS on purpose (not imported from there:
+// ai/ deliberately does not depend on modules/, matching this file's
+// existing layering). If that list ever changes, this mock's "brief names a
+// position we don't support" honesty check needs updating too.
+const MOCK_OVERLAY_ANCHORS = ['top', 'upper-third', 'top-right', 'right-center', 'center'];
+
+function mockParseTimeToSeconds(str) {
+  const m = String(str ?? '').match(/(\d+):(\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+// Extracts one labeled block of text: from `startMarker` up to (but not
+// including) the next blank line, or end of text. Every overlay/section
+// block in the brief format this mock understands is written as one
+// paragraph per element, so this is enough to isolate each one before
+// picking it apart with small, specific field regexes below -- far more
+// robust than one giant regex trying to match a whole block at once.
+function mockExtractBlock(text, startMarker) {
+  const idx = text.indexOf(startMarker);
+  if (idx === -1) return null;
+  const rest = text.slice(idx);
+  const end = rest.search(/\n\s*\n/);
+  return end === -1 ? rest.trim() : rest.slice(0, end).trim();
+}
+
+function mockParseTimeRange(block) {
+  const m = String(block ?? '').match(/\((\d+:\d+(?:\.\d+)?)\s*-\s*(\d+:\d+(?:\.\d+)?)\)/);
+  if (!m) return { startS: null, endS: null };
+  return { startS: mockParseTimeToSeconds(m[1]), endS: mockParseTimeToSeconds(m[2]) };
+}
+
+function mockParseQuotedText(block) {
+  const m = String(block ?? '').match(/text\s*"([^"]*)"/i);
+  return m ? m[1] : null;
+}
+
+// "70-80px" -> the midpoint (75); "64px" -> 64. A range is rounded to a
+// single number because font_size_px is one number in the overlay schema --
+// the mock picks the honest middle rather than guessing which end the brief
+// meant.
+function mockParseFontSizePx(block) {
+  const m = String(block ?? '').match(/(\d+)\s*(?:-\s*(\d+))?\s*px/i);
+  if (!m) return null;
+  return m[2] ? Math.round((Number(m[1]) + Number(m[2])) / 2) : Number(m[1]);
+}
+
+function mockParseFontFamily(block) {
+  if (/\bbold\b/i.test(block ?? '')) return 'bold';
+  if (/\bregular\b/i.test(block ?? '')) return 'regular';
+  return null;
+}
+
+function mockParseHexColor(block, label) {
+  const re = new RegExp(`${label}\\s+(#[0-9a-fA-F]{6}|white|black)`, 'i');
+  const m = String(block ?? '').match(re);
+  if (!m) return null;
+  if (/^white$/i.test(m[1])) return '#FFFFFF';
+  if (/^black$/i.test(m[1])) return '#000000';
+  return m[1].toUpperCase();
+}
+
+function mockParseBackgroundOpacity(block) {
+  const m = String(block ?? '').match(/background\s+#[0-9a-fA-F]{6}\s+(\d+)%/i);
+  return m ? Number(m[1]) / 100 : null;
+}
+
+// Returns { anchor, note }: anchor is null (never a guessed nearest match)
+// and note explains the mismatch when the brief names a position this
+// overlay system does not support -- the honesty rule the real prompt
+// describes, applied mechanically here.
+function mockParsePosition(block, kindLabel) {
+  const m = String(block ?? '').match(/position\s+([a-z-]+)/i);
+  if (!m) return { anchor: null, note: null };
+  const named = m[1].toLowerCase();
+  if (MOCK_OVERLAY_ANCHORS.includes(named)) return { anchor: named, note: null };
+  return { anchor: null,
+    note: `the brief places this ${kindLabel} at "${named}", which is not one of the positions Video Studio overlays support (${MOCK_OVERLAY_ANCHORS.join(', ')}); pick a supported anchor manually before approving this overlay.` };
+}
+
+function mockParseSlideIn(block) {
+  const m = String(block ?? '').match(/slide-in from (left|right)\s+([\d.]+)s/i);
+  if (!m) return null;
+  return { type: m[1] === 'left' ? 'slide-left' : 'slide-right', duration_s: Number(m[2]) };
+}
+
+function mockParseFadeOut(block) {
+  const m = String(block ?? '').match(/fade out\s+([\d.]+)s/i);
+  return m ? { type: 'fade', duration_s: Number(m[1]) } : null;
+}
+
+// Parses one TITLE_CARD or LABEL-shaped overlay block. `header` is the
+// literal marker the block starts with (e.g. "TITLE CARD", "SHARE LABEL").
+function mockParseCardOrLabel(text, header, kind, kindLabel) {
+  const block = mockExtractBlock(text, header);
+  if (!block) return null;
+  const { startS, endS } = mockParseTimeRange(block);
+  const { anchor, note: posNote } = mockParsePosition(block, kindLabel);
+  const notes = [posNote].filter(Boolean);
+  const data = {
+    text: mockParseQuotedText(block),
+    font_family: mockParseFontFamily(block),
+    font_size_px: mockParseFontSizePx(block),
+    text_color: mockParseHexColor(block, 'text color'),
+    background_color: mockParseHexColor(block, 'background'),
+    background_opacity: mockParseBackgroundOpacity(block),
+    position: { anchor },
+    animation_in: mockParseSlideIn(block) ?? (block.includes('fade in') ? { type: 'fade' } : undefined),
+    animation_out: mockParseFadeOut(block),
+  };
+  if (!data.text) notes.push(`could not find quoted text for this ${kindLabel} in the brief; check the block manually.`);
+  return { kind, start_s: startS, end_s: endS, order_index: 0, data,
+    note: notes.length ? notes.join(' ') : null };
+}
+
+// Parses the DOOR_CARD block, including each staggered "LINE N:" fade-in.
+function mockParseDoorCard(text) {
+  const block = mockExtractBlock(text, 'DOOR CARD');
+  if (!block) return null;
+  const { startS, endS } = mockParseTimeRange(block);
+  const backgroundColor = mockParseHexColor(block, 'background');
+  const lineRe = /LINE\s*\d+:\s*"([^"]*)"\s*(\d+)px\s*(#[0-9a-fA-F]{6}|white|black)(?:\s*(\d+)%\s*opacity)?\s*fade in at\s*(\d+:\d+(?:\.\d+)?)/gi;
+  const lines = [];
+  const notes = [];
+  for (const m of block.matchAll(lineRe)) {
+    const fadeInS = mockParseTimeToSeconds(m[5]);
+    const color = /^white$/i.test(m[3]) ? '#FFFFFF' : /^black$/i.test(m[3]) ? '#000000' : m[3].toUpperCase();
+    lines.push({
+      text: m[1], font_size_px: Number(m[2]), text_color: color,
+      delay_s: (startS != null && fadeInS != null) ? Math.round((fadeInS - startS) * 100) / 100 : null,
+      ...(m[4] ? { opacity: Number(m[4]) / 100 } : {}),
+    });
+  }
+  if (!lines.length) notes.push('could not find any "LINE N:" entries in the DOOR CARD block; check it manually.');
+  return { kind: 'DOOR_CARD', start_s: startS, end_s: endS, order_index: 0,
+    data: { background_color: backgroundColor, lines }, note: notes.length ? notes.join(' ') : null };
+}
+
+// Parses the "ICONS:" block, one `- ICON: description | position X | time
+// S-E` line per icon. Every icon overlay always gets asset_id: null with a
+// note -- this mock, like a real model, has no way to create an actual icon
+// image asset from free text (see the studio_brief_importer system prompt's
+// own rule on this, same honesty standard applied mechanically here).
+function mockParseIcons(text) {
+  const block = mockExtractBlock(text, 'ICONS:');
+  if (!block) return [];
+  const lineRe = /-\s*ICON:\s*([^|]+?)\s*\|\s*position\s+([a-z-]+)\s*\|\s*time\s*(\d+:\d+(?:\.\d+)?)\s*-\s*(\d+:\d+(?:\.\d+)?)/gi;
+  const out = [];
+  for (const m of block.matchAll(lineRe)) {
+    const description = m[1].trim();
+    const named = m[2].toLowerCase();
+    const startS = mockParseTimeToSeconds(m[3]);
+    const endS = mockParseTimeToSeconds(m[4]);
+    const supportedAnchor = MOCK_OVERLAY_ANCHORS.includes(named) ? named : null;
+    const notes = [`icon asset not yet uploaded: this overlay describes "${description}" from the brief, but no icon image exists in the asset library for it yet. Upload the icon PNG (the brief says Flaticon) to the asset library, then set data.asset_id to the uploaded asset's id before this overlay can be approved.`];
+    if (!supportedAnchor) {
+      notes.push(`the brief places this icon at "${named}", which is not one of the positions Video Studio overlays support (${MOCK_OVERLAY_ANCHORS.join(', ')}); pick a supported anchor manually.`);
+    }
+    out.push({ kind: 'ICON', start_s: startS, end_s: endS, order_index: 0,
+      data: { asset_id: null, position: { anchor: supportedAnchor }, description },
+      note: notes.join(' ') });
+  }
+  return out;
+}
+
+function mockParseCaption(text) {
+  const block = mockExtractBlock(text, 'CAPTION:');
+  if (!block) return null;
+  const am = block.match(/AM:\s*"([^"]*)"/i)?.[1] ?? null;
+  const en = block.match(/EN:\s*"([^"]*)"/i)?.[1] ?? null;
+  const hashtags = block.match(/HASHTAGS:\s*(.+)/i)?.[1]?.trim() ?? null;
+  if (!am && !en && !hashtags) return null;
+  return [am ? `AM: ${am}` : null, en ? `EN: ${en}` : null, hashtags ? hashtags : null]
+    .filter(Boolean).join('\n');
+}
+
+function mockImportBrief(text) {
+  const notes = [];
+
+  // ---- project-level facts ----
+  const durationMatch = text.match(/DURATION:\s*(\d+(?:\.\d+)?)\s*seconds?/i);
+  const aspectMatch = text.match(/ASPECT:\s*(9:16|16:9|1:1|4:5)/i);
+  const durationS = durationMatch ? Number(durationMatch[1]) : null;
+
+  // ---- script moments: ONE continuous take, so every AM/EN pair folds into
+  // one dialogue string and one temporal_beats list, never separate shots.
+  const momentRe = /^(HOOK|SHARE|REASSURE|EXPLAIN|CAVEAT|CTA)\s*\((\d+:\d+(?:\.\d+)?)\s*-\s*(\d+:\d+(?:\.\d+)?)\):\s*AM:\s*"([^"]*)"\s*EN:\s*"([^"]*)"/gim;
+  const moments = [...text.matchAll(momentRe)].map(m => ({
+    label: m[1], startS: mockParseTimeToSeconds(m[2]), endS: mockParseTimeToSeconds(m[3]),
+    am: m[4], en: m[5],
+  }));
+  if (!moments.length) {
+    notes.push('could not find any timed script moments (expected lines like "HOOK (0:00-0:02): AM: \\"...\\" EN: \\"...\\""); presenter_shot.audio was left empty.');
+  }
+
+  const presenterShot = {
+    shot_code: null,
+    duration_target_s: durationS,
+    story: {
+      beat: moments.length
+        ? `One continuous presenter take covering: ${moments.map(m => m.label).join(', ')}.`
+        : null,
+      narration: moments.length ? moments.map(m => m.am).join(' ') : null,
+    },
+    continuity: { characters: [], environment: null, props: [] },
+    camera: { movement: null, movement_intensity: null, framing_notes: null },
+    action: {
+      subject: 'Presenter speaks directly to camera for the entire take.',
+      environment: null,
+      temporal_beats: moments.map(m => `${m.label} (${m.startS}s-${m.endS}s): ${m.en}`),
+      performance: null,
+    },
+    audio: {
+      dialogue: moments.length ? moments.map(m => m.am).join(' ') : null,
+      dialogue_en_gloss: moments.length ? moments.map(m => m.en).join(' ') : null,
+    },
+    generation: { mode_preference: 'image_to_video', first_frame_asset_id: null },
+    note: 'This is ONE shot for the whole take, not one shot per script moment -- the moments above are timing beats within it. generation.first_frame_asset_id is null: generate a reference image from this project\'s presenter CHARACTER lock first (create that lock if it does not exist yet), then set first_frame_asset_id before generating this shot.',
+  };
+
+  // ---- overlays ----
+  const overlays = [];
+  const titleCard = mockParseCardOrLabel(text, 'TITLE CARD', 'TITLE_CARD', 'title card');
+  if (titleCard) overlays.push(titleCard);
+  const shareLabel = mockParseCardOrLabel(text, 'SHARE LABEL', 'LABEL', 'label');
+  if (shareLabel) overlays.push(shareLabel);
+  const keywordLabel = mockParseCardOrLabel(text, 'KEYWORD LABEL', 'LABEL', 'label');
+  if (keywordLabel) overlays.push(keywordLabel);
+  const doorCard = mockParseDoorCard(text);
+  if (doorCard) overlays.push(doorCard);
+  overlays.push(...mockParseIcons(text));
+  overlays.forEach((o, i) => { o.order_index = i; });
+
+  if (!overlays.length) {
+    notes.push('could not find any recognizable overlay blocks (TITLE CARD / SHARE LABEL / KEYWORD LABEL / DOOR CARD / ICONS) in the brief.');
+  }
+
+  const captionDraft = mockParseCaption(text);
+  if (!captionDraft) notes.push('no CAPTION: block found; caption_draft is null.');
+
+  return {
+    project: {
+      title: null, format: null,
+      aspect_ratio: aspectMatch ? aspectMatch[1] : null,
+      language: moments.length ? 'am' : null,
+    },
+    presenter_shot: presenterShot,
+    overlays,
+    caption_draft: captionDraft,
+    clarifying_note: notes.length
+      ? `MOCK mode: ${notes.join(' ')} A real model call would parse genuinely free-form prose better than this keyword/block stand-in.`
+      : null,
+  };
 }
 
 // ---------- Anthropic ----------

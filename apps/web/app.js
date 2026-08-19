@@ -49,6 +49,49 @@ const biText = (original, en) => {
 };
 const empty = (cols, msg) => `<tr><td colspan="${cols}" class="empty">${msg}</td></tr>`;
 const dt = (v) => v ? new Date(v).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+// Video Studio brief import (19 Aug 2026): a readable render of the draft
+// POST /studio/projects/:id/import-brief returns -- the one presenter
+// shot's voiceover, every overlay's kind/timing/colors, the caption draft,
+// and any clarifying notes -- mirroring the "st-lock-draftnote" pattern the
+// lock drafter already uses for its own clarifying_note. Kept in one place
+// since it's rendered fresh every time Draft from this brief runs.
+function renderBriefDraft(draft, projectId) {
+  const s = draft.presenter_shot ?? {};
+  const overlayRow = (o) => {
+    const d = o.data ?? {};
+    const colorBits = [d.text_color ? `text ${d.text_color}` : null, d.background_color ? `bg ${d.background_color}` : null]
+      .filter(Boolean).join(' &middot; ');
+    const lines = Array.isArray(d.lines)
+      ? `<div class="muted" style="font-size:12px;margin-top:2px">${d.lines.map(l =>
+          `${esc(l.text ?? '')} (${esc(String(l.font_size_px ?? ''))}px, ${esc(l.text_color ?? '')}, +${esc(String(l.delay_s ?? '0'))}s)`).join('<br>')}</div>`
+      : '';
+    return `<div class="claimrow" style="margin-top:8px">
+      <div class="flex"><b>${esc(o.kind ?? '')}</b>
+        <span class="mono muted">${esc(String(o.start_s ?? ''))}s&ndash;${esc(String(o.end_s ?? ''))}s</span>
+        ${colorBits ? `<span class="muted" style="font-size:12px">${colorBits}</span>` : ''}</div>
+      ${d.text ? `<div style="margin-top:4px">${esc(d.text)}</div>` : ''}
+      ${lines}
+      ${o.kind === 'ICON' && d.description ? `<div class="muted" style="font-size:12px;margin-top:2px">${esc(d.description)}</div>` : ''}
+      ${o.note ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">${esc(o.note)}</div>` : ''}
+    </div>`;
+  };
+  return `
+    <div class="claimrow"><div class="eyebrow" style="margin-bottom:4px">Presenter shot (one continuous take)</div>
+      <div class="muted" style="font-size:12px">Duration target: ${esc(String(s.duration_target_s ?? '?'))}s</div>
+      ${s.story?.beat ? `<div style="margin-top:6px">${esc(s.story.beat)}</div>` : ''}
+      ${s.audio?.dialogue ? `<div class="amharic" style="margin-top:6px">${esc(s.audio.dialogue)}</div>` : ''}
+      ${s.audio?.dialogue_en_gloss ? `<div class="muted" style="font-size:12px;margin-top:4px">${esc(s.audio.dialogue_en_gloss)}</div>` : ''}
+      ${s.note ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:8px;font-size:12px">${esc(s.note)}</div>` : ''}
+    </div>
+    <div class="eyebrow" style="margin-top:14px;margin-bottom:4px">Overlays (${(draft.overlays ?? []).length})</div>
+    ${(draft.overlays ?? []).length ? (draft.overlays ?? []).map(overlayRow).join('') : '<div class="muted" style="font-size:12px">No overlays drafted.</div>'}
+    ${draft.caption_draft ? `<div class="eyebrow" style="margin-top:14px;margin-bottom:4px">Caption draft</div>
+      <div class="claimrow" style="white-space:pre-wrap">${esc(draft.caption_draft)}</div>` : ''}
+    ${draft.clarifying_note ? `<div class="claimrow" id="st-brief-draftnote" style="border-left-color:var(--risk-mod);margin-top:12px;font-size:12px">${esc(draft.clarifying_note)}</div>` : ''}
+    <label style="margin-top:12px;display:block">Draft (JSON) -- edit anything before applying</label>
+    <textarea id="st-brief-draftjson" rows="10">${esc(JSON.stringify(draft, null, 2))}</textarea>
+    <div style="margin-top:10px"><button class="primary" data-stbriefapply="${esc(projectId)}">Apply draft</button></div>`;
+}
 // kind: false/undefined = normal, true = error (red, 5s), 'warn' = informational
 // flag (amber, 5s) -- used for non-blocking notices like platform-spec warnings.
 const toast = (msg, kind = false) => {
@@ -1455,6 +1498,11 @@ const screens = {
     const locks = Array.isArray(p.locks) ? p.locks : [];
     const shots = Array.isArray(p.shots) ? p.shots : [];
     const events = Array.isArray(p.events) ? p.events : [];
+    // Overlays (19 Aug 2026): not embedded in GET /studio/projects/:id like
+    // locks/shots/events are, so fetched separately -- same pattern the
+    // Assets & QC panel already uses for its own per-shot fetch below.
+    let overlays = [];
+    try { overlays = (await api('GET', `/studio/projects/${id}/overlays`)).items ?? []; } catch { overlays = []; }
 
     // Budget: only shown when a cap was actually set. budget_pct/budget_warning
     // are speculative fields another engineer's concurrent guardrail work may
@@ -1473,6 +1521,22 @@ const screens = {
         ${p.budget_warning ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">${esc(p.budget_warning)}</div>` : ''}
       </div>`;
     }
+
+    // Brief import (19 Aug 2026): turns a free-text production brief (the
+    // real trigger being "Spotting on the Pill", a 25s Send-It format
+    // clip) into a draft covering one presenter shot, its overlays, and a
+    // caption, so Rudy/Girum never have to retype a brief field by field.
+    // Same review-before-anything-saves discipline as the lock drafter
+    // above -- Draft calls /import-brief and saves nothing; the human
+    // reviews (and can edit the JSON below) before Apply draft actually
+    // creates the shot and overlay rows via /import-brief/apply.
+    const importBriefHtml = can('studio.write') ? `<div class="card"><div class="eyebrow">Import a brief</div>
+      <div class="sub" style="margin-top:-4px;margin-bottom:10px">Paste a production brief (timed script moments, overlay colors/fonts/positions, icon mentions, a caption). AI drafts ONE presenter shot spanning the whole runtime plus the overlays it describes -- a brief like this is one continuous take with timing beats layered on top, never several separate shots. Nothing is saved until you review the draft below and click Apply draft.</div>
+      <label>Brief text</label>
+      <textarea id="st-brief-freetext" rows="6" placeholder="e.g. DURATION: 25 seconds / ASPECT: 9:16 / timed script moments, overlay colors and positions, icon mentions, a caption..."></textarea>
+      <button style="margin-top:6px" data-stbriefdraft="${esc(id)}">Draft from this brief</button>
+      <div id="st-brief-draftbox" hidden style="margin-top:12px"></div>
+    </div>` : '';
 
     const locksHtml = locks.length ? locks.map(l => `<div class="card" style="margin-bottom:8px">
         <div class="flex">
@@ -1581,7 +1645,7 @@ const screens = {
     </div>` : '';
 
     const assembleHtml = can('studio.approve') ? `<div class="card"><div class="eyebrow">Assemble</div>
-      <div class="sub" style="margin-bottom:8px">Stitches every accepted shot asset (plus music, if given) into the rough cut. Every shot needs an accepted asset first.</div>
+      <div class="sub" style="margin-bottom:8px">Stitches every accepted shot asset (plus music, if given) into the rough cut, then burns in every approved overlay as a final pass. Every shot needs an accepted asset, and every overlay on this project needs to be approved (or removed), before this will run.</div>
       <div class="grid2">
         <div><label>Transition (optional)</label><select id="st-assemble-transition">
           <option value="cut" selected>Cut</option>
@@ -1590,6 +1654,49 @@ const screens = {
           <input id="st-assemble-music" placeholder="paste a MUSIC asset id, if any"></div>
       </div>
       <div style="margin-top:12px"><button class="primary" data-stassemble="${esc(id)}">Assemble rough cut</button></div>
+    </div>` : '';
+
+    // Overlays (19 Aug 2026): burned-in title cards, on-screen labels, the
+    // closing door card, and icon moments. v1 form is deliberately a kind
+    // selector plus one JSON textarea for `data` -- the pre-AI-assist shape
+    // the lock form used before tonight's lock-drafter feature -- since an
+    // AI-drafting UI for overlays is separate follow-up work, not this pass.
+    const overlaysHtml = overlays.length ? `<div class="card"><table>
+      <tr><th>Kind</th><th>Time range</th><th>Status</th><th></th></tr>
+      ${overlays.map(o => `<tr>
+        <td class="mono">${esc(o.kind)}</td>
+        <td class="mono">${esc(String(o.start_s))}s &ndash; ${esc(String(o.end_s))}s</td>
+        <td>${o.approved_at
+          ? `<span class="pill p-APPROVED"><span class="d"></span>approved</span>`
+          : `<span class="pill p-PENDING"><span class="d"></span>pending approval</span>`}</td>
+        <td class="flex" style="flex-wrap:wrap">
+          ${can('studio.approve') && !o.approved_at ? `<button class="approve" data-stoverlayapprove="${esc(o.id)}">Approve</button>` : ''}
+          ${can('studio.write') ? `<button data-stoverlaydelete="${esc(o.id)}" style="color:var(--risk-high)">Delete</button>` : ''}
+        </td>
+      </tr>`).join('')}
+      </table></div>` : '<div class="card empty">No overlays yet. Nothing extra burns into the rough cut until one is added and approved below.</div>';
+
+    const newOverlayHtml = can('studio.write') ? `<div class="card"><div class="eyebrow">New overlay</div>
+      <div class="sub" style="margin-top:-4px;margin-bottom:10px">A burned-in graphic over the footage -- a title card, an on-screen label, the closing door/CTA card, or an icon. Must be approved before it burns into assembly.</div>
+      <div class="grid2">
+        <div>
+          <label>Kind</label><select id="st-overlay-kind">
+            <option value="TITLE_CARD">Title card</option>
+            <option value="LABEL">Label</option>
+            <option value="DOOR_CARD">Door / CTA card</option>
+            <option value="ICON">Icon</option>
+          </select>
+          <label>Start (s)</label><input id="st-overlay-start" type="number" min="0" step="0.1" placeholder="e.g. 0">
+          <label>End (s)</label><input id="st-overlay-end" type="number" min="0" step="0.1" placeholder="e.g. 2">
+          <label>Order index</label><input id="st-overlay-order" type="number" min="0" value="0">
+        </div>
+        <div>
+          <label>Data (JSON)</label>
+          <div class="muted" style="font-size:12px;margin-bottom:4px">Shape depends on kind -- see 0035_studio_overlays.sql for the exact fields. Example for a title card:</div>
+          <textarea id="st-overlay-data" placeholder='{"text":"DM አርጉን በነጽ እንረዳሻለን!","font_family":"bold","font_size_px":40,"text_color":"#EBAB20","background_color":"#16103F","background_opacity":0.9,"corner_radius_px":16,"position":{"anchor":"top","inset_px":40},"animation_in":{"type":"fade","duration_s":0.4},"animation_out":{"type":"fade","duration_s":0.4}}'></textarea>
+        </div>
+      </div>
+      <div style="margin-top:12px"><button class="primary" data-stoverlaycreate="${esc(id)}">Create overlay</button></div>
     </div>` : '';
 
     const eventsHtml = events.length ? `<div class="card"><div class="eyebrow">Recent events</div>
@@ -1610,12 +1717,16 @@ const screens = {
       </div>
       ${p.archived_at ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">This project is archived and hidden from the Video Studio list. Nothing about its locks, shots, or generated assets was deleted -- unarchive to bring it back into view.</div>` : ''}
       ${budgetHtml}
+      ${importBriefHtml}
       <div class="eyebrow" style="margin-top:20px">Locks</div>
       ${locksHtml}
       ${newLockHtml}
       <div class="eyebrow" style="margin-top:20px">Shots</div>
       ${shotsHtml}
       ${newShotHtml}
+      <div class="eyebrow" style="margin-top:20px">Overlays</div>
+      ${overlaysHtml}
+      ${newOverlayHtml}
       ${musicHtml}
       ${assembleHtml}
       ${eventsHtml}`;
@@ -3069,7 +3180,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3255,6 +3366,67 @@ document.addEventListener('click', async (e) => {
       b.disabled = true; b.textContent = 'Unarchiving…';
       await api('POST', `/studio/projects/${projectId}/unarchive`);
       toast('Project unarchived'); return render();
+    }
+    if (b.dataset.stoverlaycreate) {
+      const projectId = b.dataset.stoverlaycreate;
+      const startRaw = elv('st-overlay-start'), endRaw = elv('st-overlay-end');
+      if (startRaw === '' || endRaw === '') return toast('Give the overlay a start and end time first.', 'warn');
+      let data;
+      try { data = JSON.parse(elv('st-overlay-data') || '{}'); }
+      catch { return toast('Invalid JSON in overlay data', true); }
+      b.disabled = true; b.textContent = 'Creating…';
+      await api('POST', `/studio/projects/${projectId}/overlays`, {
+        kind: elv('st-overlay-kind'),
+        start_s: Number(startRaw),
+        end_s: Number(endRaw),
+        order_index: Number(elv('st-overlay-order')) || 0,
+        data,
+      });
+      toast('Overlay created'); return render();
+    }
+    if (b.dataset.stoverlayapprove) {
+      b.disabled = true; b.textContent = 'Approving…';
+      await api('POST', `/studio/overlays/${b.dataset.stoverlayapprove}/approve`, {});
+      toast('Overlay approved'); return render();
+    }
+    if (b.dataset.stoverlaydelete) {
+      if (!confirm('Delete this overlay? This only removes the burn-in instruction; nothing else is affected.')) return;
+      b.disabled = true; b.textContent = 'Deleting…';
+      await api('DELETE', `/studio/overlays/${b.dataset.stoverlaydelete}`);
+      toast('Overlay deleted'); return render();
+    }
+    if (b.dataset.stbriefdraft) {
+      const projectId = b.dataset.stbriefdraft;
+      const freeText = elv('st-brief-freetext')?.trim();
+      if (!freeText) return toast('Paste the brief text first, then Draft from this brief.', 'warn');
+      const box = document.getElementById('st-brief-draftbox');
+      b.disabled = true; b.textContent = 'Drafting…';
+      try {
+        const draft = await api('POST', `/studio/projects/${projectId}/import-brief`, { free_text: freeText });
+        if (box) { box.hidden = false; box.innerHTML = renderBriefDraft(draft, projectId); }
+        toast('Draft ready below -- review before applying it.');
+      } finally {
+        b.disabled = false; b.textContent = 'Draft from this brief';
+      }
+      return;
+    }
+    if (b.dataset.stbriefapply) {
+      const projectId = b.dataset.stbriefapply;
+      let draft;
+      try { draft = JSON.parse(elv('st-brief-draftjson') || '{}'); }
+      catch { return toast('Invalid JSON in the draft box', true); }
+      b.disabled = true; b.textContent = 'Applying…';
+      try {
+        const r = await api('POST', `/studio/projects/${projectId}/import-brief/apply`, draft);
+        const skipped = r.overlays_skipped?.length ?? 0;
+        toast(`Applied: shot ${r.shot?.shot_code ?? ''} created, ${r.overlays_created?.length ?? 0} overlay${r.overlays_created?.length === 1 ? '' : 's'} created` +
+          (skipped ? `, ${skipped} overlay${skipped === 1 ? '' : 's'} skipped (see events for why)` : '') +
+          (r.caption_draft ? '. Caption draft still needs placing manually.' : ''),
+          skipped ? 'warn' : false);
+      } finally {
+        b.disabled = false; b.textContent = 'Apply draft';
+      }
+      return render();
     }
   } catch (ex) { toast(ex.message, true); render(); }
 });

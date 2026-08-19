@@ -384,6 +384,100 @@ const S = {
     caption_draft: z.string().nullable().optional(),
     clarifying_note: z.string().nullable().optional(),
   }),
+  // Video Studio (19 Aug 2026): the sibling of studio_brief_importer above,
+  // for the OTHER on-ramp into Video Studio -- an already-approved,
+  // structured lcos.script_versions row (hook/spoken_script/onscreen_text/
+  // scene_plan/cta), not a free-text brief. POST /studio/projects/
+  // from-script/draft (studio.mjs) calls this and returns a draft, saving
+  // nothing, exactly like the brief importer; POST .../apply creates the
+  // real project/shots/locks/overlays from the (possibly human-edited)
+  // draft the human reviewed.
+  //
+  // THE SHOT-COUNT RULE, load-bearing and the OPPOSITE of the brief
+  // importer's fixed one-shot rule: a Send-It brief is always one
+  // continuous presenter take, but a general approved script's scene_plan
+  // can describe either one continuous take (empty scene_plan, or a single
+  // entry spanning the whole runtime) or several genuinely distinct visual
+  // setups (multiple scene_plan entries with different visual_brief text --
+  // e.g. hook typography over b-roll, then answer cards over a gradient,
+  // then a CTA end card, which is exactly what the default MOCK
+  // script_writer output looks like). shots is drafted as ONE shot per
+  // scene_plan entry when there is more than one, and exactly one
+  // whole-runtime shot when there are zero or one -- never force a
+  // multi-scene script into one shot, and never split a single continuous
+  // scene into several. See the 0037 migration's system prompt for the same
+  // rule spelled out in prose for a real model.
+  //
+  // Overlay role -> kind mapping mirrors studio_brief_importer's named-block
+  // convention (TITLE CARD / SHARE LABEL / KEYWORD LABEL / DOOR CARD) but
+  // keyed off onscreen_text's own role tag instead of a brief's prose
+  // headers: HOOK -> TITLE_CARD (the opening card), DOOR -> DOOR_CARD (the
+  // closing card, one line from the beat's own text), SHARE/WARNING ->
+  // LABEL (an on-screen label, same role a brief's SHARE LABEL / KEYWORD
+  // LABEL blocks played), and SUBSTANCE/TURN/no role also -> LABEL at a
+  // default center anchor with a note that no role was given. Exactly like
+  // the brief importer, a script beat never drafts an ICON overlay -- there
+  // is no icon-asset source here either, only text beats.
+  //
+  // entity_codes_needed exists so POST /from-script/draft can search
+  // studio.locks GLOBALLY (unlike import-brief's project-scoped lookup --
+  // see studio.mjs for why: a character like "Dr Letena" is meant to be
+  // reused ACROSS projects, not just within the one this brief happened to
+  // land in) for an approved lock matching each code, and hand the human a
+  // reuse-or-draft-new choice per entity instead of starting every
+  // continuity lock from zero.
+  studio_script_importer: z.object({
+    project: z.object({
+      title: z.string().nullable().optional(),
+      aspect_ratio: z.string().nullable().optional(),
+      language: z.string().nullable().optional(),
+    }).optional().default({}),
+    shots: z.array(z.object({
+      order_index: z.number().int(),
+      shot_code: z.string().nullable().optional(),
+      duration_target_s: z.number().nullable().optional(),
+      story: z.object({
+        beat: z.string().nullable().optional(),
+        narration: z.string().nullable().optional(),
+      }).optional().default({}),
+      continuity: z.object({
+        characters: z.array(z.string()).optional().default([]),
+        environment: z.string().nullable().optional(),
+        props: z.array(z.string()).optional().default([]),
+      }).optional().default({}),
+      camera: z.object({
+        movement: z.string().nullable().optional(),
+        movement_intensity: z.string().nullable().optional(),
+        framing_notes: z.string().nullable().optional(),
+      }).optional().default({}),
+      action: z.object({
+        subject: z.string().nullable().optional(),
+        environment: z.string().nullable().optional(),
+        temporal_beats: z.array(z.string()).optional().default([]),
+        performance: z.string().nullable().optional(),
+      }).optional().default({}),
+      audio: z.object({
+        dialogue: z.string().nullable().optional(),
+        dialogue_en_gloss: z.string().nullable().optional(),
+      }).optional().default({}),
+      generation: z.object({
+        mode_preference: z.string().nullable().optional(),
+        first_frame_asset_id: z.string().nullable().optional(),
+      }).optional().default({}),
+      note: z.string().nullable().optional(),
+    })).min(1),
+    overlays: z.array(z.object({
+      kind: z.enum(['TITLE_CARD', 'LABEL', 'DOOR_CARD', 'ICON']),
+      start_s: z.number(),
+      end_s: z.number(),
+      order_index: z.number().int().optional().default(0),
+      data: z.record(z.any()),
+      note: z.string().nullable().optional(),
+    })).optional().default([]),
+    entity_codes_needed: z.array(z.string()).optional().default([]),
+    caption_draft: z.string().nullable().optional(),
+    clarifying_note: z.string().nullable().optional(),
+  }),
 };
 S.content_recommender = S.editorial_analyst;
 export const agentSchemas = S;

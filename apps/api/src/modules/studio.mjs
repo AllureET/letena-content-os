@@ -53,6 +53,7 @@ import { join } from 'node:path';
 import { q, one, audit, requirePerm, err } from '../core.mjs';
 import { storage, videoEngine, gemini, suno, azureSpeech } from '../adapters/index.mjs';
 import { invokeAgent } from '../ai/gateway.mjs';
+import { formatOf } from '../formats.mjs';
 import { OVERLAY_KINDS, validateOverlayData, describeOverlayCollision, buildOverlayFilterGraph,
   compileOverlayLayerSvg, resolveCanvasSizeForAspect, loadEthiopicFontsBase64 } from './studio_overlays.mjs';
 
@@ -790,6 +791,275 @@ export default async function routes(app) {
     // this endpoint existed.
     return { project_updates: projectUpdates, shot, overlays_created: createdOverlays,
       overlays_skipped: skippedOverlays, caption_draft: draft.caption_draft ?? null };
+  });
+
+  // -------------------------------------------------------------------
+  // Script import (19 Aug 2026): the sibling of the brief-import feature
+  // just above, for the OTHER on-ramp into Video Studio. createProductionJob
+  // (production.mjs) already refuses any APPROVED script whose format is
+  // VIDEO-kind with a 422 pointing here ("Approve this script, then start a
+  // Video Studio project from it instead") -- HeyGen and Creatomate were
+  // retired 19 Aug 2026, and that pipeline never rendered anything but
+  // VIDEO-kind pieces through them, so a VIDEO-kind script now has nowhere
+  // else to go. These two routes are what that message points at.
+  //
+  // Same draft/apply split as import-brief, same discipline: POST
+  // .../draft calls the studio_script_importer agent (gateway.mjs) and
+  // SAVES NOTHING; a human reviews the draft (editing project fields,
+  // shots, overlays, and choosing which continuity entities to reuse from
+  // an existing approved lock vs. draft fresh), then POST .../apply turns
+  // that reviewed draft into the real project/shots/locks/overlays.
+  //
+  // THE DIFFERENCE FROM import-brief, load-bearing: a Send-It brief is
+  // always one continuous presenter take. A general approved script's
+  // scene_plan can describe ONE continuous take or SEVERAL genuinely
+  // distinct shots/scenes -- the agent decides based on what scene_plan
+  // actually contains (see gateway.mjs's S.studio_script_importer comment
+  // and the 0037 migration's prompt for the full rule). This module does
+  // not force either shape; draft.shots is simply however many shots the
+  // agent (or the human, after editing the draft) decided the script needs.
+  app.post('/studio/projects/from-script/draft', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const scriptId = req.body?.script_id;
+    if (!scriptId) return reply.code(422).send(err(422, 'VALIDATION', 'script_id is required'));
+    const script = await one(`SELECT * FROM lcos.scripts WHERE id=$1`, [scriptId]);
+    if (!script) return reply.code(404).send(err(404, 'NOT_FOUND', 'script not found'));
+    if (script.status !== 'APPROVED') {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        'Only an APPROVED script can start a Video Studio project.', { guard: 'scriptApproved' }));
+    }
+
+    // Resolve body_kind exactly the way createProductionJob (production.mjs)
+    // does: the format registry's own body_kind first, falling back to the
+    // legacy video_family mapping for a concept with no format_code. A
+    // script that is not VIDEO-kind has no business here -- it either
+    // already produces fine through the regular pipeline, or (a non-VIDEO
+    // format) was never blocked from it in the first place.
+    const concept = await one(`SELECT * FROM lcos.content_concepts WHERE id=$1`, [script.concept_id]);
+    const fmtRow = concept?.format_code
+      ? await one(`SELECT body_kind FROM lcos.content_formats WHERE code=$1`, [concept.format_code]) : null;
+    const bodyKind = fmtRow?.body_kind ?? formatOf(concept?.video_family);
+    if (bodyKind !== 'VIDEO') {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `This script is a ${bodyKind} piece, not video -- produce it through the regular production pipeline instead of Video Studio.`,
+        { guard: 'scriptIsVideoKind' }));
+    }
+
+    // Idempotent re-entry: a script that already has a linked project (see
+    // studio.projects.source_script_id, 0037 migration) returns that
+    // project instead of drafting again, so double-clicking "Start Video
+    // Studio project" or reloading mid-review can never spawn a second
+    // project for the same script. POST .../apply enforces the same rule
+    // server-side, so this is a convenience short-circuit, not the only
+    // guard against a duplicate.
+    const existing = await one(`SELECT * FROM studio.projects WHERE source_script_id=$1`, [script.id]);
+    if (existing) return { existing_project: existing };
+
+    const version = await one(
+      `SELECT * FROM lcos.script_versions WHERE script_id=$1 AND version=$2`,
+      [script.id, script.approved_version ?? script.current_version]);
+    if (!version) return reply.code(404).send(err(404, 'NOT_FOUND', 'the script has no approved version to import'));
+
+    const out = await invokeAgent('studio_script_importer', {
+      hook: version.hook, spoken_script: version.spoken_script, onscreen_text: version.onscreen_text,
+      scene_plan: version.scene_plan, cta: version.cta, caption: version.caption,
+      estimated_duration_s: version.estimated_duration_s, language: script.language,
+      format_code: concept?.format_code ?? null, concept_title: concept?.title ?? null,
+      concept_characters: concept?.characters ?? [],
+    }, { objectType: 'STUDIO_SCRIPT_IMPORT', objectId: script.id, workflowCode: 'studio' });
+
+    // Reuse candidates: for every entity_code the draft names, search
+    // studio.locks GLOBALLY -- no project_id filter, UNLIKE import-brief's
+    // project-scoped lookup a few hundred lines above (`WHERE project_id=$1
+    // AND entity_code = ANY($2)`). That project-scoped search is right for
+    // resolving a shot's OWN lock versions within a project that already
+    // exists; this search is answering a different question -- "does an
+    // approved lock for this entity already exist ANYWHERE" -- because a
+    // recurring entity like "Dr Letena" is meant to be reused across
+    // projects, not redrawn from scratch every time a new project happens
+    // to need her. Only an ACTIVE, APPROVED lock counts as a candidate: an
+    // unapproved draft lock in some other project is not something this
+    // project should silently inherit.
+    const entityCodes = [...new Set(out.entity_codes_needed ?? [])];
+    const reuse_candidates = [];
+    for (const entityCode of entityCodes) {
+      const candidate = await one(
+        `SELECT l.id AS source_lock_id, l.entity_type, l.entity_code, l.version, l.data,
+                l.reference_asset_ids, p.id AS project_id, p.code AS project_code, p.title AS project_title
+         FROM studio.locks l JOIN studio.projects p ON p.id = l.project_id
+         WHERE l.entity_code=$1 AND l.is_active AND l.approved_at IS NOT NULL
+         ORDER BY l.version DESC LIMIT 1`, [entityCode]);
+      reuse_candidates.push({ entity_code: entityCode, candidate: candidate ?? null });
+    }
+
+    return { draft: out, reuse_candidates,
+      script: { id: script.id, code: script.code, language: script.language } };
+  });
+
+  // Applies a (possibly human-edited) draft from the endpoint above. Mirrors
+  // import-brief/apply's own discipline exactly -- a human still had to look
+  // at and submit the draft object, nothing here triggers automatically off
+  // the draft call, and any overlay that cannot validate is SKIPPED and
+  // reported with a reason, never silently dropped and never allowed to
+  // create a broken row. Two things import-brief/apply did not need to
+  // handle: MULTIPLE shots (looped instead of a single presenter_shot
+  // insert), and reuse_locks (copying a chosen existing approved lock into
+  // this new project instead of leaving every continuity entity to be
+  // drafted from zero).
+  app.post('/studio/projects/from-script/apply', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const { script_id: scriptId, draft, reuse_locks: reuseLocks } = req.body ?? {};
+    if (!scriptId) return reply.code(422).send(err(422, 'VALIDATION', 'script_id is required'));
+    const script = await one(`SELECT * FROM lcos.scripts WHERE id=$1`, [scriptId]);
+    if (!script) return reply.code(404).send(err(404, 'NOT_FOUND', 'script not found'));
+    if (!draft || !Array.isArray(draft.shots) || !draft.shots.length) {
+      return reply.code(422).send(err(422, 'VALIDATION', 'draft.shots is required and must be a non-empty array'));
+    }
+
+    // Refuse a second project for the same script server-side too (the
+    // draft endpoint's existing_project short-circuit is a convenience, not
+    // the only guard -- a caller could skip straight to apply).
+    const already = await one(`SELECT * FROM studio.projects WHERE source_script_id=$1`, [script.id]);
+    if (already) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `Script ${script.code} already has a Video Studio project (${already.code}). Open it instead of creating another.`,
+        { guard: 'oneProjectPerScript' }));
+    }
+
+    // Validate every reuse_locks entry BEFORE creating anything, so a stale
+    // or wrong entry fails the whole call cleanly rather than leaving a
+    // half-built project behind. In the normal flow every entry here came
+    // straight from a reuse_candidate the draft endpoint itself already
+    // vetted as active+approved moments earlier, so this should essentially
+    // never fire -- it exists for the edge case where the underlying lock
+    // changed (deactivated, or reused entity_code changed) between draft
+    // and apply, which deserves a loud, specific refusal, not a silent
+    // "draft new instead" fallback the human never asked for.
+    const sourceLockByEntityCode = {};
+    for (const r of (reuseLocks ?? [])) {
+      if (!r?.entity_code || !r?.source_lock_id) {
+        return reply.code(422).send(err(422, 'VALIDATION',
+          'each reuse_locks entry needs both entity_code and source_lock_id'));
+      }
+      const src = await one(`SELECT * FROM studio.locks WHERE id=$1`, [r.source_lock_id]);
+      if (!src || src.entity_code !== r.entity_code || !src.is_active || !src.approved_at) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          `reuse_locks entry for ${r.entity_code} does not resolve to a currently active, approved lock (source_lock_id ${r.source_lock_id}) -- it may have been revised or deactivated since the draft was reviewed. Refresh the draft and choose again.`,
+          { guard: 'lockReuseInvalid' }));
+      }
+      sourceLockByEntityCode[r.entity_code] = src;
+    }
+
+    const projTitle = (draft.project?.title && String(draft.project.title).trim()) || script.code;
+    const projAspect = (draft.project?.aspect_ratio && String(draft.project.aspect_ratio).trim()) || '9:16';
+    const projLanguage = String(draft.project?.language || script.language || 'AM').toLowerCase();
+    const project = await one(
+      `INSERT INTO studio.projects (code, title, format, autonomy_level, brief, aspect_ratio, fps, language,
+         source_script_id, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [code('STU'), projTitle, 'ai_story', 'A1', JSON.stringify({}), projAspect, 30, projLanguage,
+       script.id, req.actor?.id ?? null]);
+    await q(`INSERT INTO studio.events (project_id, to_state, actor_id, note) VALUES ($1,$2,$3,$4)`,
+      [project.id, project.state, req.actor?.id ?? null, `project created from script ${script.code}`]);
+
+    // Reuse locks: copy each chosen source lock's (entity_type, entity_code,
+    // data, reference_asset_ids) into a NEW row scoped to THIS project,
+    // version 1, active, carrying over the source's approval -- a lock a
+    // human already approved once should not need re-approving just
+    // because it is now attached to a second project (10.8: an approved
+    // reference is immutable, but that immutability is about not silently
+    // rewriting it, not about forcing needless re-review of an unchanged
+    // fact). The SOURCE row is never mutated or touched: two projects can
+    // each hold their own copy of "Dr Letena" without one project's later
+    // revision silently changing the other's.
+    const lockIdByEntityCode = {};
+    const locksReused = [];
+    for (const [entityCode, src] of Object.entries(sourceLockByEntityCode)) {
+      const copy = await one(
+        `INSERT INTO studio.locks (project_id, level, entity_type, entity_code, version, data,
+           reference_asset_ids, is_active, approved_at, approved_by)
+         VALUES ($1,$2,$3,$4,1,$5,$6,true,$7,$8) RETURNING *`,
+        [project.id, src.level, src.entity_type, src.entity_code, JSON.stringify(src.data),
+         src.reference_asset_ids, src.approved_at, src.approved_by]);
+      lockIdByEntityCode[entityCode] = copy.id;
+      locksReused.push({ entity_code: entityCode, source_lock_id: src.id, source_project_id: src.project_id, new_lock_id: copy.id });
+      await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+        [project.id, req.actor?.id ?? null, `locks/${copy.entity_code}.v1`,
+         `reused lock ${copy.entity_code} from project ${src.project_id} (source lock ${src.id}); the already-approved reference was carried over without re-approval`]);
+    }
+
+    // One studio.shots row per draft shot, in array order. locked_lock_ids
+    // links whichever of the just-created (reused) locks match that shot's
+    // own continuity entity codes -- an entity the human chose NOT to
+    // reuse is simply absent from locked_lock_ids for now, exactly as the
+    // task describes; it gets a lock the normal way (create-shot's own
+    // resolution, or a manual lock) once one exists.
+    const shotsCreated = [];
+    for (let i = 0; i < draft.shots.length; i++) {
+      const sh = draft.shots[i] ?? {};
+      const continuity = sh.continuity ?? {};
+      const entityCodes = [...(continuity.characters ?? []), continuity.environment, ...(continuity.props ?? [])]
+        .filter(Boolean);
+      const lockedIds = entityCodes.map(c => lockIdByEntityCode[c]).filter(Boolean);
+      const shotCode = (sh.shot_code && String(sh.shot_code).trim()) || code('SH');
+      const shot = await one(
+        `INSERT INTO studio.shots (project_id, shot_code, order_index, duration_target_s, story, continuity,
+           camera, action, audio, graphics, generation, acceptance, locked_lock_ids)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+        [project.id, shotCode, sh.order_index ?? i, sh.duration_target_s ?? 5,
+         JSON.stringify(sh.story ?? {}), JSON.stringify(continuity), JSON.stringify(sh.camera ?? {}),
+         JSON.stringify(sh.action ?? {}), JSON.stringify(sh.audio ?? {}), JSON.stringify({}),
+         JSON.stringify(sh.generation ?? {}), JSON.stringify({}), lockedIds]);
+      shotsCreated.push(shot);
+      await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+        [project.id, req.actor?.id ?? null, `shots/${shot.shot_code}`,
+         `created shot ${shot.shot_code} (${i + 1} of ${draft.shots.length}) from script ${script.code}`]);
+    }
+
+    // Overlays: identical validate/collision/skip-with-reason discipline as
+    // import-brief/apply, reusing the exact same shared functions. The
+    // collision pool starts empty (a brand-new project has no other
+    // overlays yet) and grows as each one is created, same pattern as
+    // import-brief/apply's own loop.
+    const createdOverlays = [];
+    const skippedOverlays = [];
+    for (const ov of (draft.overlays ?? [])) {
+      const reasons = [];
+      if (!OVERLAY_KINDS.includes(ov?.kind)) reasons.push(`kind must be one of ${OVERLAY_KINDS.join(', ')}`);
+      if (typeof ov?.start_s !== 'number' || typeof ov?.end_s !== 'number' || !(ov.end_s > ov.start_s)) {
+        reasons.push('start_s and end_s are required numbers, and end_s must be greater than start_s');
+      }
+      if (!reasons.length) reasons.push(...validateOverlayData(ov.kind, ov.data));
+      if (!reasons.length && ov.kind === 'ICON') {
+        const iconAsset = ov.data?.asset_id ? await one(`SELECT id, kind FROM lcos.assets WHERE id=$1`, [ov.data.asset_id]) : null;
+        if (!iconAsset) reasons.push(`data.asset_id ${ov.data?.asset_id ?? '(none)'} does not resolve to an existing asset -- upload the icon image to the asset library first, then set asset_id and create this overlay directly`);
+        else if (iconAsset.kind !== 'ICON') reasons.push(`data.asset_id ${ov.data.asset_id} resolves to a ${iconAsset.kind} asset, not ICON`);
+      }
+      if (!reasons.length) {
+        const collision = describeOverlayCollision(createdOverlays, ov.kind, ov.data, ov.start_s, ov.end_s);
+        if (collision) reasons.push(collision);
+      }
+      if (reasons.length) {
+        skippedOverlays.push({ kind: ov?.kind ?? null, start_s: ov?.start_s ?? null, end_s: ov?.end_s ?? null,
+          reason: reasons.join('; ') });
+        continue;
+      }
+      const saved = await one(
+        `INSERT INTO studio.overlays (project_id, kind, start_s, end_s, order_index, data, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+        [project.id, ov.kind, ov.start_s, ov.end_s, ov.order_index ?? 0, JSON.stringify(ov.data ?? {}), req.actor?.id ?? null]);
+      createdOverlays.push(saved);
+    }
+
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [project.id, req.actor?.id ?? null, `projects/${project.code}`,
+       `applied script import from ${script.code}: ${shotsCreated.length} shot(s), ${createdOverlays.length} overlay(s) created` +
+       (skippedOverlays.length ? `, ${skippedOverlays.length} overlay(s) skipped (see response)` : '') +
+       (locksReused.length ? `, ${locksReused.length} lock(s) reused from an existing approved project` : '')]);
+    await audit(null, { actor: req.actor, action: 'studio.project.from_script', objectType: 'STUDIO_PROJECT',
+      objectId: project.id, objectCode: project.code });
+
+    return { project, shots_created: shotsCreated, locks_reused: locksReused,
+      overlays_created: createdOverlays, overlays_skipped: skippedOverlays,
+      caption_draft: draft.caption_draft ?? null };
   });
 
   // -------------------------------------------------------------------

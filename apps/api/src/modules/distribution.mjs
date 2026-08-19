@@ -6,6 +6,7 @@ import { publishers, collectors, storage } from '../adapters/index.mjs';
 import { getPlatformSpec, evaluateContent } from './platform_specs.mjs';
 import { reachScore, educationScore, serviceScore, compositeScore } from '../../../../packages/scoring/src/index.mjs';
 import { publishRule } from '../pipeline_rules.mjs';
+import { formatOf } from '../formats.mjs';
 
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
@@ -123,13 +124,24 @@ export default async function routes(app) {
        LEFT JOIN lcos.script_versions sv ON sv.script_id=s.id AND sv.version=s.current_version
        WHERE s.status IN ('VALIDATED','LANGUAGE_REVIEW','CLINICAL_REVIEW') AND s.validation_result='PASS'
        ORDER BY s.created_at DESC LIMIT 100`)).rows;
+    // body_kind here (19 Aug 2026) is the same createProductionJob fallback
+    // as content.mjs's GET /content/scripts: registry body_kind first, else
+    // the legacy video_family mapping. A VIDEO-kind script never enters this
+    // pipeline (production.mjs's own guard refuses it), so the UI offers
+    // "Start Video Studio project" instead of "Produce" for those rows.
     const toProduce = (await q(
-      `SELECT s.id, s.code, s.language, s.risk_tier, s.created_at, cf.code AS family_code
-       FROM lcos.scripts s JOIN lcos.content_families cf ON cf.id=s.family_id
+      `SELECT s.id, s.code, s.language, s.risk_tier, s.created_at, cf.code AS family_code,
+              cc.video_family, fmt.body_kind AS registry_body_kind
+       FROM lcos.scripts s
+       JOIN lcos.content_families cf ON cf.id=s.family_id
+       JOIN lcos.content_concepts cc ON cc.id=s.concept_id
+       LEFT JOIN lcos.content_formats fmt ON fmt.code=cc.format_code
        WHERE s.status='APPROVED' AND NOT EXISTS (
          SELECT 1 FROM lcos.production_jobs pj WHERE pj.script_id=s.id
            AND pj.status NOT IN ('FAILED','CANCELLED'))
-       ORDER BY s.created_at DESC LIMIT 100`)).rows;
+       ORDER BY s.created_at DESC LIMIT 100`)).rows
+      .map(({ registry_body_kind, video_family, ...s }) =>
+        ({ ...s, body_kind: registry_body_kind ?? formatOf(video_family) }));
     const toPublish = (await q(
       `SELECT r.id AS render_id, r.script_id, r.storage_key, r.duration_s, r.created_at,
               s.code AS script_code, s.language, s.risk_tier, cf.code AS family_code,

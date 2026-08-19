@@ -49,6 +49,21 @@ const biText = (original, en) => {
 };
 const empty = (cols, msg) => `<tr><td colspan="${cols}" class="empty">${msg}</td></tr>`;
 const dt = (v) => v ? new Date(v).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '';
+// The Produce action for an APPROVED script (19 Aug 2026): production.mjs's
+// createProductionJob refuses any VIDEO-kind script outright now that
+// HeyGen/Creatomate are retired, so a VIDEO-kind row here has to offer
+// something that actually works instead of a button that just 422s. body_kind
+// (added to GET /content/scripts and GET /distribution/queue's to_produce
+// list, see content.mjs/distribution.mjs) is the same createProductionJob
+// fallback (registry body_kind, else legacy video_family), computed once
+// server-side so this stays a plain render, no client-side format lookup.
+function produceButtonHtml(s) {
+  if (s.body_kind === 'VIDEO') {
+    return can('studio.write')
+      ? `<a class="btn" href="#/studio-from-script/${esc(s.id)}">Start Video Studio project</a>` : '';
+  }
+  return can('production.request') ? `<button data-produce="${esc(s.id)}">Produce</button>` : '';
+}
 // Video Studio brief import (19 Aug 2026): a readable render of the draft
 // POST /studio/projects/:id/import-brief returns -- the one presenter
 // shot's voiceover, every overlay's kind/timing/colors, the caption draft,
@@ -91,6 +106,84 @@ function renderBriefDraft(draft, projectId) {
     <label style="margin-top:12px;display:block">Draft (JSON) -- edit anything before applying</label>
     <textarea id="st-brief-draftjson" rows="10">${esc(JSON.stringify(draft, null, 2))}</textarea>
     <div style="margin-top:10px"><button class="primary" data-stbriefapply="${esc(projectId)}">Apply draft</button></div>`;
+}
+// Video Studio script import (19 Aug 2026): a readable render of the draft
+// POST /studio/projects/from-script/draft returns -- one or more shots
+// (never forced to one, unlike renderBriefDraft's fixed single presenter
+// shot above), their overlays, and for every continuity entity the draft
+// names, a reuse-or-draft-new choice against whatever approved lock the
+// draft endpoint's GLOBAL search already found. `payload` is the endpoint's
+// full response: either { existing_project } (this script already has a
+// project -- nothing left to draft) or { draft, reuse_candidates, script }.
+function renderScriptImportDraft(payload, scriptId) {
+  if (payload.existing_project) {
+    const p = payload.existing_project;
+    return `<div class="claimrow" style="margin-top:8px">This script already has a Video Studio project -- nothing new was drafted.</div>
+      <div style="margin-top:10px"><a class="btn primary" href="#/studio-project/${esc(p.id)}">Open ${esc(p.code)} &rarr;</a></div>`;
+  }
+  const draft = payload.draft;
+  const reuseCandidates = payload.reuse_candidates ?? [];
+  const shotRow = (s, i) => `<div class="claimrow" style="margin-top:8px">
+      <div class="flex"><b>Shot ${i + 1}${s.shot_code ? ` &middot; ${esc(s.shot_code)}` : ''}</b>
+        <span class="mono muted">${esc(String(s.duration_target_s ?? '?'))}s</span></div>
+      ${s.story?.beat ? `<div style="margin-top:4px">${esc(s.story.beat)}</div>` : ''}
+      ${s.audio?.dialogue ? `<div class="amharic" style="margin-top:6px">${esc(s.audio.dialogue)}</div>` : ''}
+      ${s.continuity?.characters?.length ? `<div class="muted" style="font-size:12px;margin-top:4px">Characters: ${s.continuity.characters.map(c => esc(c)).join(', ')}</div>` : ''}
+      ${s.note ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">${esc(s.note)}</div>` : ''}
+    </div>`;
+  const overlayRow = (o) => {
+    const d = o.data ?? {};
+    const colorBits = [d.text_color ? `text ${d.text_color}` : null, d.background_color ? `bg ${d.background_color}` : null]
+      .filter(Boolean).join(' &middot; ');
+    const lines = Array.isArray(d.lines)
+      ? `<div class="muted" style="font-size:12px;margin-top:2px">${d.lines.map(l =>
+          `${esc(l.text ?? '')} (${esc(String(l.font_size_px ?? ''))}px, ${esc(l.text_color ?? '')})`).join('<br>')}</div>`
+      : '';
+    return `<div class="claimrow" style="margin-top:8px">
+      <div class="flex"><b>${esc(o.kind ?? '')}</b>
+        <span class="mono muted">${esc(String(o.start_s ?? ''))}s&ndash;${esc(String(o.end_s ?? ''))}s</span>
+        ${colorBits ? `<span class="muted" style="font-size:12px">${colorBits}</span>` : ''}</div>
+      ${d.text ? `<div style="margin-top:4px">${esc(d.text)}</div>` : ''}
+      ${lines}
+      ${o.note ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">${esc(o.note)}</div>` : ''}
+    </div>`;
+  };
+  // One row per entity_codes_needed: a reuse/draft-new radio pair when a
+  // candidate was found, or a plain note when none was -- exactly the
+  // human decision the apply endpoint's reuse_locks array records. The
+  // hidden input carries the chosen candidate's source_lock_id so the
+  // apply handler can read it straight off the DOM without re-fetching.
+  const entityRows = (draft.entity_codes_needed ?? []).map(code => {
+    const rc = reuseCandidates.find(r => r.entity_code === code)?.candidate;
+    return `<div class="claimrow" style="margin-top:8px">
+      <div class="mono"><b>${esc(code)}</b></div>
+      ${rc
+        ? `<label style="display:block;margin-top:4px;font-weight:400">
+             <input type="radio" name="st-reuse-${esc(code)}" value="reuse" checked>
+             Reuse ${esc(rc.project_code)}'s ${esc(rc.entity_type)} (v${esc(String(rc.version))})</label>
+           <label style="display:block;font-weight:400">
+             <input type="radio" name="st-reuse-${esc(code)}" value="new"> Draft new instead</label>
+           <input type="hidden" class="st-reuse-lockid" data-entitycode="${esc(code)}" value="${esc(rc.source_lock_id)}">`
+        : `<div class="muted" style="font-size:12px;margin-top:2px">No existing approved lock found for this entity -- create one from the new project's own Locks section once it exists.</div>`}
+    </div>`;
+  }).join('');
+  return `
+    <div class="eyebrow" style="margin-top:4px">Project</div>
+    <div class="grid2">
+      <div><label>Title</label><input id="st-script-title" value="${esc(draft.project?.title ?? '')}"></div>
+      <div><label>Aspect ratio</label><input id="st-script-aspect" value="${esc(draft.project?.aspect_ratio ?? '9:16')}"></div>
+    </div>
+    <div class="eyebrow" style="margin-top:14px">Shots (${draft.shots.length})</div>
+    ${draft.shots.map(shotRow).join('')}
+    <div class="eyebrow" style="margin-top:14px">Overlays (${(draft.overlays ?? []).length})</div>
+    ${(draft.overlays ?? []).length ? draft.overlays.map(overlayRow).join('') : '<div class="muted" style="font-size:12px">No overlays drafted.</div>'}
+    ${entityRows ? `<div class="eyebrow" style="margin-top:14px">Continuity entities</div>${entityRows}` : ''}
+    ${draft.caption_draft ? `<div class="eyebrow" style="margin-top:14px;margin-bottom:4px">Caption draft</div>
+      <div class="claimrow" style="white-space:pre-wrap">${esc(draft.caption_draft)}</div>` : ''}
+    ${draft.clarifying_note ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:12px;font-size:12px">${esc(draft.clarifying_note)}</div>` : ''}
+    <label style="margin-top:12px;display:block">Draft (JSON) -- edit anything before applying</label>
+    <textarea id="st-script-draftjson" rows="14">${esc(JSON.stringify(draft, null, 2))}</textarea>
+    <div style="margin-top:10px"><button class="primary" data-stscriptapply="${esc(scriptId)}">Apply draft</button></div>`;
 }
 // kind: false/undefined = normal, true = error (red, 5s), 'warn' = informational
 // flag (amber, 5s) -- used for non-blocking notices like platform-spec warnings.
@@ -392,7 +485,7 @@ const SECTIONS = [
 const DETAIL_SECTION = {
   question: 'questions', card: 'knowledge', script: 'content', render: 'production',
   amharic: 'content', produce: 'production', transcript: 'content',
-  board: 'today', 'studio-project': 'studio',
+  board: 'today', 'studio-project': 'studio', 'studio-from-script': 'studio',
 };
 
 // route id -> [sectionId, sectionLabel, tabs]
@@ -1028,7 +1121,7 @@ const screens = {
         <td class="mono">${esc(s.card_code)}</td><td>${esc(s.language)}</td>
         <td>${pill(s.risk_tier)}</td><td>${pill(s.validation_result === 'PASS' ? 'PASS' : s.validation_result === 'FAIL' ? 'FAIL' : null) || '<span class="muted">—</span>'}</td>
         <td>${pill(s.status)}</td><td></td>
-        <td>${s.status === 'APPROVED' && can('production.request') ? `<button data-produce="${s.id}">Produce</button>` : ''}</td>
+        <td>${s.status === 'APPROVED' ? produceButtonHtml(s) : ''}</td>
       </tr>`).join('')}</table></div>`;
   },
 
@@ -1270,11 +1363,23 @@ const screens = {
 
       <div class="card"><div class="flex"><div class="eyebrow" style="margin:0">2 · Approved, ready to produce (${P.length})</div>
         <div class="spacer"></div>
-        ${P.length && can('production.request') ? `<button class="primary" data-produceall="1">Produce all ${P.length}</button>` : ''}</div>
+        ${(() => {
+          // Produce all only ever batches the regular render pipeline
+          // (production.mjs). A VIDEO-kind script is refused there now
+          // that HeyGen/Creatomate are retired -- see produceButtonHtml
+          // above -- so it is left out of both the count and the batch
+          // loop below; it needs the per-script Video Studio review
+          // screen (draft, then a human choice per shot/overlay/lock),
+          // not a one-click bulk action.
+          const producible = P.filter(s => s.body_kind !== 'VIDEO').length;
+          const videoCount = P.length - producible;
+          return `${producible && can('production.request') ? `<button class="primary" data-produceall="1">Produce all ${producible}</button>` : ''}` +
+            (videoCount ? `<span class="muted" style="font-size:12px;margin-left:10px">${videoCount} video script${videoCount === 1 ? '' : 's'} need Video Studio, one at a time</span>` : '');
+        })()}</div>
       <table><tr><th>Script</th><th>Lang</th><th>Tier</th><th>Family</th><th></th></tr>
       ${P.map(s => `<tr class="rowlink" data-nav="script/${s.id}" tabindex="0"><td class="mono">${esc(s.code)}</td><td>${esc(s.language)}</td>
         <td>${pill(s.risk_tier)}</td><td class="mono muted">${esc(s.family_code)}</td>
-        <td>${can('production.request') ? `<button data-produce="${s.id}">Produce</button>` : ''}</td></tr>`).join('')
+        <td>${produceButtonHtml(s)}</td></tr>`).join('')
       || '<tr><td colspan=5 class="empty">Nothing to produce. Approved scripts queue up here.</td></tr>'}</table></div>
 
       <div class="card"><div class="eyebrow">3 · Ready to publish (${R.length})</div>
@@ -1730,6 +1835,34 @@ const screens = {
       ${musicHtml}
       ${assembleHtml}
       ${eventsHtml}`;
+  },
+
+  // Script-to-project bridge (19 Aug 2026): the review screen a VIDEO-kind
+  // APPROVED script's "Start Video Studio project" button (scripts/reviews
+  // lists) lands on, sibling of the "Import a brief" section on the
+  // project screen above but for a structured, already-approved script
+  // instead of a pasted free-text brief. Same discipline as everywhere
+  // else in Video Studio: nothing is saved by loading this screen or by
+  // Draft from this script -- POST /studio/projects/from-script/draft only
+  // ever returns a draft (or, if this script already has a linked
+  // project, existing_project). Drafting is a deliberate click here, same
+  // as "Draft from this brief" and "Draft with AI" on locks, rather than
+  // an automatic call on page load/refresh -- a real (non-MOCK) call costs
+  // real AI spend, and this screen can be reloaded or navigated back to.
+  async 'studio-from-script'(scriptId) {
+    let s;
+    try { s = await api('GET', `/content/scripts/${scriptId}`); }
+    catch (ex) {
+      return `<a class="backlink" href="#/scripts">&larr; Scripts</a>
+        <h1>Script not found</h1><div class="sub">${esc(ex.message)}</div>`;
+    }
+    return `<a class="backlink" href="#/script/${esc(scriptId)}">&larr; Back to script</a>
+      <h1>Start a Video Studio project</h1>
+      <div class="sub">From script ${esc(s.code ?? '')}${s.version?.hook ? ` &middot; ${esc(String(s.version.hook).slice(0, 90))}` : ''}. AI drafts the project, its shot(s), and its overlays from this approved script -- one shot per distinct scene when the script's scene plan names more than one, otherwise one continuous shot for the whole runtime. Nothing is saved until you review the draft below and click Apply draft.</div>
+      <div class="card">
+        <button class="primary" data-stscriptdraft="${esc(scriptId)}">Draft from this script</button>
+        <div id="st-script-draftbox" hidden style="margin-top:12px"></div>
+      </div>`;
   },
 
   async published() {
@@ -2615,9 +2748,12 @@ document.addEventListener('click', async (e) => {
     if (b.dataset.produceall) {
       b.disabled = true;
       const qd = await api('GET', '/distribution/queue');
+      // VIDEO-kind scripts are excluded here too, same reasoning as the
+      // button's own count above: production.mjs refuses them outright now.
+      const toProduce = qd.to_produce.filter(s => s.body_kind !== 'VIDEO');
       let done = 0, failed = 0;
-      for (const s of qd.to_produce) {
-        b.textContent = `Producing ${done + failed + 1}/${qd.to_produce.length}…`;
+      for (const s of toProduce) {
+        b.textContent = `Producing ${done + failed + 1}/${toProduce.length}…`;
         try {
           const job = await api('POST', '/production/jobs', { script_id: s.id });
           await api('POST', `/production/jobs/${job.id}/run`);
@@ -3180,7 +3316,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3427,6 +3563,58 @@ document.addEventListener('click', async (e) => {
         b.disabled = false; b.textContent = 'Apply draft';
       }
       return render();
+    }
+    if (b.dataset.stscriptdraft) {
+      const scriptId = b.dataset.stscriptdraft;
+      const box = document.getElementById('st-script-draftbox');
+      b.disabled = true; b.textContent = 'Drafting…';
+      try {
+        const r = await api('POST', '/studio/projects/from-script/draft', { script_id: scriptId });
+        if (box) { box.hidden = false; box.innerHTML = renderScriptImportDraft(r, scriptId); }
+        toast(r.existing_project ? 'This script already has a Video Studio project.'
+          : 'Draft ready below -- review before applying it.');
+      } finally {
+        b.disabled = false; b.textContent = 'Draft from this script';
+      }
+      return;
+    }
+    if (b.dataset.stscriptapply) {
+      const scriptId = b.dataset.stscriptapply;
+      let draft;
+      try { draft = JSON.parse(elv('st-script-draftjson') || '{}'); }
+      catch { return toast('Invalid JSON in the draft box', true); }
+      // The Title/Aspect ratio inputs are the one part of the draft this
+      // screen offers a plain field for (see renderScriptImportDraft); any
+      // other project/shot/overlay edit goes through the JSON box itself,
+      // same convention as the brief importer's own review screen.
+      const titleField = elv('st-script-title')?.trim();
+      const aspectField = elv('st-script-aspect')?.trim();
+      draft.project = { ...(draft.project ?? {}), ...(titleField ? { title: titleField } : {}),
+        ...(aspectField ? { aspect_ratio: aspectField } : {}) };
+      // reuse_locks: one entry per entity_codes_needed row whose radio is
+      // still on "reuse" (the default, when a candidate existed) -- an
+      // entity switched to "Draft new instead", or with no candidate at
+      // all, is simply absent, exactly as the apply endpoint expects.
+      const reuseLocks = [...document.querySelectorAll('.st-reuse-lockid')].map((inp) => {
+        const code = inp.dataset.entitycode;
+        const radio = document.querySelector(`input[name="st-reuse-${CSS.escape(code)}"]:checked`);
+        return radio?.value === 'reuse' ? { entity_code: code, source_lock_id: inp.value } : null;
+      }).filter(Boolean);
+      b.disabled = true; b.textContent = 'Applying…';
+      try {
+        const r = await api('POST', '/studio/projects/from-script/apply',
+          { script_id: scriptId, draft, reuse_locks: reuseLocks });
+        const skipped = r.overlays_skipped?.length ?? 0;
+        toast(`Applied: ${r.shots_created?.length ?? 0} shot${r.shots_created?.length === 1 ? '' : 's'}, ` +
+          `${r.overlays_created?.length ?? 0} overlay${r.overlays_created?.length === 1 ? '' : 's'} created` +
+          (r.locks_reused?.length ? `, ${r.locks_reused.length} lock${r.locks_reused.length === 1 ? '' : 's'} reused` : '') +
+          (skipped ? `, ${skipped} overlay${skipped === 1 ? '' : 's'} skipped (see events for why)` : ''),
+          skipped ? 'warn' : false);
+        location.hash = '#/studio-project/' + r.project.id;
+      } finally {
+        b.disabled = false; b.textContent = 'Apply draft';
+      }
+      return;
     }
   } catch (ex) { toast(ex.message, true); render(); }
 });

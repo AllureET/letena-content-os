@@ -422,6 +422,19 @@ export class MockAIProvider extends BaseProvider {
   agent_studio_brief_importer(ctx) {
     return mockImportBrief(String(ctx.free_text ?? ''));
   }
+
+  // Deterministic stand-in for studio_script_importer (19 Aug 2026). Unlike
+  // the brief importer, there is no free-text parsing ambiguity to resolve
+  // here -- the input is already a structured, approved script_versions
+  // row -- so this mock is closer to a straight reshape than block/regex
+  // extraction. It still applies the one piece of real judgement the real
+  // prompt calls out: scene_plan with 0 or 1 entries drafts ONE shot for
+  // the whole runtime, more than one entry drafts one shot per entry. See
+  // mockScriptImport below and 0037_studio_script_importer.sql's prompt for
+  // the same rules in prose for a real model.
+  agent_studio_script_importer(ctx) {
+    return mockScriptImport(ctx);
+  }
 }
 
 // ===========================================================================
@@ -683,6 +696,202 @@ function mockImportBrief(text) {
     caption_draft: captionDraft,
     clarifying_note: notes.length
       ? `MOCK mode: ${notes.join(' ')} A real model call would parse genuinely free-form prose better than this keyword/block stand-in.`
+      : null,
+  };
+}
+
+// ===========================================================================
+// studio_script_importer MOCK helpers (19 Aug 2026). Pure functions, no
+// `this`, same discipline as the studio_brief_importer helpers just above.
+// See agent_studio_script_importer above for how this is invoked, and
+// 0037_studio_script_importer.sql / apps/api/src/ai/gateway.mjs's
+// S.studio_script_importer for the same rules described for a real model.
+// ===========================================================================
+
+// Mirrors studio_overlays.mjs's OVERLAY_KINDS/role convention on purpose
+// (not imported: ai/ deliberately does not depend on modules/, same
+// layering rule the brief-importer helpers already follow). HOOK opens like
+// a brief's TITLE CARD, DOOR closes like its DOOR CARD, SHARE/WARNING read
+// like its named LABEL blocks; SUBSTANCE/TURN/no role fall back to a plain
+// LABEL rather than inventing a card the beat's role does not support.
+const SCRIPT_OVERLAY_ROLE_KIND = {
+  HOOK: 'TITLE_CARD', DOOR: 'DOOR_CARD',
+  SHARE: 'LABEL', WARNING: 'LABEL', SUBSTANCE: 'LABEL', TURN: 'LABEL',
+};
+const SCRIPT_OVERLAY_ROLE_ANCHOR = {
+  HOOK: 'upper-third', SHARE: 'top-right', WARNING: 'right-center',
+  SUBSTANCE: 'center', TURN: 'center', DOOR: 'center',
+};
+
+// "Selam Bekele" -> "SELAM_BEKELE". Deterministic, reversible-by-eye lock
+// entity-code convention for a concept's own named fictional characters --
+// the only source of a continuity entity code this mock (or the real
+// prompt) will ever draft from a script alone; environment/prop codes are
+// never invented (see mockScriptShots' note text).
+function mockScriptEntityCode(name) {
+  return String(name ?? '').trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+// Splits spoken_script's words proportionally across scenePlan entries by
+// each scene's share of total runtime. This is a mechanical split of REAL
+// text (never invented content), but it is only an approximation of where
+// the actual dialogue cut points fall -- callers attach a note saying so on
+// every shot this touches, same honesty standard as the rest of this mock.
+function mockSplitDialogueByScenes(spokenScript, scenePlan) {
+  const words = String(spokenScript ?? '').split(/\s+/).filter(Boolean);
+  const totalDuration = scenePlan.reduce((max, s) => Math.max(max, Number(s.end_s ?? 0)), 0);
+  if (!words.length || !totalDuration) return scenePlan.map(() => null);
+  let wordIdx = 0;
+  return scenePlan.map((s, i) => {
+    const isLast = i === scenePlan.length - 1;
+    const share = (Number(s.end_s ?? 0) - Number(s.start_s ?? 0)) / totalDuration;
+    const count = isLast ? words.length - wordIdx : Math.max(1, Math.round(share * words.length));
+    const slice = words.slice(wordIdx, wordIdx + count);
+    wordIdx += slice.length;
+    return slice.join(' ') || null;
+  });
+}
+
+// THE SHOT-COUNT RULE, applied mechanically: scene_plan with 0 or 1 entries
+// -> one shot spanning the whole runtime; more than one entry -> one shot
+// per entry, in order. See the schema comment in gateway.mjs for the full
+// rationale.
+function mockScriptShots(ctx) {
+  const scenePlan = Array.isArray(ctx.scene_plan) ? ctx.scene_plan : [];
+  const onscreenBeats = Array.isArray(ctx.onscreen_text) ? ctx.onscreen_text : [];
+  const characterCodes = (Array.isArray(ctx.concept_characters) ? ctx.concept_characters : [])
+    .map(c => mockScriptEntityCode(c?.name)).filter(Boolean);
+
+  if (scenePlan.length <= 1) {
+    const scene = scenePlan[0] ?? null;
+    const totalDuration = scene ? Number(scene.end_s ?? 0) - Number(scene.start_s ?? 0)
+      : (ctx.estimated_duration_s != null ? Number(ctx.estimated_duration_s) : null);
+    return [{
+      order_index: 0,
+      shot_code: null,
+      duration_target_s: totalDuration,
+      story: {
+        beat: scene?.visual_brief ?? null,
+        narration: ctx.spoken_script ?? null,
+      },
+      continuity: { characters: characterCodes, environment: null, props: [] },
+      camera: { movement: null, movement_intensity: null, framing_notes: null },
+      action: {
+        subject: scene?.asset_requirement?.kind
+          ? `On-camera per the script's asset requirement: ${scene.asset_requirement.kind}` : null,
+        environment: null,
+        temporal_beats: onscreenBeats.map(b => b?.text).filter(Boolean),
+        performance: null,
+      },
+      audio: { dialogue: ctx.spoken_script ?? null, dialogue_en_gloss: null },
+      generation: { mode_preference: characterCodes.length ? 'image_to_video' : null, first_frame_asset_id: null },
+      note: (scenePlan.length
+        ? 'One shot for the whole script: scene_plan named a single scene spanning the runtime, not several distinct setups.'
+        : 'One shot for the whole script: this script carries no scene_plan, so the whole runtime is treated as one continuous take.')
+        + (characterCodes.length
+          ? ` A CHARACTER lock for ${characterCodes.join(', ')} should exist (or be created) before this shot generates.`
+          : ''),
+    }];
+  }
+
+  const dialogues = mockSplitDialogueByScenes(ctx.spoken_script, scenePlan);
+  return scenePlan.map((scene, i) => ({
+    order_index: i,
+    shot_code: null,
+    duration_target_s: (scene.end_s != null && scene.start_s != null)
+      ? Number(scene.end_s) - Number(scene.start_s) : null,
+    story: {
+      beat: scene.visual_brief ?? null,
+      narration: i === 0 ? (ctx.hook ?? null) : null,
+    },
+    continuity: { characters: i === 0 ? characterCodes : [], environment: null, props: [] },
+    camera: { movement: null, movement_intensity: null, framing_notes: null },
+    action: {
+      subject: scene.asset_requirement?.kind
+        ? `Asset requirement: ${scene.asset_requirement.kind}${scene.asset_requirement.tags?.length ? ` (${scene.asset_requirement.tags.join(', ')})` : ''}`
+        : null,
+      environment: null,
+      temporal_beats: [],
+      performance: null,
+    },
+    audio: { dialogue: dialogues[i], dialogue_en_gloss: null },
+    generation: {
+      mode_preference: (i === 0 && characterCodes.length) ? 'image_to_video' : null,
+      first_frame_asset_id: null,
+    },
+    note: `Scene ${scene.index ?? i + 1} of the script's scene_plan (${scene.start_s ?? '?'}s-${scene.end_s ?? '?'}s), `
+      + `drafted as its own shot because scene_plan names more than one distinct visual setup. `
+      + `audio.dialogue is a time-proportional slice of the script's continuous spoken_script, not a per-scene `
+      + `script the source data actually has -- adjust the boundary by ear against the real cut points before generating.`,
+  }));
+}
+
+// One overlay per onscreen_text beat, in at_second order. See
+// SCRIPT_OVERLAY_ROLE_KIND/ANCHOR above for the role -> kind convention.
+// Never drafts an ICON: identical to studio_brief_importer, there is no
+// icon-asset source in a script beat either.
+function mockScriptOverlays(onscreenText) {
+  const beats = (Array.isArray(onscreenText) ? onscreenText : [])
+    .slice().sort((a, b) => Number(a.at_second) - Number(b.at_second));
+  return beats.map((beat, i) => {
+    const role = beat?.role ?? null;
+    const kind = SCRIPT_OVERLAY_ROLE_KIND[role] ?? 'LABEL';
+    const anchor = SCRIPT_OVERLAY_ROLE_ANCHOR[role] ?? 'center';
+    const startS = Number(beat?.at_second ?? 0);
+    const next = beats[i + 1];
+    const usedDefaultEnd = !next;
+    const endS = next ? Number(next.at_second) : startS + 4;
+    const fontFamily = (beat?.emphasis === 'STRONG' || beat?.emphasis === 'WARNING') ? 'bold' : 'regular';
+    const notes = [];
+    if (!role) notes.push('this onscreen_text beat has no role tag, so it was drafted as a generic LABEL at a default center position -- adjust kind/position manually if a different overlay type fits better.');
+    if (usedDefaultEnd) notes.push('no later beat exists to mark where this one ends, so a default 4-second duration was used -- adjust end_s to match the real cut.');
+    if (kind === 'DOOR_CARD') {
+      return { kind, start_s: startS, end_s: endS, order_index: i,
+        data: { background_color: null, lines: [{ text: beat?.text ?? null, font_family: fontFamily,
+          font_size_px: beat?.font_size_px ?? null, text_color: beat?.color ?? null, delay_s: 0 }] },
+        note: notes.length ? notes.join(' ') : null };
+    }
+    return { kind, start_s: startS, end_s: endS, order_index: i,
+      data: { text: beat?.text ?? null, font_family: fontFamily, font_size_px: beat?.font_size_px ?? null,
+        text_color: beat?.color ?? null, background_color: null, background_opacity: null,
+        position: { anchor } },
+      note: notes.length ? notes.join(' ') : null };
+  });
+}
+
+function mockScriptEntityCodesNeeded(shots) {
+  const set = new Set();
+  for (const sh of shots) {
+    for (const c of sh.continuity?.characters ?? []) set.add(c);
+    if (sh.continuity?.environment) set.add(sh.continuity.environment);
+    for (const p of sh.continuity?.props ?? []) set.add(p);
+  }
+  return [...set];
+}
+
+function mockScriptImport(ctx) {
+  const scenePlanLen = Array.isArray(ctx.scene_plan) ? ctx.scene_plan.length : 0;
+  const onscreenLen = Array.isArray(ctx.onscreen_text) ? ctx.onscreen_text.length : 0;
+  const shots = mockScriptShots(ctx);
+  const overlays = mockScriptOverlays(ctx.onscreen_text);
+  const notes = [];
+  if (!scenePlanLen) notes.push('this script carries no scene_plan, so the whole runtime was drafted as one continuous shot.');
+  if (!onscreenLen) notes.push('no onscreen_text beats were found, so no overlays were drafted -- add them manually if this piece needs on-screen graphics.');
+  return {
+    project: {
+      title: ctx.concept_title ?? null,
+      // Every VIDEO-kind format in the registry today targets vertical
+      // short-form social video -- a sourced default, not a guess about
+      // this specific script (see the 0037 migration's prompt).
+      aspect_ratio: '9:16',
+      language: ctx.language ? String(ctx.language).toLowerCase() : null,
+    },
+    shots,
+    overlays,
+    entity_codes_needed: mockScriptEntityCodesNeeded(shots),
+    caption_draft: ctx.caption ?? null,
+    clarifying_note: notes.length
+      ? `MOCK mode: ${notes.join(' ')} A real model call would draft continuity and camera detail this structural stand-in cannot.`
       : null,
   };
 }

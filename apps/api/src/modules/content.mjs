@@ -52,13 +52,23 @@ export default async function routes(app) {
 
   app.get('/content/scripts', { preHandler: requirePerm('script.read') }, async (req) => {
     const r = await q(
-      `SELECT s.*, cf.code AS family_code, kc.code AS card_code
+      `SELECT s.*, cf.code AS family_code, kc.code AS card_code,
+              cc.video_family, fmt.body_kind AS registry_body_kind
        FROM lcos.scripts s
        JOIN lcos.content_families cf ON cf.id=s.family_id
        JOIN lcos.knowledge_cards kc ON kc.id=cf.knowledge_card_id
+       JOIN lcos.content_concepts cc ON cc.id=s.concept_id
+       LEFT JOIN lcos.content_formats fmt ON fmt.code=cc.format_code
        WHERE ($1::text IS NULL OR s.status=$1::lcos.script_status)
        ORDER BY s.created_at DESC LIMIT 200`, [req.query.status ?? null]);
-    return { items: r.rows };
+    // body_kind (19 Aug 2026): the same fallback createProductionJob
+    // (production.mjs) uses to decide whether a script is a video --
+    // registry's own body_kind first, else the legacy video_family mapping
+    // -- so the scripts list can tell a VIDEO-kind APPROVED script apart
+    // from every other kind and offer "Start Video Studio project"
+    // (studio.mjs's /from-script/draft) instead of "Produce" for it.
+    return { items: r.rows.map(({ registry_body_kind, video_family, ...s }) =>
+      ({ ...s, body_kind: registry_body_kind ?? formatOf(video_family) })) };
   });
   app.get('/content/scripts/:id', { preHandler: requirePerm('script.read') }, async (req, reply) => {
     const s = await one(`SELECT * FROM lcos.scripts WHERE id=$1`, [req.params.id]);

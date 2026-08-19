@@ -262,6 +262,39 @@ const S = {
     knowledge_blockers: z.array(z.any()).optional().default([]),
     experiments_to_run: z.array(z.any()).optional().default([]),
     caveats: z.array(z.string()).optional().default([]) }),
+  // Video Studio (18 Aug 2026): turns a non-technical, free-text description
+  // of a character/style/environment/prop into the structured fields a
+  // continuity lock needs. This is an INTAKE assist only -- the human still
+  // sees and can edit the drafted fields before a lock is ever saved, and
+  // once saved, compileStillPrompt() (studio.mjs) still compiles the actual
+  // generation prompt deterministically from that stored data, exactly as
+  // before. The model never writes a generation prompt directly; it only
+  // fills in the same structured vocabulary a person would otherwise have
+  // to type by hand. All fields nullable/optional: only the ones relevant
+  // to the given entity_type should be filled, and a thin description
+  // should leave fields blank rather than invent plausible-sounding detail.
+  studio_lock_drafter: z.object({
+    fields: z.object({
+      name: z.string().nullable().optional(),
+      apparent_age: z.string().nullable().optional(),
+      silhouette: z.string().nullable().optional(),
+      face: z.string().nullable().optional(),
+      hair: z.string().nullable().optional(),
+      wardrobe_default: z.string().nullable().optional(),
+      forbidden_drift: z.array(z.string()).optional().default([]),
+      style_summary: z.string().nullable().optional(),
+      motion_grammar: z.string().nullable().optional(),
+      architecture: z.string().nullable().optional(),
+      palette: z.string().nullable().optional(),
+      time: z.string().nullable().optional(),
+      weather: z.string().nullable().optional(),
+      material: z.string().nullable().optional(),
+      color: z.string().nullable().optional(),
+      wear: z.string().nullable().optional(),
+      scale_reference: z.string().nullable().optional(),
+    }),
+    clarifying_note: z.string().nullable().optional(),
+  }),
 };
 S.content_recommender = S.editorial_analyst;
 export const agentSchemas = S;

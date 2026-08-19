@@ -52,6 +52,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { q, one, audit, requirePerm, err } from '../core.mjs';
 import { storage, videoEngine, gemini, suno, azureSpeech } from '../adapters/index.mjs';
+import { invokeAgent } from '../ai/gateway.mjs';
 
 const execFileP = promisify(execFile);
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -132,6 +133,33 @@ function negativePromptFor(locks) {
   const base = ['identity mutation', 'duplicate subjects', 'extra limbs', 'fused hands',
     'unintended text', 'subtitles', 'logo', 'watermark', 'camera shake unless specified', 'morphing'];
   return [...base, ...forbidden].join(', ');
+}
+
+const LOCK_ENTITY_TYPES = ['STYLE', 'CHARACTER', 'ENVIRONMENT', 'PROP'];
+
+// Turns the flat field set the studio_lock_drafter agent returns into the
+// nested lock.data shape compileStillPrompt() actually reads (see its own
+// field reads above: d.wardrobe_variants?.default, not a flat
+// wardrobe_default -- the flat shape is just easier for the model to fill
+// reliably). Drops null/empty fields entirely rather than writing them out
+// as null, so a lock created from a thin description stays honestly thin
+// instead of carrying a wall of nulls into stored data.
+function reshapeLockDraft(fields) {
+  const f = fields ?? {};
+  const data = {};
+  const direct = ['name', 'apparent_age', 'silhouette', 'face', 'hair', 'style_summary',
+    'motion_grammar', 'architecture', 'palette', 'time', 'weather', 'material', 'color',
+    'wear', 'scale_reference'];
+  for (const key of direct) {
+    if (f[key] != null && String(f[key]).trim() !== '') data[key] = f[key];
+  }
+  if (f.wardrobe_default != null && String(f.wardrobe_default).trim() !== '') {
+    data.wardrobe_variants = { default: f.wardrobe_default };
+  }
+  if (Array.isArray(f.forbidden_drift) && f.forbidden_drift.length) {
+    data.forbidden_drift = f.forbidden_drift;
+  }
+  return data;
 }
 
 // ===========================================================================
@@ -590,6 +618,29 @@ export default async function routes(app) {
     const r = await q(`SELECT * FROM studio.locks WHERE project_id=$1 AND is_active ORDER BY entity_type, entity_code`,
       [req.params.id]);
     return { items: r.rows };
+  });
+
+  // AI-assisted lock intake (18 Aug 2026): turns a free-text description a
+  // non-technical person can actually write into the structured fields a
+  // lock needs, via the studio_lock_drafter agent (gateway.mjs). Nothing
+  // is saved here -- this returns a draft `data` object for the New lock
+  // form to show and let the human edit before POSTing the actual lock, so
+  // the deterministic prompt compiler downstream still only ever sees
+  // reviewed, structured data, never a raw model output. Gated on
+  // studio.write, same as creating the lock itself, since this doesn't
+  // touch paid image/video generation (that's studio.generate); the
+  // org-wide daily AI text-spend cap in invokeAgent() still applies.
+  app.post('/studio/locks/draft', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const { entity_type, free_text } = req.body ?? {};
+    if (!entity_type || !LOCK_ENTITY_TYPES.includes(entity_type)) {
+      return reply.code(422).send(err(422, 'VALIDATION', `entity_type must be one of ${LOCK_ENTITY_TYPES.join(', ')}`));
+    }
+    if (!free_text || !String(free_text).trim()) {
+      return reply.code(422).send(err(422, 'VALIDATION', 'free_text is required'));
+    }
+    const out = await invokeAgent('studio_lock_drafter', { entity_type, free_text },
+      { objectType: 'STUDIO_LOCK_DRAFT', workflowCode: 'studio' });
+    return { data: reshapeLockDraft(out.fields), clarifying_note: out.clarifying_note ?? null };
   });
 
   // Creates the NEXT version of a lock. Approving a new version does not

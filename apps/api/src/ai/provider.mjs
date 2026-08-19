@@ -378,6 +378,36 @@ export class MockAIProvider extends BaseProvider {
   }
 
   agent_content_recommender(ctx) { return this.agent_editorial_analyst(ctx); }
+
+  // Deterministic stand-in for studio_lock_drafter (18 Aug 2026): simple
+  // keyword/regex extraction, not real language understanding -- good
+  // enough to prove the endpoint's validation/reshape/response plumbing
+  // works offline, not a stand-in for real draft quality (that only a real
+  // model call can demonstrate).
+  agent_studio_lock_drafter(ctx) {
+    const text = String(ctx.free_text ?? '');
+    const type = ctx.entity_type;
+    const grab = (re) => { const m = text.match(re); return m ? m[1].trim() : null; };
+    const fields = {};
+    if (type === 'CHARACTER') {
+      fields.name = grab(/\b([A-Z][a-z]{1,20})\b/);
+      fields.apparent_age = grab(/\b((?:late|early|mid)?\s?\d{1,2}0s|\d{1,2}\s?years?\s?old)\b/i);
+      fields.hair = grab(/([a-z-]+ hair)\b/i);
+      fields.wardrobe_default = grab(/(?:wearing|in) ([a-z ,.'-]+?)(?:\.|,| with|$)/i);
+    } else if (type === 'STYLE') {
+      fields.style_summary = text.trim() ? text.slice(0, 160) : null;
+    } else if (type === 'ENVIRONMENT') {
+      fields.architecture = text.trim() ? text.slice(0, 160) : null;
+    } else if (type === 'PROP') {
+      fields.material = grab(/\b(leather|wood|metal|plastic|glass|fabric|paper)\b/i);
+      fields.color = grab(/\b(red|blue|green|yellow|black|white|brown|ochre|teal|grey|gray)\b/i);
+    }
+    const neg = grab(/\bno ([a-z ]+?)(?:\.|,|$)/i);
+    fields.forbidden_drift = neg ? [`no ${neg}`] : [];
+    const filled = Object.entries(fields).some(([k, v]) => k !== 'forbidden_drift' && v);
+    return { fields, clarifying_note: filled ? null :
+      'MOCK mode: free_text did not match anything the mock drafter recognizes; a real model call would do better than this keyword stand-in.' };
+  }
 }
 
 // ---------- Anthropic ----------

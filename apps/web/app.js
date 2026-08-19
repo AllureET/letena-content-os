@@ -454,6 +454,36 @@ const STUDIO_FORMATS = [
   { value: 'promo', label: 'Promo', desc: 'Announces or launches something -- a service, an event, a new offering.' },
 ];
 
+// Continuity lock catalog (18 Aug 2026). A "lock" is Video Studio's term
+// for a reusable, versioned description of something that has to look the
+// same across every shot it appears in -- a character's face and outfit, a
+// location's colors, the overall visual style. Locks are read by
+// compileStillPrompt() (apps/api/src/modules/studio.mjs) into the exact
+// image-generation prompt, so the field names below are not just help
+// text: they match what that function actually reads for each entity
+// type. Getting them right in the JSON is what makes the generated
+// reference image match.
+const LOCK_LEVELS = [
+  { value: 'L1_ENTITY', label: 'Entity (a character, place, or object)', desc: 'The one you’ll use almost every time: a specific character, environment, or prop that needs to look the same in every shot it’s in.' },
+  { value: 'L0_PROJECT', label: 'Project-wide style', desc: 'Rules for the whole project at once: overall look, medium, palette. Usually just one of these per project (Entity type: STYLE).' },
+  { value: 'L2_STATE', label: 'A state change mid-story', desc: 'Something that changes partway through, like a wardrobe change, an injury, or a shift from day to night.' },
+  { value: 'L3_SEQUENCE', label: 'Sequence continuity', desc: 'Which way is screen-left/right, eyelines, geography across a run of shots. Rarely needed for a short piece.' },
+];
+const LOCK_ENTITY_TYPES = [
+  { value: 'CHARACTER', label: 'Character',
+    desc: 'A recurring person or character, so they look the same in every shot.',
+    example: '{\n  "name": "Maya",\n  "apparent_age": "late 20s",\n  "silhouette": "tall, narrow shoulders",\n  "face": "oval face, dark eyes",\n  "hair": "chin-length black bob",\n  "wardrobe_variants": { "default": "ochre field jacket" },\n  "forbidden_drift": ["no earrings"]\n}' },
+  { value: 'STYLE', label: 'Style',
+    desc: 'The overall look of the project: illustration style, palette, how things move.',
+    example: '{\n  "style_summary": "warm gouache illustration, soft edges",\n  "motion_grammar": "gentle, grounded"\n}' },
+  { value: 'ENVIRONMENT', label: 'Environment',
+    desc: 'A recurring location: its architecture, colors, time of day, weather.',
+    example: '{\n  "architecture": "small clinic waiting room",\n  "palette": "warm neutrals",\n  "time": "late afternoon",\n  "weather": "clear"\n}' },
+  { value: 'PROP', label: 'Prop',
+    desc: 'A recurring object that needs to look consistent: its material, color, wear, scale.',
+    example: '{\n  "material": "worn leather",\n  "color": "deep brown",\n  "wear": "scuffed edges",\n  "scale_reference": "fits in one hand"\n}' },
+];
+
 // ---------- screens ----------
 const screens = {
   // Today and Board, merged (15 Aug 2026): tiles as a compact strip up top,
@@ -1453,29 +1483,35 @@ const screens = {
       </div>`).join('') : '<div class="card empty">No locks yet.</div>';
 
     const newLockHtml = can('studio.write') ? `<div class="card"><div class="eyebrow">New lock</div>
+      <div class="sub" style="margin-top:-4px;margin-bottom:10px">A lock is a reusable description of something that has to look the same in every shot -- a character, a place, an object, or the project's overall style. Create one for each recurring element before generating shots that use it.</div>
       <div class="grid2">
         <div>
-          <label>Level</label><select id="st-lock-level">
-            <option value="L0_PROJECT">L0_PROJECT</option>
-            <option value="L1_ENTITY" selected>L1_ENTITY</option>
-            <option value="L2_STATE">L2_STATE</option>
-            <option value="L3_SEQUENCE">L3_SEQUENCE</option></select>
+          <label>What kind of lock</label><select id="st-lock-level">
+            ${LOCK_LEVELS.map(v => `<option value="${esc(v.value)}"${v.value === 'L1_ENTITY' ? ' selected' : ''}>${esc(v.label)}</option>`).join('')}
+          </select>
+          <div class="muted" id="st-lock-level-desc" style="font-size:12px;margin-top:2px;margin-bottom:8px">${esc(LOCK_LEVELS.find(v => v.value === 'L1_ENTITY').desc)}</div>
           <label>Entity type</label><select id="st-lock-entitytype">
-            <option value="STYLE">STYLE</option>
-            <option value="CHARACTER" selected>CHARACTER</option>
-            <option value="ENVIRONMENT">ENVIRONMENT</option>
-            <option value="PROP">PROP</option></select>
+            ${LOCK_ENTITY_TYPES.map(v => `<option value="${esc(v.value)}"${v.value === 'CHARACTER' ? ' selected' : ''}>${esc(v.label)}</option>`).join('')}
+          </select>
+          <div class="muted" id="st-lock-entitytype-desc" style="font-size:12px;margin-top:2px;margin-bottom:8px">${esc(LOCK_ENTITY_TYPES.find(v => v.value === 'CHARACTER').desc)}</div>
           <label>Entity code</label><input id="st-lock-entitycode" placeholder="e.g. CHR-MAYA">
+          <div class="muted" style="font-size:12px;margin-top:2px">A short ID you make up, so shots can reference this lock. Reuse the same code every time this same character/place/object needs a shot.</div>
         </div>
         <div>
-          <label>Lock data (JSON)</label>
-          <textarea id="st-lock-data" placeholder='{"description": "Maya, 24, braided hair, yellow scarf"}'></textarea>
+          <label>Describe it in your own words</label>
+          <div class="muted" style="font-size:12px;margin-bottom:4px">Write what you'd tell someone on the phone -- who or what it is, what it looks like, anything it should never have. AI drafts the fields below from this; you review and fix anything before creating the lock.</div>
+          <textarea id="st-lock-freetext" placeholder="e.g. Maya is a woman in her late 20s, chin-length black bob, wearing an ochre field jacket. No earrings."></textarea>
+          <button style="margin-top:6px" data-stlockdraft="1">Draft with AI</button>
+          <div class="claimrow" id="st-lock-draftnote" hidden style="margin-top:8px;font-size:12px"></div>
+          <label style="margin-top:12px;display:block">Lock data (JSON)</label>
+          <div class="muted" style="font-size:12px;margin-bottom:4px">Filled in automatically by Draft with AI, or write it yourself. These are the exact fields read when building the generation prompt -- edit anything that isn't right before creating the lock.</div>
+          <textarea id="st-lock-data" placeholder="${esc(LOCK_ENTITY_TYPES.find(v => v.value === 'CHARACTER').example)}"></textarea>
         </div>
       </div>
       <div style="margin-top:12px"><button class="primary" data-stlockcreate="${esc(id)}">Create lock</button></div>
     </div>` : '';
 
-    const acceptedMark = (s) => s.has_accepted_asset
+    const acceptedMark = (s) => s.accepted_asset_id
       ? '<span style="color:var(--risk-routine);font-weight:600">&check; accepted</span>'
       : '<span class="muted">&mdash;</span>';
     const shotsHtml = shots.length ? `<div class="card"><table>
@@ -2718,6 +2754,25 @@ document.addEventListener('change', (e) => {
     if (desc) desc.textContent = STUDIO_FORMATS.find(f => f.value === t.value)?.desc ?? '';
     return;
   }
+  // Same in-place update for the New lock form's two explainer lines, plus
+  // the JSON textarea's placeholder example, which changes per entity type
+  // since compileStillPrompt() reads different fields for a CHARACTER vs
+  // an ENVIRONMENT vs a PROP vs the project-wide STYLE lock. Placeholder
+  // only, never the textarea's actual value, so nothing already typed is
+  // ever overwritten.
+  if (t.id === 'st-lock-level') {
+    const desc = document.getElementById('st-lock-level-desc');
+    if (desc) desc.textContent = LOCK_LEVELS.find(v => v.value === t.value)?.desc ?? '';
+    return;
+  }
+  if (t.id === 'st-lock-entitytype') {
+    const desc = document.getElementById('st-lock-entitytype-desc');
+    const entry = LOCK_ENTITY_TYPES.find(v => v.value === t.value);
+    if (desc) desc.textContent = entry?.desc ?? '';
+    const data = document.getElementById('st-lock-data');
+    if (data && entry) data.placeholder = entry.example;
+    return;
+  }
   if (t.id === 'mk-card') { MAKE.cardId = t.value; return render(); }
   if (t.name === 'mk-aud') { MAKE.audience = t.value; return render(); }
   if (t.name === 'mk-path') { MAKE.path = t.value; return render(); }
@@ -3003,10 +3058,35 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
+    if (b.dataset.stlockdraft) {
+      const freeText = elv('st-lock-freetext')?.trim();
+      if (!freeText) return toast('Describe it first, then Draft with AI.', 'warn');
+      const entityType = elv('st-lock-entitytype');
+      const note = document.getElementById('st-lock-draftnote');
+      b.disabled = true; b.textContent = 'Drafting…';
+      try {
+        const r = await api('POST', '/studio/locks/draft', { entity_type: entityType, free_text: freeText });
+        const dataBox = document.getElementById('st-lock-data');
+        if (dataBox) dataBox.value = JSON.stringify(r.data, null, 2);
+        if (note) {
+          if (r.clarifying_note) {
+            note.hidden = false; note.textContent = r.clarifying_note;
+          } else {
+            note.hidden = true; note.textContent = '';
+          }
+        }
+        const hasFields = Object.keys(r.data ?? {}).length > 0;
+        if (hasFields) toast('Draft filled in below -- review before creating the lock.');
+        else toast('Not enough in that description to draft anything -- try adding more detail.', 'warn');
+      } finally {
+        b.disabled = false; b.textContent = 'Draft with AI';
+      }
+      return;
+    }
     if (b.id === 'st-newproj-go') {
       const title = elv('st-title')?.trim();
       if (!title) return toast('Give the project a title first.', 'warn');

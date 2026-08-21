@@ -132,6 +132,31 @@ test('a draft shot deletes along with the images made for it', async () => {
   assert.equal(await one(`SELECT id FROM studio.shots WHERE id=$1`, [shot.id]), null);
 });
 
+test('an environment reference is generated as an empty room', () => {
+  const p = compileStillPrompt({ entity_type: 'ENVIRONMENT', entity_code: 'ENV-T',
+    data: { architecture: 'a consulting room' } });
+  assert.match(p, /\[EMPTY ROOM\]/);
+  assert.match(p, /No people/,
+    'left unsaid the model puts someone in the chair, and that reference then conditions every composed frame');
+});
+
+test('a character reference is NOT told the room is empty', () => {
+  const p = compileStillPrompt({ entity_type: 'CHARACTER', entity_code: 'CHR-T', data: { name: 'T' } });
+  assert.ok(!p.includes('[EMPTY ROOM]'), 'the rule is about places, and a character lock is a person');
+});
+
+test('a shot whose render failed can be deleted even though it never left NEEDS_REVIEW', async () => {
+  // The exact trap this replaced: no video to reject, wrong status to
+  // delete, so the shot could not be removed at all.
+  const shot = (await call('POST', `/studio/projects/${projectId}/shots`,
+    { shot_code: 'SH-STUCK', order_index: 8, duration_target_s: 5, story: { beat: 'stuck' },
+      generation: { mode_preference: 'text_to_video' } })).json();
+  await q(`UPDATE studio.shots SET status='NEEDS_REVIEW' WHERE id=$1`, [shot.id]);
+  const r = await call('DELETE', `/studio/shots/${shot.id}`);
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(await one(`SELECT id FROM studio.shots WHERE id=$1`, [shot.id]), null);
+});
+
 test('a shot holding an accepted video is not deletable', async () => {
   const shot = (await call('POST', `/studio/projects/${projectId}/shots`,
     { shot_code: 'SH-KEEP', order_index: 2, duration_target_s: 5, story: { beat: 'keep' },
@@ -140,7 +165,7 @@ test('a shot holding an accepted video is not deletable', async () => {
   await call('POST', `/studio/assets/${a.id}/accept`, {});
   const r = await call('DELETE', `/studio/shots/${shot.id}`);
   assert.equal(r.statusCode, 422);
-  assert.equal(r.json().guard, 'shotNotDraft');
+  assert.equal(r.json().guard, 'shotAccepted');
 });
 
 test('clearing rejected takes removes them and reports anything it kept', async () => {

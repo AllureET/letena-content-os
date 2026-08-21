@@ -223,6 +223,13 @@ export function compileStillPrompt(lock) {
     if (d.wardrobe_variants?.default) lines.push(`[WARDROBE] ${d.wardrobe_variants.default}`);
   } else if (lock.entity_type === 'ENVIRONMENT') {
     lines.push(`[ENVIRONMENT] ${[d.architecture, d.palette, d.time, d.weather].filter(Boolean).join('; ')}`);
+    // An environment reference is a picture of a PLACE. Left unsaid, the
+    // model puts someone in it -- the first clean consulting room came back
+    // with a man sitting in the doctor's chair -- and that reference then
+    // conditions every composed frame, quietly pulling the presenter's
+    // identity toward a stranger. The room has to be empty for the lock to
+    // mean what it says.
+    lines.push('[EMPTY ROOM] Nobody is in this room. No people, no figures, no reflections of people. Furniture, objects and light only.');
   } else if (lock.entity_type === 'PROP') {
     lines.push(`[PROP] ${[d.material, d.color, d.wear, d.scale_reference].filter(Boolean).join('; ')}`);
   }
@@ -2652,14 +2659,18 @@ export default async function routes(app) {
   app.delete('/studio/shots/:shotId', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
     const shot = await one(`SELECT * FROM studio.shots WHERE id=$1`, [req.params.shotId]);
     if (!shot) return reply.code(404).send(err(404, 'NOT_FOUND', 'shot not found'));
-    if (!['DRAFT', 'STALE'].includes(shot.status)) {
+    // Only one thing makes a shot undeletable: it is part of the cut. The
+    // first version of this guard also demanded DRAFT or STALE, which read
+    // as caution and behaved as a trap -- a shot whose every render failed
+    // sat in NEEDS_REVIEW with no video, so it could not be deleted (wrong
+    // status) and could not be rejected either (no asset to reject). That
+    // is exactly the shot someone wants gone. The real protections are
+    // below and they do not depend on status: nothing accepted, nothing
+    // continuing from it, and none of its images in use elsewhere.
+    if (shot.status === 'ACCEPTED' || shot.accepted_asset_id) {
       return reply.code(422).send(err(422, 'GUARD_FAILED',
-        `${shot.shot_code} is ${shot.status}. Only a shot still in draft can be deleted; reject its video first if you want it gone.`,
-        { guard: 'shotNotDraft' }));
-    }
-    if (shot.accepted_asset_id) {
-      return reply.code(422).send(err(422, 'GUARD_FAILED',
-        `${shot.shot_code} has an accepted video and is part of the cut.`, { guard: 'shotAccepted' }));
+        `${shot.shot_code} has an accepted video and is part of the cut. Reject that video first if you want the shot gone.`,
+        { guard: 'shotAccepted' }));
     }
     const dependent = await one(
       `SELECT shot_code FROM studio.shots WHERE project_id=$1 AND generation->>'continued_from_shot_id' = $2::text

@@ -24,6 +24,7 @@ process.env.LCOS_STORAGE_DIR = '/tmp/lcos-libbridge-test-storage';
 const { buildServer } = await import('../src/server.mjs');
 const { pool, q, one } = await import('../src/core.mjs');
 
+const RUN_STARTED_AT = new Date();
 let app, token;
 const login = async (email) => (await app.inject({ method: 'POST', url: '/api/v1/auth/login',
   payload: { email, password: 'letena-dev-2026' } })).json().token;
@@ -34,7 +35,33 @@ before(async () => {
   app = await buildServer();
   token = await login('producer@letena.local');
 });
-after(async () => { await app.close(); await pool.end(); });
+// Test hygiene (21 Aug 2026): these tests bridge assets into lcos.assets,
+// the SHARED content library, and the local test database persists between
+// runs. Left alone they accumulate a few BACKGROUND/CHARACTER_REFERENCE
+// rows per run forever, and GET /production/assets is ORDER BY created_at
+// DESC LIMIT 200 -- so after enough runs they push older fixtures out of
+// that window and break an unrelated test (part2_flow's library filter
+// assertion, which is how this was noticed). Removing exactly the rows
+// this file created keeps the shared library stable for every other test.
+// studio.assets.library_asset_id has an FK to lcos.assets, so the mirror
+// pointer is cleared before the delete.
+async function cleanupBridgedAssets(codes) {
+  if (!codes.length) return;
+  await q(`UPDATE studio.assets SET library_asset_id = NULL
+           WHERE library_asset_id IN (SELECT id FROM lcos.assets WHERE code = ANY($1))`, [codes]);
+  await q(`DELETE FROM lcos.asset_tags WHERE asset_id IN (SELECT id FROM lcos.assets WHERE code = ANY($1))`, [codes]);
+  await q(`DELETE FROM lcos.assets WHERE code = ANY($1)`, [codes]);
+}
+
+after(async () => {
+  // Every row bridgeAssetToLibrary() created during this file carries the
+  // STUDIO- code prefix; scope the delete to the ones created since this
+  // run started so a concurrent run's rows are never touched.
+  const r = await q(`SELECT code FROM lcos.assets WHERE code LIKE 'STUDIO-%' AND created_at >= $1`, [RUN_STARTED_AT]);
+  await cleanupBridgedAssets(r.rows.map(x => x.code));
+  await app.close();
+  await pool.end();
+});
 
 test('generated lock reference mirrors into lcos.assets, and shows up in GET .../locks', async () => {
   const proj = (await call('POST', '/studio/projects',

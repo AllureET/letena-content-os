@@ -52,6 +52,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { q, one, audit, requirePerm, err } from '../core.mjs';
 import { storage, videoEngine, gemini, suno, azureSpeech } from '../adapters/index.mjs';
+import { cred } from '../creds.mjs';
 import { invokeAgent } from '../ai/gateway.mjs';
 import { formatOf } from '../formats.mjs';
 import { OVERLAY_KINDS, validateOverlayData, describeOverlayCollision, buildOverlayFilterGraph,
@@ -59,7 +60,22 @@ import { OVERLAY_KINDS, validateOverlayData, describeOverlayCollision, buildOver
 
 const execFileP = promisify(execFile);
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-const MOCK = () => (process.env.LCOS_ADAPTER_MODE || 'MOCK').toUpperCase() === 'MOCK';
+// MUST read the same source the adapters read (21 Aug 2026 bug, found on
+// the first real Runway generation). This used to read process.env
+// directly while adapters/index.mjs reads cred(), which is DB-first with an
+// env fallback -- and the operator sets LCOS_ADAPTER_MODE through the
+// Settings page, i.e. in the DB, not in .env on the server. So on
+// production the adapters correctly ran in PRODUCTION mode while every
+// MOCK() check in THIS file still said "we're mocked", silently:
+//   - skipping ffprobe technical QC on real generated media
+//   - skipping the Gemini continuity check on real media
+//   - writing a 1x1 placeholder instead of extracting a real last frame
+//     for shot-to-shot continuity
+//   - and worst, making assemble() emit a text placeholder file as the
+//     FINAL CUT instead of running the real ffmpeg concat + overlay burn-in
+// The first real generation looked fine (a genuine 5s Runway mp4) while its
+// QC report claimed MOCK, which is what exposed this.
+const MOCK = () => (cred('LCOS_ADAPTER_MODE') || 'MOCK').toUpperCase() === 'MOCK';
 
 // Estimated per-unit cost of each paid generation call (playbook section
 // 21's budget guardrail needs SOME number to check spend against). These

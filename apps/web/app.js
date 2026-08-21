@@ -305,7 +305,7 @@ function assetThumb(a) {
   const u = mediaUrl(a.storage_key);
   const mt = a.mime_type ?? '';
   if (!u) return `<div class="ath none">${esc(a.kind)}</div>`;
-  if (mt.startsWith('image/')) return `<img class="ath" src="${esc(u)}" alt="${esc(a.title)}" loading="lazy" onerror="assetImgError(this,'${esc(a.kind)}')">`;
+  if (mt.startsWith('image/')) return `<a href="${esc(u)}" target="_blank" rel="noopener" title="Open full size"><img class="ath" src="${esc(u)}" alt="${esc(a.title)}" loading="lazy" onerror="assetImgError(this,'${esc(a.kind)}')"></a>`;
   if (mt.startsWith('video/')) return `<video class="ath" src="${esc(u)}" muted loop playsinline preload="metadata"
     onmouseover="this.play().catch(()=>{})" onmouseout="this.pause()"></video>`;
   if (mt.startsWith('audio/')) return `<div class="ath audio">&#9835;<audio controls preload="none" src="${esc(u)}"></audio></div>`;
@@ -1672,7 +1672,17 @@ const screens = {
           <a href="${esc(mediaUrl(latestRef.storage_key))}" target="_blank" rel="noopener" title="Open full size">
             <img class="ath" style="max-width:160px;max-height:160px;border-radius:6px;display:block" src="${esc(mediaUrl(latestRef.storage_key))}" alt="${esc(l.entity_code)} reference" loading="lazy" onerror="assetImgError(this,'REFERENCE_IMAGE')">
           </a>
-          <div class="muted" style="font-size:11px;margin-top:2px">${refs.length} version${refs.length > 1 ? 's' : ''} &middot; click to view full size</div>
+          <div style="font-size:11px;margin-top:2px"><span class="pill p-APPROVED" style="font-size:10px"><span class="d"></span>current</span> <span class="muted">&middot; this is the version used for generation &middot; click it to view full size</span></div>
+          ${refs.length > 1 ? `<div class="muted" style="font-size:11px;margin-top:8px;font-weight:600">Earlier versions -- click one to view, or make it current again:</div>
+          <div class="flex" style="flex-wrap:wrap;gap:6px;margin-top:4px">
+            ${[...new Map(refs.slice(0, -1).filter(r2 => r2.storage_key !== latestRef.storage_key).map(r2 => [r2.storage_key, r2])).values()].reverse().map(r2 => `
+              <div style="text-align:center">
+                <a href="${esc(mediaUrl(r2.storage_key))}" target="_blank" rel="noopener" title="Open full size">
+                  <img class="ath" style="max-width:72px;max-height:72px;border-radius:4px;display:block" src="${esc(mediaUrl(r2.storage_key))}" alt="earlier version" loading="lazy" onerror="assetImgError(this,'REFERENCE_IMAGE')">
+                </a>
+                <button style="font-size:10px;padding:2px 6px;margin-top:2px" data-strefselect="${esc(l.id)}|${esc(r2.id)}">Make current</button>
+              </div>`).join('')}
+          </div>` : ''}
         </div>` : `<div class="muted" style="font-size:12px;margin-top:8px">No reference image yet.</div>`}
         ${can('studio.generate') ? `<div id="stlockrefpanel-${esc(l.id)}" hidden style="margin-top:10px;border-top:1px solid #e5e5e5;padding-top:10px">
           <div style="font-size:12px;font-weight:600;margin-bottom:6px">Remix with Gemini</div>
@@ -3431,7 +3441,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3543,6 +3553,12 @@ document.addEventListener('click', async (e) => {
       const [lockId, libAssetId] = b.dataset.stlockattach.split('|');
       await api('POST', `/studio/locks/${lockId}/reference/attach`, { library_asset_id: libAssetId });
       toast('Attached from the library. This is now the current reference.'); return render();
+    }
+    if (b.dataset.strefselect) {
+      const [lockId, assetId] = b.dataset.strefselect.split('|');
+      b.disabled = true; b.textContent = 'Switching…';
+      await api('POST', `/studio/locks/${lockId}/reference/select`, { asset_id: assetId });
+      toast('Switched. That version is current again.'); return render();
     }
     if (b.dataset.stlockuploadgo) {
       const lockId = b.dataset.stlockuploadgo;

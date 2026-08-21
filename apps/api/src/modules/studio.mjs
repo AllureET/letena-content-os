@@ -1376,6 +1376,33 @@ export default async function routes(app) {
     return asset;
   });
 
+  // Make an OLDER reference version this lock's current one (owner
+  // question, 21 Aug 2026: "i dont understand how to change the
+  // references"). The convention everywhere in this file is append-only /
+  // newest-wins, so "select" simply re-appends the chosen asset id --
+  // history is preserved, no rows are deleted, and every consumer that
+  // already reads "last entry wins" keeps working unchanged. Free: no
+  // generation call, no new storage.
+  app.post('/studio/locks/:lockId/reference/select', { preHandler: requirePerm('studio.generate') }, async (req, reply) => {
+    const lock = await one(`SELECT * FROM studio.locks WHERE id=$1`, [req.params.lockId]);
+    if (!lock) return reply.code(404).send(err(404, 'NOT_FOUND', 'lock not found'));
+    const assetId = req.body?.asset_id;
+    if (!assetId) return reply.code(422).send(err(422, 'VALIDATION', 'asset_id is required'));
+    if (!(lock.reference_asset_ids ?? []).includes(assetId)) {
+      return reply.code(422).send(err(422, 'VALIDATION',
+        'asset_id is not one of this lock\'s reference versions -- use /reference/attach for a library asset instead'));
+    }
+    if (lock.reference_asset_ids[lock.reference_asset_ids.length - 1] === assetId) {
+      return { ok: true, already_current: true };
+    }
+    await q(`UPDATE studio.locks SET reference_asset_ids = array_append(reference_asset_ids, $2) WHERE id=$1`,
+      [lock.id, assetId]);
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [lock.project_id, req.actor?.id ?? null, `locks/${lock.entity_code}`,
+       `re-selected an earlier reference version as current for ${lock.entity_code}`]);
+    return { ok: true, already_current: false };
+  });
+
   // Remix an existing reference/keyframe through Gemini image editing
   // (owner request, 21 Aug 2026: "recall characters and backgrounds
   // directly from the studio... and remix them"): send the SAME image back

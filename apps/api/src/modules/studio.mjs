@@ -1937,6 +1937,26 @@ export default async function routes(app) {
     for (const f of fields) {
       if (b[f] !== undefined) { sets.push(`${f}=$${i}`); vals.push(JSON.stringify(b[f])); i++; }
     }
+    // Changing which entities a shot contains has to change which locks it
+    // is authored against (21 Aug 2026). locked_lock_ids was resolved once,
+    // when the shot was created, and never again -- so moving a shot to a
+    // different environment updated the continuity block and left the shot
+    // still bound to the old lock. Everything downstream reads
+    // locked_lock_ids, not continuity: compose-first-frame builds its
+    // prompt from those locks, and STALE detection watches them. The shot
+    // would have gone on composing the old set while the screen said it
+    // was somewhere else. Same resolution the create route does, so the two
+    // cannot drift apart.
+    if (b.continuity !== undefined) {
+      const entityCodes = [
+        ...(b.continuity?.characters ?? []), b.continuity?.environment, ...(b.continuity?.props ?? []),
+      ].filter(Boolean);
+      const lockRows = entityCodes.length
+        ? (await q(`SELECT id FROM studio.locks WHERE project_id=$1 AND entity_code = ANY($2) AND is_active`,
+            [shot.project_id, entityCodes])).rows
+        : [];
+      sets.push(`locked_lock_ids=$${i}`); vals.push(lockRows.map(l => l.id)); i++;
+    }
     if (b.duration_target_s !== undefined) { sets.push(`duration_target_s=$${i}`); vals.push(b.duration_target_s); i++; }
     if (!sets.length) return shot;
     sets.push('status=\'DRAFT\'', 'updated_at=now()');
@@ -2249,7 +2269,17 @@ export default async function routes(app) {
     // the classification and retry/fallback rules it applies.
     const ladder = await runGenerationLadder({ project, actorId: req.actor?.id ?? null, engine, engineName, mode, callArgs });
     if (!ladder.success) {
-      await q(`UPDATE studio.shots SET status='NEEDS_REVIEW', updated_at=now() WHERE id=$1`, [shot.id]);
+      // Back to DRAFT, not NEEDS_REVIEW (21 Aug 2026). NEEDS_REVIEW means a
+      // person should look at what came out; when every attempt failed
+      // there is nothing to look at, and the shot was left in a state that
+      // asked for a verdict on a video that does not exist. Worse, it was a
+      // dead end: NEEDS_REVIEW cannot be edited (PATCH only touches DRAFT
+      // and STALE) and cannot be rejected (there is no asset to reject), so
+      // a shot whose render failed could not be changed and tried again
+      // without going into the database. DRAFT is the honest state -- work
+      // on this one again -- and the failure is not lost: every attempt is
+      // already written to the project timeline by the ladder.
+      await q(`UPDATE studio.shots SET status='DRAFT', updated_at=now() WHERE id=$1`, [shot.id]);
       const last = ladder.attempts[ladder.attempts.length - 1];
       // Never hide the attempt history: a human reviewing this failure
       // sees every real call the ladder tried, not just the last error.

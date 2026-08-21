@@ -122,7 +122,7 @@ test('a PROVIDER_DOWN failure skips the same-engine retry and succeeds via the f
     'provider reflects whichever engine actually produced the asset; RUNWAY is the fallback target since it is the only implemented adapter');
 });
 
-test('a POLICY failure goes straight to NEEDS_REVIEW: no retry, no fallback, exactly one real call', async (t) => {
+test('a POLICY failure stops cold and leaves the shot editable: no retry, no fallback, exactly one real call', async (t) => {
   let klingCalls = 0;
   t.mock.method(kling, 'textToVideo', async () => {
     klingCalls += 1;
@@ -148,7 +148,11 @@ test('a POLICY failure goes straight to NEEDS_REVIEW: no retry, no fallback, exa
   assert.equal(fallbackCalls, 0, 'the fallback engine is never a policy workaround');
 
   const shotAfter = await getShot(project.id, shot.id);
-  assert.equal(shotAfter.status, 'NEEDS_REVIEW');
+  // DRAFT, not NEEDS_REVIEW, since 21 Aug 2026: nothing rendered, so there
+  // is nothing for a person to review, and NEEDS_REVIEW is a state that can
+  // neither be edited nor rejected -- a shot refused on policy grounds
+  // needs its prompt changed, which DRAFT allows and NEEDS_REVIEW did not.
+  assert.equal(shotAfter.status, 'DRAFT');
 });
 
 test('total exhaustion after all 3 attempts returns 502 with the full attempts array', async (t) => {
@@ -184,7 +188,10 @@ test('total exhaustion after all 3 attempts returns 502 with the full attempts a
   assert.equal(body.attempts[2].error_class, 'PROVIDER_DOWN');
 
   const shotAfter = await getShot(project.id, shot.id);
-  assert.equal(shotAfter.status, 'NEEDS_REVIEW');
+  // Same rule as the POLICY case above: every attempt failed, so the shot
+  // goes back to DRAFT where it can be changed and tried again. The three
+  // attempts are still on the project timeline.
+  assert.equal(shotAfter.status, 'DRAFT');
 });
 
 // 21 Aug 2026: RUNWAY is both the default engine and the fallback target,

@@ -1643,7 +1643,21 @@ const screens = {
       <div id="st-brief-draftbox" hidden style="margin-top:12px"></div>
     </div>` : '';
 
-    const locksHtml = locks.length ? locks.map(l => `<div class="card" style="margin-bottom:8px">
+    // Reference thumbnails + remix/library/upload (21 Aug 2026): before this,
+    // a lock's generated reference image was invisible anywhere in the UI --
+    // the only signal was the text "has reference image". This renders the
+    // newest version (reference_assets is already ordered oldest-first by
+    // the API, so .at(-1) is the current one) as an actual thumbnail, links
+    // it to the full-size file for a real preview, and adds the three ways
+    // to get a new reference version onto this lock without necessarily
+    // paying for a from-scratch Gemini generation: remix the current image
+    // through Gemini with a new instruction, pick an existing image from the
+    // library, or upload one of your own.
+    const locksHtml = locks.length ? locks.map(l => {
+      const refs = l.reference_assets ?? [];
+      const latestRef = refs.length ? refs[refs.length - 1] : null;
+      const libKind = l.entity_type === 'CHARACTER' ? 'CHARACTER_REFERENCE' : l.entity_type === 'ENVIRONMENT' ? 'BACKGROUND' : null;
+      return `<div class="card" style="margin-bottom:8px">
         <div class="flex">
           <span class="mono">${esc(l.entity_type)} &middot; ${esc(l.entity_code)}</span>
           <span class="muted">v${esc(String(l.version ?? 1))}</span>
@@ -1652,8 +1666,32 @@ const screens = {
           <span class="spacer"></span>
           ${can('studio.approve') && !l.approved_at ? `<button class="approve" data-stlockapprove="${esc(l.id)}">Approve</button>` : ''}
           ${can('studio.generate') ? `<button data-stlockref="${esc(l.id)}">Generate reference image</button>` : ''}
+          ${can('studio.generate') ? `<button data-stlockreftoggle="${esc(l.id)}">Reference tools</button>` : ''}
         </div>
-      </div>`).join('') : '<div class="card empty">No locks yet.</div>';
+        ${latestRef ? `<div style="margin-top:8px">
+          <a href="${esc(mediaUrl(latestRef.storage_key))}" target="_blank" rel="noopener" title="Open full size">
+            <img class="ath" style="max-width:160px;max-height:160px;border-radius:6px;display:block" src="${esc(mediaUrl(latestRef.storage_key))}" alt="${esc(l.entity_code)} reference" loading="lazy" onerror="assetImgError(this,'REFERENCE_IMAGE')">
+          </a>
+          <div class="muted" style="font-size:11px;margin-top:2px">${refs.length} version${refs.length > 1 ? 's' : ''} &middot; click to view full size</div>
+        </div>` : `<div class="muted" style="font-size:12px;margin-top:8px">No reference image yet.</div>`}
+        ${can('studio.generate') ? `<div id="stlockrefpanel-${esc(l.id)}" hidden style="margin-top:10px;border-top:1px solid #e5e5e5;padding-top:10px">
+          <div style="font-size:12px;font-weight:600;margin-bottom:6px">Remix with Gemini</div>
+          <div class="muted" style="font-size:11px;margin-bottom:4px">Sends the current reference image back to Gemini with a new instruction (e.g. "add glasses", "same doctor, evening lighting") instead of generating from scratch. Becomes the new current version; the old one stays in history.</div>
+          <div class="flex" style="gap:6px">
+            <input id="stremixprompt-${esc(l.id)}" placeholder="e.g. same doctor, add glasses" style="flex:1" ${latestRef ? '' : 'disabled'}>
+            <button data-stlockremix="${esc(l.id)}" data-stlockremixasset="${latestRef ? esc(latestRef.id) : ''}" ${latestRef ? '' : 'disabled title="Generate a reference image first"'}>Remix</button>
+          </div>
+          ${libKind ? `<div style="font-size:12px;font-weight:600;margin:12px 0 4px">Pick from the library</div>
+            <button data-stlocklibopen="${esc(l.id)}|${esc(l.entity_type)}">Browse ${libKind === 'CHARACTER_REFERENCE' ? 'character references' : 'backgrounds'}</button>
+            <div id="stlocklibbox-${esc(l.id)}" hidden style="margin-top:8px"></div>` : ''}
+          <div style="font-size:12px;font-weight:600;margin:12px 0 4px">Upload your own</div>
+          <div class="flex" style="gap:6px">
+            <input type="file" id="stlockuploadfile-${esc(l.id)}" accept="image/*">
+            <button data-stlockuploadgo="${esc(l.id)}">Upload as reference</button>
+          </div>
+        </div>` : ''}
+      </div>`;
+    }).join('') : '<div class="card empty">No locks yet.</div>';
 
     const newLockHtml = can('studio.write') ? `<div class="card"><div class="eyebrow">New lock</div>
       <div class="sub" style="margin-top:-4px;margin-bottom:10px">A lock is a reusable description of something that has to look the same in every shot -- a character, a place, an object, or the project's overall style. Create one for each recurring element before generating shots that use it.</div>
@@ -1728,6 +1766,40 @@ const screens = {
       </div>`;
     };
 
+    // Continue from the shot before this one (owner request, 21 Aug 2026:
+    // reproduce Kling's "last frame becomes the next first frame" so
+    // shots visually flow together, provider-agnostically -- works the
+    // same whether the accepted video came from Kling, Runway, or VEO).
+    // Sibling of composeStepHtml above, same "sits above Generate, never
+    // replaces it" discipline. prevShotFor looks at THIS render's own
+    // shots list rather than a fresh request, since order_index is always
+    // already loaded here.
+    const prevShotFor = (s) => {
+      const earlier = shots.filter(o => Number(o.order_index ?? 0) < Number(s.order_index ?? 0));
+      if (!earlier.length) return null;
+      return earlier.reduce((a, b) => (Number(b.order_index) > Number(a.order_index) ? b : a));
+    };
+    const continueStepHtml = (s) => {
+      if (!can('studio.generate')) return '';
+      const prev = prevShotFor(s);
+      const ready = !!(prev && prev.accepted_asset_id);
+      const already = s.generation?.continued_from_shot_id;
+      return `<div class="claimrow" style="margin-bottom:8px">
+        <div style="font-size:11px;font-weight:600;margin-bottom:2px">Continue from previous shot (optional)</div>
+        <div style="font-size:11px;margin-top:2px">${prev
+          ? `Previous shot: <span class="mono">${esc(prev.shot_code)}</span> &middot; ${prev.accepted_asset_id
+              ? '<span style="color:var(--risk-routine)">has an accepted video</span>'
+              : '<span style="color:var(--risk-mod)">no accepted video yet</span>'}`
+          : '<span class="muted">this is the first shot &mdash; nothing before it to continue from</span>'}</div>
+        <button style="margin-top:6px" ${ready ? '' : 'disabled'} title="${ready
+          ? `Pull ${esc(prev.shot_code)}&#39;s accepted video&#39;s last frame as this shot&#39;s first frame, so the two shots flow together`
+          : (prev ? `Accept ${esc(prev.shot_code)}&#39;s generated video first` : 'No earlier shot in this project')}"
+          data-stshotcontinue="${esc(s.id)}">Continue from previous shot</button>
+        ${already ? `<div class="muted" style="font-size:11px;margin-top:4px">&check; continuing from a prior shot's last frame -- Generate below will use it.</div>` : ''}
+        <div id="stcontinuebox-${esc(s.id)}"></div>
+      </div>`;
+    };
+
     const shotsHtml = shots.length ? `<div class="card"><table>
       <tr><th>Shot</th><th>Beat</th><th>Status</th><th>Duration (s)</th><th>Asset</th><th></th></tr>
       ${shots.map(s => {
@@ -1741,6 +1813,7 @@ const screens = {
           <td>${acceptedMark(s)}</td>
           <td style="min-width:220px">
             ${composeStepHtml(s)}
+            ${continueStepHtml(s)}
             <div class="flex" style="flex-wrap:wrap">
               ${can('studio.generate') ? `<button data-stshotgenerate="${esc(s.id)}">Generate</button>` : ''}
               ${can('studio.generate') ? `<button data-stshotvoiceshow="${esc(s.id)}">Add voice</button>` : ''}
@@ -3358,7 +3431,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3425,6 +3498,62 @@ document.addEventListener('click', async (e) => {
       await api('POST', `/studio/locks/${b.dataset.stlockref}/reference`, {});
       toast('Reference image generated'); return render();
     }
+    if (b.dataset.stlockreftoggle) {
+      const panel = document.getElementById(`stlockrefpanel-${b.dataset.stlockreftoggle}`);
+      if (panel) panel.hidden = !panel.hidden;
+      return;
+    }
+    if (b.dataset.stlockremix) {
+      const lockId = b.dataset.stlockremix;
+      const prompt = elv(`stremixprompt-${lockId}`)?.trim();
+      if (!prompt) return toast('Describe the change first.', 'warn');
+      // The button only knows the LOCK id; the newest reference asset id
+      // for that lock is read back off the current render's own lock data
+      // via the panel's data, set below when the lock list was built.
+      const assetId = b.dataset.stlockremixasset;
+      if (!assetId) return toast('No reference image to remix yet.', 'warn');
+      b.disabled = true; b.textContent = 'Remixing…';
+      await api('POST', `/studio/assets/${assetId}/remix`, { prompt });
+      toast('Remixed. This is now the current reference.'); return render();
+    }
+    if (b.dataset.stlocklibopen) {
+      const [lockId, entityType] = b.dataset.stlocklibopen.split('|');
+      const box = document.getElementById(`stlocklibbox-${lockId}`);
+      if (!box) return;
+      if (box.dataset.loaded) { box.hidden = !box.hidden; return; }
+      box.hidden = false;
+      box.innerHTML = '<div class="muted" style="font-size:12px">Loading…</div>';
+      try {
+        const r = await api('GET', `/studio/locks/library-candidates?entity_type=${encodeURIComponent(entityType)}`);
+        const items = r.items ?? [];
+        box.innerHTML = items.length
+          ? `<div class="flex" style="flex-wrap:wrap;gap:8px">${items.map(a => `
+            <div style="text-align:center">
+              <img class="ath" style="max-width:90px;max-height:90px;border-radius:4px;cursor:pointer" src="${esc(mediaUrl(a.storage_key))}" alt="${esc(a.title)}" loading="lazy" onerror="assetImgError(this,'CHARACTER_REFERENCE')" data-stlockattach="${esc(lockId)}|${esc(a.id)}">
+              <div class="muted" style="font-size:10px;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.title)}</div>
+            </div>`).join('')}</div>`
+          : '<div class="muted" style="font-size:12px">Nothing in the library yet for this kind.</div>';
+        box.dataset.loaded = '1';
+      } catch (ex) {
+        box.innerHTML = `<div class="muted" style="font-size:12px">${esc(ex.message)}</div>`;
+      }
+      return;
+    }
+    if (b.dataset.stlockattach) {
+      const [lockId, libAssetId] = b.dataset.stlockattach.split('|');
+      await api('POST', `/studio/locks/${lockId}/reference/attach`, { library_asset_id: libAssetId });
+      toast('Attached from the library. This is now the current reference.'); return render();
+    }
+    if (b.dataset.stlockuploadgo) {
+      const lockId = b.dataset.stlockuploadgo;
+      const file = document.getElementById(`stlockuploadfile-${lockId}`)?.files?.[0];
+      if (!file) return toast('Choose an image file first.', 'warn');
+      if (file.size > 8 * 1024 * 1024) return toast('Uploads are capped at 8MB.', 'warn');
+      b.disabled = true; b.textContent = 'Uploading…';
+      await api('POST', `/studio/locks/${lockId}/reference/upload`,
+        { image_base64: await fileB64(file), mime_type: file.type || 'image/png' });
+      toast('Uploaded. This is now the current reference.'); return render();
+    }
     if (b.dataset.stshotcreate) {
       const projectId = b.dataset.stshotcreate;
       const shotCode = elv('st-shot-code')?.trim();
@@ -3478,6 +3607,39 @@ document.addEventListener('click', async (e) => {
         b.disabled = false; b.textContent = 'Step 3 · Compose first frame';
       }
       return;
+    }
+    if (b.dataset.stshotcontinue) {
+      const id = b.dataset.stshotcontinue;
+      const box = document.getElementById(`stcontinuebox-${id}`);
+      b.disabled = true; b.textContent = 'Pulling last frame…';
+      try {
+        const r = await api('POST', `/studio/shots/${id}/continue-from-previous`, {});
+        if (box) {
+          box.innerHTML = `<div class="claimrow" style="margin-top:8px">
+            <div style="font-size:12px"><b>&check; Continuing from ${esc(r.continued_from?.shot_code ?? '')}</b>.
+              This shot is now set to image_to_video mode using that shot's last frame -- click Generate below to render the video from it.</div>
+            <img class="ath" style="margin-top:6px;max-width:200px" src="${esc(mediaUrl(r.asset?.storage_key))}"
+              alt="continuity frame" loading="lazy" onerror="assetImgError(this,'KEYFRAME')">
+            <div style="margin-top:6px">
+              <label style="font-size:11px">Remix this frame before generating (optional)</label>
+              <textarea id="stcontinueremixprompt-${esc(r.asset.id)}" style="font-size:12px;width:100%" placeholder="e.g. same room, slightly warmer light"></textarea>
+              <button style="margin-top:4px" data-stcontinueremix="${esc(r.asset.id)}">Remix</button>
+            </div>
+          </div>`;
+        }
+        toast(`Continuing from ${r.continued_from?.shot_code ?? 'the previous shot'}.`);
+      } finally {
+        b.disabled = false; b.textContent = 'Continue from previous shot';
+      }
+      return;
+    }
+    if (b.dataset.stcontinueremix) {
+      const assetId = b.dataset.stcontinueremix;
+      const prompt = elv(`stcontinueremixprompt-${assetId}`)?.trim();
+      if (!prompt) return toast('Describe the change first.', 'warn');
+      b.disabled = true; b.textContent = 'Remixing…';
+      await api('POST', `/studio/assets/${assetId}/remix`, { prompt });
+      toast('Remixed. The shot now uses the remixed frame.'); return render();
     }
     if (b.dataset.stshotgenerate) {
       const id = b.dataset.stshotgenerate;

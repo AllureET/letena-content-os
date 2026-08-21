@@ -195,9 +195,21 @@ export const gemini = {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${need('GEMINI_API_KEY')}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts }] }),
+      // responseModalities (21 Aug 2026 fix): without this, a request that
+      // hands the model one or more existing images alongside the prompt
+      // (composition, remix) came back 400 in production -- confirmed live
+      // against the real API, not a guess. A pure text->image call (zero
+      // reference images) happened to work without it, which is why this
+      // was missed until compose-first-frame exercised the multi-image
+      // path for the first time. Both TEXT and IMAGE are requested because
+      // Gemini's image models normally return a short caption alongside
+      // the image; asking for IMAGE alone is rejected by some API versions.
+      body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } }),
     });
-    if (!res.ok) throw new Error(`gemini ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`gemini ${res.status}${body ? `: ${body.slice(0, 500)}` : ''}`);
+    }
     const d = await res.json();
     const b64 = d.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
     if (!b64) throw new Error('gemini returned no image');

@@ -79,7 +79,61 @@ const ESTIMATED_COST_USD = {
   GEMINI_COMPOSE_IMAGE: 0.04,    // Gemini character+environment composite still, flat per image
   SUNO_MUSIC_TRACK: 0.20,        // Suno music bed, flat per generated track
   AZURE_TTS_PER_CHAR: 0.000016,  // Azure neural TTS, per character of input text
+  GEMINI_REMIX_IMAGE: 0.04,      // Gemini image-edit on an existing reference/keyframe, flat per remix
 };
+
+// ===========================================================================
+// Library bridge (21 Aug 2026 -- owner request: images generated inside
+// Video Studio were invisible everywhere else in LCOS). Mirrors a
+// studio.assets image row into lcos.assets, the Production > Asset library
+// every other part of LCOS already browses, right after it's generated,
+// and records the mirror on the studio row (migration 0038) so nothing is
+// ever bridged twice. kindHint maps a lock's entity_type onto the
+// library's existing filters so "Character references" / "Backgrounds"
+// stay meaningful for studio-generated work instead of dumping everything
+// into one generic bucket; anything without a clear entity (a composed
+// KEYFRAME, a remix not attached to a lock) falls back to IMAGE_PHOTO.
+// Never throws into the caller's request: a bridge failure (e.g. a code
+// collision) is logged as a studio event instead of failing the whole
+// generation the human was actually waiting on.
+async function bridgeAssetToLibrary({ asset, kindHint, title, actorId }) {
+  const kind = kindHint === 'CHARACTER' ? 'CHARACTER_REFERENCE'
+    : kindHint === 'ENVIRONMENT' ? 'BACKGROUND'
+    : 'IMAGE_PHOTO';
+  try {
+    const lib = await one(
+      `INSERT INTO lcos.assets (code, kind, origin, title, storage_key, mime_type, is_ai_generated,
+         ai_generation_meta, is_active, uploaded_by)
+       VALUES ($1,$2::lcos.asset_kind,'AI_GENERATED'::lcos.asset_origin,$3,$4,'image/png',true,$5,true,$6)
+       RETURNING id`,
+      [code('STUDIO'), kind, title.slice(0, 200), asset.storage_key,
+       JSON.stringify({ studio_asset_id: asset.id, ...(asset.generator ?? {}) }), actorId ?? null]);
+    await q(`UPDATE studio.assets SET library_asset_id=$2 WHERE id=$1`, [asset.id, lib.id]);
+    return lib.id;
+  } catch (e) {
+    await q(`INSERT INTO studio.events (project_id, note) VALUES ($1,$2)`,
+      [asset.project_id, `could not mirror asset ${asset.id} into the library: ${e.message}`]).catch(() => {});
+    return null;
+  }
+}
+
+// Loads the actual asset rows behind each lock's reference_asset_ids
+// (newest last, matching the append-only discipline everywhere else this
+// array is read) so the frontend can render a real thumbnail and a
+// version history instead of the bare "has reference image" text it had
+// before. Mutates each lock in place; a lock with no references gets [].
+async function attachReferenceAssets(locks) {
+  const allIds = [...new Set(locks.flatMap(l => l.reference_asset_ids ?? []))];
+  const rows = allIds.length
+    ? (await q(`SELECT id, storage_key, generator, created_at FROM studio.assets
+                WHERE id = ANY($1) ORDER BY created_at`, [allIds])).rows
+    : [];
+  const byId = new Map(rows.map(r => [r.id, r]));
+  for (const l of locks) {
+    l.reference_assets = (l.reference_asset_ids ?? []).map((id) => byId.get(id)).filter(Boolean);
+  }
+  return locks;
+}
 
 // ===========================================================================
 // Prompt compilation (playbook 12). Deterministic assembly from locks and
@@ -236,6 +290,36 @@ async function technicalQc(localPath, expected) {
   } catch (e) {
     return { disposition: 'BLOCKED', report: { error: `ffprobe failed: ${e.message}` } };
   }
+}
+
+// Pull the LAST frame of a video asset as a still PNG (owner request, 21
+// Aug 2026: "kling offers this thing where the last frame of a video
+// becomes the first frame of the next video... can we implement that
+// with runway"). Reproduces the trick provider-agnostically instead of
+// depending on any one vendor's built-in continuation feature: extract
+// the frame ourselves, then feed it back in through the exact same
+// generation.first_frame_asset_id path compose-first-frame already uses,
+// so /shots/:shotId/generate needs no changes to consume it. Input-seeks
+// to just before the end (fast -- no full decode -- and frame-accurate
+// enough that "the last frame" vs "0.08s before it" makes no visible
+// difference for continuity purposes) rather than reading through the
+// whole file. In MOCK mode the stored "video" is a placeholder text file
+// written by the mock adapters, not real media -- ffmpeg would just fail
+// against it -- so this writes an honest 1x1 placeholder PNG instead of
+// pretending to extract anything, matching technicalQc/continuityQc's
+// own MOCK discipline above.
+async function extractLastFrame(videoLocalPath, outPath) {
+  if (MOCK()) {
+    const PLACEHOLDER_PNG = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+    await writeFile(outPath, PLACEHOLDER_PNG);
+    return;
+  }
+  const { stdout } = await execFileP('ffprobe',
+    ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', videoLocalPath]);
+  const duration = Number(stdout.trim()) || 0;
+  const seekTo = Math.max(0, duration - 0.08);
+  await execFileP('ffmpeg', ['-y', '-ss', String(seekTo), '-i', videoLocalPath, '-frames:v', '1', '-q:v', '2', outPath]);
 }
 
 // Continuity QC (playbook 19.2) via Gemini vision comparison. Only runs
@@ -622,6 +706,7 @@ export default async function routes(app) {
     if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
     const locks = (await q(`SELECT * FROM studio.locks WHERE project_id=$1 AND is_active ORDER BY entity_type, entity_code`,
       [p.id])).rows;
+    await attachReferenceAssets(locks);
     const shots = (await q(`SELECT * FROM studio.shots WHERE project_id=$1 ORDER BY order_index`, [p.id])).rows;
     const events = (await q(`SELECT * FROM studio.events WHERE project_id=$1 ORDER BY at DESC LIMIT 50`, [p.id])).rows;
     return { ...p, locks, shots, events };
@@ -1097,6 +1182,24 @@ export default async function routes(app) {
   app.get('/studio/projects/:id/locks', { preHandler: requirePerm('studio.read') }, async (req) => {
     const r = await q(`SELECT * FROM studio.locks WHERE project_id=$1 AND is_active ORDER BY entity_type, entity_code`,
       [req.params.id]);
+    await attachReferenceAssets(r.rows);
+    return { items: r.rows };
+  });
+
+  // Reusable reference images a lock of THIS entity_type could pick from
+  // the library, without spending on a fresh Gemini generation -- feeds
+  // the Video Studio "pick from library" panel. Reuses the same
+  // lcos.assets table and kind filter the Production > Asset library
+  // already reads (CHARACTER_REFERENCE / BACKGROUND); a PROP or STYLE lock
+  // gets no library shortcut yet since neither kind exists in the library
+  // today.
+  app.get('/studio/locks/library-candidates', { preHandler: requirePerm('studio.read') }, async (req, reply) => {
+    const entityType = req.query?.entity_type;
+    const kind = entityType === 'CHARACTER' ? 'CHARACTER_REFERENCE' : entityType === 'ENVIRONMENT' ? 'BACKGROUND' : null;
+    if (!kind) return { items: [] };
+    const r = await q(
+      `SELECT id, code, title, storage_key, mime_type, is_ai_generated, created_at FROM lcos.assets
+       WHERE kind=$1::lcos.asset_kind AND is_active ORDER BY created_at DESC LIMIT 60`, [kind]);
     return { items: r.rows };
   });
 
@@ -1201,8 +1304,142 @@ export default async function routes(app) {
        code('JOB'), JSON.stringify({ prompt })]);
     await q(`UPDATE studio.locks SET reference_asset_ids = array_append(reference_asset_ids, $2) WHERE id=$1`,
       [lock.id, asset.id]);
+    await bridgeAssetToLibrary({ asset, kindHint: lock.entity_type,
+      title: `${lock.entity_code} reference — ${project.title}`, actorId: req.actor?.id });
     await spendBudget(project.id, resolveSpendAmount(gen, estimatedCost));
     return { ...asset, ...(budget.warning ? { budget_warning: budget.warning } : {}) };
+  });
+
+  // Attach an EXISTING library asset (Production > Asset library, or an
+  // image a previous studio project already generated) as this lock's
+  // newest reference version, instead of paying for a new Gemini call.
+  // Copies the storage_key into a fresh studio.assets row so version
+  // history and the compose-first-frame step work exactly as if Gemini
+  // had just generated it; generator.provider records where it actually
+  // came from so that's never confused with a real generation.
+  app.post('/studio/locks/:lockId/reference/attach', { preHandler: requirePerm('studio.generate') }, async (req, reply) => {
+    const lock = await one(`SELECT * FROM studio.locks WHERE id=$1`, [req.params.lockId]);
+    if (!lock) return reply.code(404).send(err(404, 'NOT_FOUND', 'lock not found'));
+    const libAssetId = req.body?.library_asset_id;
+    if (!libAssetId) return reply.code(422).send(err(422, 'VALIDATION', 'library_asset_id is required'));
+    const libAsset = await one(`SELECT * FROM lcos.assets WHERE id=$1 AND is_active`, [libAssetId]);
+    if (!libAsset) return reply.code(404).send(err(404, 'NOT_FOUND', 'library asset not found'));
+    const assetId = crypto.randomUUID();
+    const asset = await one(
+      `INSERT INTO studio.assets (id, project_id, kind, status, storage_key, generator, prompt_job_code, settings, library_asset_id)
+       VALUES ($1,$2,'REFERENCE_IMAGE','GENERATED',$3,$4,$5,$6,$7) RETURNING *`,
+      [assetId, lock.project_id, libAsset.storage_key,
+       JSON.stringify({ provider: 'LIBRARY', source_library_asset_id: libAsset.id, source_title: libAsset.title }),
+       code('JOB'), JSON.stringify({}), libAsset.id]);
+    await q(`UPDATE studio.locks SET reference_asset_ids = array_append(reference_asset_ids, $2) WHERE id=$1`,
+      [lock.id, asset.id]);
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [lock.project_id, req.actor?.id ?? null, `locks/${lock.entity_code}`,
+       `attached library asset "${libAsset.title}" as a reference for ${lock.entity_code}`]);
+    return asset;
+  });
+
+  // Upload a reference image from outside Gemini entirely -- a real photo
+  // of Letena's actual presenter, a hand-picked stock backdrop, anything a
+  // producer already has -- as a lock's newest reference, same version
+  // history as a generated one. Base64 in the JSON body (not multipart) to
+  // match every other write route in this API; the frontend reads the
+  // chosen file client-side via FileReader before posting.
+  app.post('/studio/locks/:lockId/reference/upload',
+    { preHandler: requirePerm('studio.generate'), bodyLimit: 12 * 1024 * 1024 }, async (req, reply) => {
+    const lock = await one(`SELECT * FROM studio.locks WHERE id=$1`, [req.params.lockId]);
+    if (!lock) return reply.code(404).send(err(404, 'NOT_FOUND', 'lock not found'));
+    const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [lock.project_id]);
+    const { image_base64, mime_type } = req.body ?? {};
+    if (!image_base64) return reply.code(422).send(err(422, 'VALIDATION', 'image_base64 is required'));
+    const mt = mime_type || 'image/png';
+    const ext = mt === 'image/jpeg' ? 'jpg' : mt === 'image/webp' ? 'webp' : 'png';
+    const assetId = crypto.randomUUID();
+    const key = `assets/uploaded/${assetId}/image.${ext}`;
+    let buf;
+    try { buf = Buffer.from(image_base64, 'base64'); }
+    catch { return reply.code(422).send(err(422, 'VALIDATION', 'image_base64 is not valid base64')); }
+    if (buf.length > 8 * 1024 * 1024) {
+      return reply.code(422).send(err(422, 'VALIDATION', 'uploads are capped at 8MB'));
+    }
+    await storage.put(key, buf);
+    const asset = await one(
+      `INSERT INTO studio.assets (id, project_id, kind, status, storage_key, generator, prompt_job_code, settings)
+       VALUES ($1,$2,'REFERENCE_IMAGE','GENERATED',$3,$4,$5,$6) RETURNING *`,
+      [assetId, lock.project_id, key, JSON.stringify({ provider: 'UPLOAD', mime_type: mt }), code('JOB'), JSON.stringify({})]);
+    await q(`UPDATE studio.locks SET reference_asset_ids = array_append(reference_asset_ids, $2) WHERE id=$1`,
+      [lock.id, asset.id]);
+    await bridgeAssetToLibrary({ asset, kindHint: lock.entity_type,
+      title: `${lock.entity_code} reference (uploaded) — ${project.title}`, actorId: req.actor?.id });
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [lock.project_id, req.actor?.id ?? null, `locks/${lock.entity_code}`, `uploaded a reference image for ${lock.entity_code}`]);
+    return asset;
+  });
+
+  // Remix an existing reference/keyframe through Gemini image editing
+  // (owner request, 21 Aug 2026: "recall characters and backgrounds
+  // directly from the studio... and remix them"): send the SAME image back
+  // to Gemini with a NEW instruction ("make the coat blue", "add glasses",
+  // "same doctor, different clinic room") instead of generating from
+  // scratch. If the source image is currently a lock's reference, the
+  // remix becomes that lock's newest version too -- reference_asset_ids
+  // is append-only everywhere else in this file, so the newest entry
+  // already wins by convention; this keeps that convention rather than
+  // inventing a second one. The prior version is never deleted.
+  app.post('/studio/assets/:assetId/remix', { preHandler: requirePerm('studio.generate') }, async (req, reply) => {
+    const source = await one(`SELECT * FROM studio.assets WHERE id=$1`, [req.params.assetId]);
+    if (!source) return reply.code(404).send(err(404, 'NOT_FOUND', 'asset not found'));
+    if (!['REFERENCE_IMAGE', 'KEYFRAME'].includes(source.kind)) {
+      return reply.code(422).send(err(422, 'VALIDATION', 'only a REFERENCE_IMAGE or KEYFRAME asset can be remixed'));
+    }
+    const prompt = req.body?.prompt?.trim();
+    if (!prompt) return reply.code(422).send(err(422, 'VALIDATION', 'prompt is required'));
+    const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [source.project_id]);
+    const estimatedCost = ESTIMATED_COST_USD.GEMINI_REMIX_IMAGE;
+    let budget;
+    try {
+      budget = await checkAndSpendBudget(project, estimatedCost, req.actor, req.body?.override_budget === true);
+    } catch (e) {
+      if (!(e instanceof BudgetExceededError)) throw e;
+      return reply.code(422).send(err(422, 'BUDGET_EXCEEDED', e.message));
+    }
+    const assetId = crypto.randomUUID();
+    const gen = await gemini.generateImage({ prompt, assetId, referenceImageKeys: [source.storage_key] });
+    const asset = await one(
+      `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings, source_asset_id)
+       VALUES ($1,$2,$3,$4,'GENERATED',$5,$6,$7,$8,$9) RETURNING *`,
+      [assetId, project.id, source.shot_id, source.kind, gen.storage_key,
+       JSON.stringify({ provider: 'GEMINI', model: 'gemini-2.5-flash-image', remixed_from: source.id }),
+       code('JOB'), JSON.stringify({ prompt, remixed_from: source.id }), source.id]);
+
+    const owningLock = await one(
+      `SELECT * FROM studio.locks WHERE $1 = ANY(reference_asset_ids) AND is_active`, [source.id]);
+    if (owningLock) {
+      await q(`UPDATE studio.locks SET reference_asset_ids = array_append(reference_asset_ids, $2) WHERE id=$1`,
+        [owningLock.id, asset.id]);
+    }
+    // If the source is currently SOME shot's first_frame_asset_id (set by
+    // compose-first-frame or continue-from-previous, neither of which
+    // attaches to a lock), the remix must become that shot's first frame
+    // too -- otherwise Generate would silently keep using the un-remixed
+    // frame while the UI shows the remixed one, which defeats the entire
+    // point of remix being an "editable checkpoint" before generating.
+    const owningShot = await one(
+      `SELECT * FROM studio.shots WHERE generation->>'first_frame_asset_id' = $1`, [source.id]);
+    if (owningShot) {
+      await q(`UPDATE studio.shots SET generation = generation || $2::jsonb, updated_at=now() WHERE id=$1`,
+        [owningShot.id, JSON.stringify({ first_frame_asset_id: asset.id })]);
+    }
+    await bridgeAssetToLibrary({ asset, kindHint: owningLock?.entity_type ?? null,
+      title: `remix — ${prompt.slice(0, 60)}`, actorId: req.actor?.id });
+    await q(`INSERT INTO studio.events (project_id, actor_id, note) VALUES ($1,$2,$3)`,
+      [project.id, req.actor?.id ?? null,
+       `remixed asset ${source.id}${owningLock ? ` (now the newest reference for ${owningLock.entity_code})` : ''}` +
+       `${owningShot ? ` (now shot ${owningShot.shot_code}'s first frame)` : ''}: "${prompt.slice(0, 100)}"`]);
+    await spendBudget(project.id, resolveSpendAmount(gen, estimatedCost));
+    return { ...asset, attached_to_lock: owningLock ? { id: owningLock.id, entity_code: owningLock.entity_code } : null,
+      attached_to_shot: owningShot ? { id: owningShot.id, shot_code: owningShot.shot_code } : null,
+      ...(budget.warning ? { budget_warning: budget.warning } : {}) };
   });
 
   // -------------------------------------------------------------------
@@ -1338,11 +1575,99 @@ export default async function routes(app) {
     await q(`UPDATE studio.shots SET generation = generation || $2::jsonb, updated_at=now() WHERE id=$1`,
       [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: 'image_to_video' })]);
 
+    await bridgeAssetToLibrary({ asset, kindHint: null,
+      title: `${shot.shot_code} first frame — ${project.title}`, actorId: req.actor?.id });
     await spendBudget(project.id, resolveSpendAmount(gen, estimatedCost));
 
     return { asset, character_lock: { id: characterLock.id, entity_code: characterLock.entity_code },
       environment_lock: { id: environmentLock.id, entity_code: environmentLock.entity_code },
       ...(budget.warning ? { budget_warning: budget.warning } : {}) };
+  });
+
+  // Continue a shot from the shot before it (owner request, 21 Aug 2026:
+  // Kling advertises "the last frame of a video becomes the first frame
+  // of the next", and the ask was to reproduce that with Runway too).
+  // Rather than depending on any one video vendor's native continuation
+  // feature, this pulls the LAST frame of an earlier shot's own ACCEPTED
+  // video with ffmpeg (extractLastFrame above) and points THIS shot's
+  // first_frame_asset_id at it -- the exact same field compose-first-
+  // frame already writes, so /generate needs no changes to consume it and
+  // this works with Kling, Runway, or VEO identically. Deliberately a
+  // manual, per-shot action (not automatic chaining) and the resulting
+  // frame is a normal KEYFRAME asset the producer can review, and remix
+  // through Gemini (POST /studio/assets/:assetId/remix already accepts
+  // KEYFRAME) before Generate ever runs -- an editable checkpoint, not a
+  // black box.
+  //
+  // Only ever reads from an ACCEPTED asset, never a raw generated
+  // candidate: continuity should build on reviewed work, not on
+  // something that might still get reworked or rejected. Defaults to the
+  // immediately preceding shot in this project's own order_index
+  // sequence; body.source_shot_id overrides that to continue from a
+  // specific non-adjacent shot instead (e.g. skipping a cutaway).
+  app.post('/studio/shots/:shotId/continue-from-previous', { preHandler: requirePerm('studio.generate') }, async (req, reply) => {
+    const shot = await one(`SELECT * FROM studio.shots WHERE id=$1`, [req.params.shotId]);
+    if (!shot) return reply.code(404).send(err(404, 'NOT_FOUND', 'shot not found'));
+    const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [shot.project_id]);
+
+    let sourceShot;
+    if (req.body?.source_shot_id) {
+      sourceShot = await one(`SELECT * FROM studio.shots WHERE id=$1 AND project_id=$2`,
+        [req.body.source_shot_id, shot.project_id]);
+      if (!sourceShot) {
+        return reply.code(404).send(err(404, 'NOT_FOUND', 'source_shot_id does not resolve to a shot in this project'));
+      }
+    } else {
+      sourceShot = await one(
+        `SELECT * FROM studio.shots WHERE project_id=$1 AND order_index < $2 ORDER BY order_index DESC LIMIT 1`,
+        [shot.project_id, shot.order_index]);
+      if (!sourceShot) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          'this is the first shot in the project by order_index -- there is no earlier shot to continue from. Pass source_shot_id to continue from a specific non-adjacent shot instead.'));
+      }
+    }
+    if (sourceShot.id === shot.id) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED', 'a shot cannot continue from itself'));
+    }
+    if (!sourceShot.accepted_asset_id) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `shot ${sourceShot.shot_code} has no ACCEPTED video yet -- accept its generated video (POST /studio/assets/:assetId/accept) before continuing from it, so a shot only ever builds on reviewed work`));
+    }
+    const sourceAsset = await one(`SELECT * FROM studio.assets WHERE id=$1`, [sourceShot.accepted_asset_id]);
+    if (!sourceAsset || sourceAsset.kind !== 'VIDEO') {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `shot ${sourceShot.shot_code}'s accepted asset is not a VIDEO -- cannot extract a last frame from it`));
+    }
+
+    const assetId = crypto.randomUUID();
+    const scratchPath = storage.localPath(`assets/generated/${assetId}/last-frame-scratch.png`);
+    await mkdir(join(scratchPath, '..'), { recursive: true });
+    await extractLastFrame(storage.localPath(sourceAsset.storage_key), scratchPath);
+    const key = `assets/generated/${assetId}/last-frame.png`;
+    await storage.put(key, await readFile(scratchPath));
+
+    const asset = await one(
+      `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings, source_asset_id)
+       VALUES ($1,$2,$3,'KEYFRAME','GENERATED',$4,$5,$6,$7,$8) RETURNING *`,
+      [assetId, project.id, shot.id, key,
+       JSON.stringify({ provider: 'FRAME_EXTRACT', continued_from_shot_id: sourceShot.id, continued_from_asset_id: sourceAsset.id }),
+       code('JOB'), JSON.stringify({ continued_from_shot_code: sourceShot.shot_code }), sourceAsset.id]);
+
+    // Same field-merge discipline as compose-first-frame: only touch
+    // generation.first_frame_asset_id/mode_preference/continued_from_shot_id,
+    // preserve every other existing key, and do not flip shot.status.
+    await q(`UPDATE studio.shots SET generation = generation || $2::jsonb, updated_at=now() WHERE id=$1`,
+      [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: 'image_to_video',
+        continued_from_shot_id: sourceShot.id })]);
+
+    await bridgeAssetToLibrary({ asset, kindHint: null,
+      title: `${shot.shot_code} continued from ${sourceShot.shot_code} — ${project.title}`, actorId: req.actor?.id });
+
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [project.id, req.actor?.id ?? null, `shots/${shot.shot_code}`,
+       `pulled the last frame of ${sourceShot.shot_code}'s accepted video as ${shot.shot_code}'s first frame, for continuity`]);
+
+    return { asset, continued_from: { shot_id: sourceShot.id, shot_code: sourceShot.shot_code, asset_id: sourceAsset.id } };
   });
 
   // Generate a candidate for a shot: compile the prompt, run it through the

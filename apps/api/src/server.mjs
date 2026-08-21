@@ -1,6 +1,7 @@
 // LCOS API server. Fastify, one process, modules registered under /api/v1.
 // Also serves the admin UI (apps/web) as static files.
 import Fastify from 'fastify';
+import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -35,10 +36,29 @@ export async function buildServer() {
 
   // Admin UI (no build step; EMR design language)
   const webDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web');
-  app.get('/', async (req, reply) =>
-    reply.type('text/html').send(readFileSync(join(webDir, 'index.html'), 'utf8')));
+
+  // Cache-busting the front end, automatically (22 Aug 2026).
+  //
+  // index.html loaded the script as `/app.js?v=9`, a version number a human
+  // was supposed to bump by hand on every deploy. Nobody did, for a long
+  // time. The consequence is nastier than a stale page: the API deploys and
+  // the browser does not, so a person is running old JavaScript against a
+  // new server and every screen looks like it simply ignored the fix that
+  // just shipped. A whole evening of "the viewer is not there" turned out
+  // to be exactly this -- the code was live on the server the entire time.
+  //
+  // The stamp is now a hash of app.js as it sits on disk, computed once at
+  // boot and substituted into whatever ?v= the file carries. It changes
+  // when and only when the file changes, so an unchanged deploy keeps the
+  // cache and a changed one breaks it, with nothing to remember.
+  const appJsPath = join(webDir, 'app.js');
+  const appJsStamp = crypto.createHash('sha256')
+    .update(readFileSync(appJsPath)).digest('hex').slice(0, 12);
+  const indexHtml = readFileSync(join(webDir, 'index.html'), 'utf8')
+    .replace(/\/app\.js\?v=[^"']*/g, `/app.js?v=${appJsStamp}`);
+  app.get('/', async (req, reply) => reply.type('text/html').send(indexHtml));
   app.get('/app.js', async (req, reply) =>
-    reply.type('text/javascript').send(readFileSync(join(webDir, 'app.js'), 'utf8')));
+    reply.type('text/javascript').send(readFileSync(appJsPath, 'utf8')));
 
   // SSO from the Letena EMR. The EMR's api/lcos_sso.php sends a short-lived
   // token: base64url(payload json).hex_hmac_sha256(b64, shared ingest secret),

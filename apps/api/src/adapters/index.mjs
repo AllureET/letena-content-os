@@ -370,6 +370,29 @@ export const elevenlabs = {
 };
 
 // ---------- images: Gemini ----------
+// Which Gemini models this adapter calls, and why they are settings.
+//
+// 21 Aug 2026: every non-image Gemini call in here was hard-wired to
+// gemini-2.5-flash, and Google retired it for new callers mid-build. The
+// first request after that returned "This model models/gemini-2.5-flash is
+// no longer available to new users. Please update your code to use
+// models/gemini-3.6-flash". That one dead string was sitting in three
+// places -- sheet splitting, Amharic transcription, and continuity QC --
+// so a provider deprecation nobody controls could quietly take out three
+// unrelated features at once, and the only fix would have been a code
+// change and a deploy.
+//
+// A model name is a fact about a vendor's catalogue, not a fact about
+// Letena, so it belongs in Settings where an operator can change it the
+// day a deprecation notice arrives. The constants below are only the
+// defaults for an install that has not set one.
+const GEMINI_TEXT_MODEL_DEFAULT = 'gemini-3.6-flash';
+const GEMINI_IMAGE_MODEL_DEFAULT = 'gemini-2.5-flash-image';
+const geminiTextModel = () => cred('GEMINI_TEXT_MODEL') || GEMINI_TEXT_MODEL_DEFAULT;
+const geminiImageModel = () => cred('GEMINI_IMAGE_MODEL') || GEMINI_IMAGE_MODEL_DEFAULT;
+const geminiUrl = (model) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${need('GEMINI_API_KEY')}`;
+
 export const gemini = {
   // referenceImageKeys (Video Studio character+environment composition,
   // 19 Aug 2026): an optional array of 0-2 existing storage keys to hand
@@ -391,7 +414,7 @@ export const gemini = {
       ({ inlineData: { mimeType: 'image/png', data: readFileSync(storage.localPath(k)).toString('base64') } }));
     const parts = [...imageParts, { text: prompt }];
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${need('GEMINI_API_KEY')}`, {
+      geminiUrl(geminiImageModel()), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       // responseModalities (21 Aug 2026 fix): without this, a request that
       // hands the model one or more existing images alongside the prompt
@@ -430,7 +453,7 @@ export const gemini = {
       ] };
     }
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${need('GEMINI_API_KEY')}`, {
+      geminiUrl(geminiTextModel()), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ contents: [{ parts: [
         { text: 'Transcribe this Amharic recording. Return strict JSON: an array of {start_s, end_s, speaker, text}. speaker is "doctor" or "guest". Keep clinical/brand terms (Postpill, Condom, HIV, IUD) in Latin script exactly as spoken.' },
@@ -489,7 +512,7 @@ x and y are the top-left corner as a fraction of the full image width and height
       { inlineData: { mimeType, data: imageBase64 } },
     ];
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${need('GEMINI_API_KEY')}`, {
+      geminiUrl(geminiTextModel()), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ contents: [{ parts }] }),
     });
@@ -523,7 +546,7 @@ x and y are the top-left corner as a fraction of the full image width and height
         { text: `REFERENCE ${i + 1}:` }, { inlineData: { mimeType: 'image/png', data: b64 } }]),
     ];
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${need('GEMINI_API_KEY')}`, {
+      geminiUrl(geminiTextModel()), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ contents: [{ parts }] }),
     });

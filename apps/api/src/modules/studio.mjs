@@ -1761,8 +1761,7 @@ export default async function routes(app) {
         `INSERT INTO studio.assets (id, project_id, kind, status, storage_key, generator, prompt_job_code, settings, source_asset_id)
          VALUES ($1,$2,'REFERENCE_IMAGE','GENERATED',$3,$4,$5,$6,$7) RETURNING id, storage_key`,
         [assetId, project.id, key,
-         JSON.stringify({ provider: 'SHEET_SPLIT', lock_id: lock.id, model: 'gemini-2.5-flash',
-           split_from_asset_id: sheet.id }),
+         JSON.stringify({ provider: 'SHEET_SPLIT', lock_id: lock.id, split_from_asset_id: sheet.id }),
          code('JOB'),
          JSON.stringify({ panel_label: String(panel?.label ?? '').slice(0, 120), panel_use: use,
            panel_has_text: hasText, panel_box: { x, y, w, h }, split_from_sheet_kind: sheet.sheet_kind }),

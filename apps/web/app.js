@@ -1677,6 +1677,25 @@ const screens = {
     let overlays = [];
     try { overlays = (await api('GET', `/studio/projects/${id}/overlays`)).items ?? []; } catch { overlays = []; }
 
+    // Per-shot assets for the inline review box (21 Aug 2026, owner looking
+    // at a shot sitting in NEEDS_REVIEW: "this says needs review but doesnt
+    // offer me a viewer to view it or a place to approve, reject, make
+    // comment or whatever"). The players and the Accept button already
+    // existed, but only inside the collapsed "Assets & QC" panel, which is
+    // a place you have to know to look -- so a shot asking to be reviewed
+    // showed a status pill and nothing to review it with.
+    //
+    // Fetched only for the shots that are actually in a review state, not
+    // for every shot in the project: a long project would otherwise fire a
+    // request per shot on every render to draw boxes nobody asked for.
+    const assetsByShot = new Map();
+    await Promise.all(shots
+      .filter(s => ['NEEDS_REVIEW', 'ACCEPTED', 'QC_BLOCKED'].includes(s.status))
+      .map(async (s) => {
+        try { assetsByShot.set(s.id, (await api('GET', `/studio/shots/${s.id}/assets`)).items ?? []); }
+        catch { assetsByShot.set(s.id, []); }
+      }));
+
     // Budget: only shown when a cap was actually set. budget_pct/budget_warning
     // are speculative fields another engineer's concurrent guardrail work may
     // add tonight; shown only if present, never assumed.
@@ -1805,6 +1824,58 @@ const screens = {
       ? '<span style="color:var(--risk-routine);font-weight:600">&check; accepted</span>'
       : '<span class="muted">&mdash;</span>';
 
+    // The review box itself: the newest rendered video for this shot, a
+    // player, what QC thought of it in plain words, one comment field, and
+    // the three things a person can do about it. Shown open, in the row,
+    // because a shot that says NEEDS REVIEW is asking to be looked at now.
+    const reviewBoxHtml = (s) => {
+      const items = assetsByShot.get(s.id);
+      if (!items) return '';
+      const video = items.find(a => a.kind === 'VIDEO' && a.storage_key);
+      if (!video) {
+        // NEEDS_REVIEW with nothing rendered means the last generate
+        // attempt failed outright. Say that, rather than showing an empty
+        // box that reads like the video is still loading.
+        return `<div class="claimrow" style="margin-top:8px;border-left-color:var(--risk-mod)">
+          <div style="font-size:11px;font-weight:600">Nothing to review yet</div>
+          <div class="muted" style="font-size:11px;margin-top:2px">This shot is waiting on review but no video was
+            produced, so the last generate attempt failed. The project timeline at the bottom of this page records
+            every attempt and the reason each one gave.</div></div>`;
+      }
+      const u = mediaUrl(video.storage_key);
+      const qc = (video.qc_reports ?? [])[0];
+      const issues = qc?.technical?.issues ?? [];
+      const blocked = video.status === 'QC_BLOCKED';
+      const done = ['ACCEPTED', 'REJECTED'].includes(video.status);
+      return `<div class="claimrow" style="margin-top:8px">
+        <div class="flex"><div style="font-size:11px;font-weight:600">Review this shot</div>
+          <span class="spacer"></span>${pill(video.status)}
+          ${video.cost_usd != null ? `<span class="muted" style="font-size:11px">$${esc(String(video.cost_usd))}</span>` : ''}</div>
+        <video src="${esc(u)}" controls playsinline preload="metadata"
+          style="margin-top:6px;width:100%;max-width:260px;border-radius:6px;display:block;background:#000"></video>
+        <div class="flex" style="margin-top:6px;gap:6px">
+          <button style="font-size:11px;padding:2px 8px"
+            onclick="imagePreview('${esc(u)}','${esc(s.shot_code)}')">Preview &amp; download</button>
+        </div>
+        ${qc ? `<div style="margin-top:6px">${pill(qc.disposition)}
+          ${issues.length ? `<div class="muted" style="font-size:11px;margin-top:4px">${issues.map(x => esc(x)).join('; ')}</div>` : ''}
+          ${qc.continuity?.notes ? `<div class="muted" style="font-size:11px;margin-top:2px">Continuity: ${esc(qc.continuity.notes)}</div>` : ''}
+        </div>` : ''}
+        ${video.settings?.review_note ? `<div class="muted" style="font-size:11px;margin-top:6px">Last comment: ${esc(video.settings.review_note)}</div>` : ''}
+        ${done ? `<div class="muted" style="font-size:11px;margin-top:6px">Already ${esc(video.status.toLowerCase())}. Open Assets &amp; QC for the full history of this shot.</div>` : `
+        <textarea id="strevnote-${esc(video.id)}" style="margin-top:6px"
+          placeholder="What is right or wrong about this take (optional)"></textarea>
+        <div class="flex" style="margin-top:6px;gap:6px;flex-wrap:wrap">
+          ${can('studio.approve') ? (blocked
+            ? `<button disabled title="QC blocked this clip on a hard constraint, so it cannot be approved. Reject it and generate again.">Approve</button>`
+            : `<button class="approve" data-stassetaccept="${esc(video.id)}">Approve</button>`) : ''}
+          ${can('studio.approve') ? `<button data-stassetreject="${esc(video.id)}"
+            title="Sends the shot back to draft so you can change it and generate again">Reject</button>` : ''}
+          <button data-stassetnote="${esc(video.id)}" title="Records the comment without approving or rejecting">Comment only</button>
+        </div>`}
+      </div>`;
+    };
+
     // Step-by-step first frame (19 Aug 2026): Letena's real Instagram
     // doctor-presenter content is the same doctor (CHARACTER lock) across
     // different backdrops (ENVIRONMENT lock) -- so before the single
@@ -1891,6 +1962,7 @@ const screens = {
           <td class="mono">${esc(String(s.duration_target_s ?? ''))}</td>
           <td>${acceptedMark(s)}</td>
           <td style="min-width:220px">
+            ${reviewBoxHtml(s)}
             ${composeStepHtml(s)}
             ${continueStepHtml(s)}
             <div class="flex" style="flex-wrap:wrap">
@@ -3578,7 +3650,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3934,9 +4006,30 @@ document.addEventListener('click', async (e) => {
       return;
     }
     if (b.dataset.stassetaccept) {
+      const id = b.dataset.stassetaccept;
       b.disabled = true; b.textContent = 'Accepting…';
-      await api('POST', `/studio/assets/${b.dataset.stassetaccept}/accept`, {});
+      await api('POST', `/studio/assets/${id}/accept`, { note: elv(`strevnote-${id}`) ?? '' });
       toast('Asset accepted'); return render();
+    }
+    // Reject and comment (21 Aug 2026): the review box's other two verdicts.
+    // Reject sends the shot back to DRAFT so Generate can run again and the
+    // beat/framing can be edited first; a note on its own changes nothing
+    // and is just recorded against the clip.
+    if (b.dataset.stassetreject) {
+      const id = b.dataset.stassetreject;
+      const note = elv(`strevnote-${id}`) ?? '';
+      b.disabled = true; b.textContent = 'Rejecting…';
+      const r = await api('POST', `/studio/assets/${id}/reject`, { note });
+      toast(`Rejected. The shot is back to ${r.shot_status ?? 'DRAFT'} so you can change it and generate again.`);
+      return render();
+    }
+    if (b.dataset.stassetnote) {
+      const id = b.dataset.stassetnote;
+      const note = elv(`strevnote-${id}`)?.trim();
+      if (!note) return toast('Write the comment first.', 'warn');
+      b.disabled = true; b.textContent = 'Saving…';
+      await api('POST', `/studio/assets/${id}/note`, { note });
+      toast('Comment saved to the project timeline.'); return render();
     }
     if (b.dataset.stmusic) {
       const projectId = b.dataset.stmusic;

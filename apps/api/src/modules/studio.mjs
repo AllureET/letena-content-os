@@ -2208,9 +2208,80 @@ export default async function routes(app) {
       await q(`UPDATE studio.shots SET status='ACCEPTED', accepted_asset_id=$2, updated_at=now() WHERE id=$1`,
         [asset.shot_id, asset.id]);
     }
+    const note = String(req.body?.note ?? '').trim();
+    if (note) {
+      await q(`UPDATE studio.assets SET settings = settings || $2::jsonb WHERE id=$1`,
+        [asset.id, JSON.stringify({ review_note: note })]);
+    }
     await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
-      [asset.project_id, req.actor?.id ?? null, asset.id, `accepted asset for shot ${asset.shot_id ?? '(none)'}`]);
+      [asset.project_id, req.actor?.id ?? null, asset.id,
+       `accepted asset for shot ${asset.shot_id ?? '(none)'}${note ? ` -- ${note}` : ''}`]);
     return { ok: true };
+  });
+
+  // Reject and comment (21 Aug 2026, owner looking at a shot sitting in
+  // NEEDS_REVIEW: "this says needs review but doesnt offer me a viewer to
+  // view it or a place to approve, reject, make comment or whatever").
+  // Accept existed and was the only verdict the API could express, so a
+  // clip that was wrong had no way to be marked wrong -- the shot just sat
+  // there and the only recourse was to generate over it and hope. A review
+  // step you can only pass is not a review step.
+  app.post('/studio/assets/:assetId/reject', { preHandler: requirePerm('studio.approve') }, async (req, reply) => {
+    const asset = await one(`SELECT * FROM studio.assets WHERE id=$1`, [req.params.assetId]);
+    if (!asset) return reply.code(404).send(err(404, 'NOT_FOUND', 'asset not found'));
+    const note = String(req.body?.note ?? '').trim();
+
+    // Rejecting an already-accepted asset is a legitimate change of mind,
+    // but not once a later shot has built its own first frame on top of it:
+    // pulling that out from under a downstream shot would leave it
+    // continuing from something the project says is wrong, silently. Name
+    // the shot that depends on it so the person knows what to deal with
+    // first, rather than refusing with a shrug.
+    if (asset.status === 'ACCEPTED') {
+      const dependent = await one(
+        `SELECT shot_code FROM studio.shots
+         WHERE project_id=$1 AND generation->>'continued_from_shot_id' = $2::text
+         ORDER BY order_index LIMIT 1`, [asset.project_id, asset.shot_id]);
+      if (dependent) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          `${dependent.shot_code} already continues from this accepted video, so rejecting it now would leave that shot building on rejected work. Regenerate ${dependent.shot_code}'s first frame first, then reject this.`,
+          { guard: 'rejectWouldOrphanContinuity' }));
+      }
+    }
+
+    await q(`UPDATE studio.assets SET status='REJECTED'${note ? `, settings = settings || $2::jsonb` : ''} WHERE id=$1`,
+      note ? [asset.id, JSON.stringify({ review_note: note })] : [asset.id]);
+
+    // Put the shot back where it can be worked on. NEEDS_REVIEW would leave
+    // it looking like it still needs a verdict when the verdict has just
+    // been given; DRAFT is the state that says "generate this again", and
+    // it is also the only state PATCH /studio/shots/:id will edit, so the
+    // person can change the beat or the framing before retrying.
+    if (asset.shot_id) {
+      await q(`UPDATE studio.shots SET status='DRAFT',
+                 accepted_asset_id = CASE WHEN accepted_asset_id=$2 THEN NULL ELSE accepted_asset_id END,
+                 updated_at=now() WHERE id=$1`, [asset.shot_id, asset.id]);
+    }
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [asset.project_id, req.actor?.id ?? null, asset.id,
+       `rejected asset for shot ${asset.shot_id ?? '(none)'}${note ? ` -- ${note}` : ''}`]);
+    return { ok: true, shot_status: 'DRAFT' };
+  });
+
+  // A comment that changes nothing. Useful for "keep this, but the light is
+  // slightly cold" -- a thought worth recording against the clip without
+  // passing or failing it. Written to the project's event timeline, which
+  // is the one place a human already reads the history of a shot.
+  app.post('/studio/assets/:assetId/note', { preHandler: requirePerm('studio.read') }, async (req, reply) => {
+    const asset = await one(`SELECT * FROM studio.assets WHERE id=$1`, [req.params.assetId]);
+    if (!asset) return reply.code(404).send(err(404, 'NOT_FOUND', 'asset not found'));
+    const note = String(req.body?.note ?? '').trim();
+    if (!note) return reply.code(422).send(err(422, 'VALIDATION', 'note is required'));
+    await q(`UPDATE studio.assets SET settings = settings || $2::jsonb WHERE id=$1`,
+      [asset.id, JSON.stringify({ review_note: note })]);
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [asset.project_id, req.actor?.id ?? null, asset.id, `note on asset: ${note}`]);
+    return { ok: true, note };
   });
 
   // -------------------------------------------------------------------

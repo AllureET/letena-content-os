@@ -218,7 +218,7 @@ export function compileStillPrompt(lock) {
 // square was being handed straight to the video engine with a 9:16 ratio
 // request, so the engine reframed it and the composition drifted again.
 // See cropToAspect() and its call in compose-first-frame.
-export function compileComposePrompt(characterLock, environmentLock, styleLock, aspectRatio) {
+export function compileComposePrompt(characterLock, environmentLock, styleLock, aspectRatio, shotFraming) {
   const cd = characterLock.data ?? {};
   const ed = environmentLock.data ?? {};
   const lines = [];
@@ -231,10 +231,18 @@ export function compileComposePrompt(characterLock, environmentLock, styleLock, 
   lines.push(`[COMPOSITION] Place the [SUBJECT] into the [ENVIRONMENT], preserving the character's identity, wardrobe, and physical features EXACTLY as locked, and preserving the environment's architecture, palette, and setting EXACTLY as locked. Do not invent a different character or a different place -- this is the same character, this is the same place, seen together for the first time.`);
   if (ed.lighting || cd.lighting) lines.push(`[LIGHTING] ${ed.lighting ?? cd.lighting}`);
   // FRAMING is load-bearing and was missing entirely until 21 Aug 2026.
-  // The character's own composition wins (it describes how the PERSON is
-  // framed, which is what a presenter shot is about); the environment's is
-  // the fallback for a shot with no character framing note.
-  const framing = cd.composition ?? ed.composition;
+  // Precedence, widest source of truth last: the SHOT's own camera framing
+  // note wins, then the character's composition, then the environment's.
+  // The shot-level override was added the same evening, on the first real
+  // Spotting on the Pill compose: the character lock said "waist-up
+  // portrait" and Gemini returned a full-body wide of the whole room, which
+  // is unusable at 9:16 on a phone because her face ends up tiny. Before
+  // this, the only way to reframe one shot was to revise the character
+  // lock, which stales every shot in the project and is plainly the wrong
+  // lever -- a lock describes WHO she is and should not have to change
+  // because one shot wants a tighter crop. camera.framing_notes is a field
+  // the shot already carried and that nothing else read.
+  const framing = shotFraming ?? cd.composition ?? ed.composition;
   if (framing) lines.push(`[FRAMING] ${framing}`);
   if (aspectRatio) {
     lines.push(`[ASPECT] ${aspectRatio} vertical portrait orientation. Compose for this frame shape, not a square.`);
@@ -1792,7 +1800,8 @@ export default async function routes(app) {
     ]);
 
     const assetId = crypto.randomUUID();
-    const prompt = compileComposePrompt(characterLock, environmentLock, styleLock, project.aspect_ratio);
+    const prompt = compileComposePrompt(characterLock, environmentLock, styleLock, project.aspect_ratio,
+      shot.camera?.framing_notes ?? null);
     // Reference-pack conditioning (21 Aug 2026): if either lock has an
     // uploaded pack, add its most identity-bearing sheet alongside the two
     // flat references. Gemini caps conditioning at 3 images, so the

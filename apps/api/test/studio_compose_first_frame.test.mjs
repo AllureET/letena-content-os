@@ -19,6 +19,7 @@ const { buildServer } = await import('../src/server.mjs');
 const { pool, q, one } = await import('../src/core.mjs');
 const { gemini, storage } = await import('../src/adapters/index.mjs');
 const { readFile } = await import('node:fs/promises');
+const { compileComposePrompt } = await import('../src/modules/studio.mjs');
 
 let app, token;
 const login = async (email) => (await app.inject({ method: 'POST', url: '/api/v1/auth/login',
@@ -233,4 +234,37 @@ test('gemini.generateImage MOCK placeholder reflects the reference image count',
     referenceImageKeys: ['some/key1.png', 'some/key2.png'] });
   const twoBuf = await readFile(storage.localPath(two.storage_key));
   assert.match(twoBuf.toString(), /^MOCK-GEMINI-PNG refs=2/);
+});
+
+// Shot-level framing override (21 Aug 2026). Added on the first real
+// Spotting on the Pill compose: the character lock said "waist-up portrait"
+// and Gemini returned a full-body wide of the whole room. At 9:16 on a phone
+// that puts the presenter's face at a few percent of the frame, which is
+// unusable for a talking-head piece. The only lever before this was revising
+// the character lock, which stales every shot in the project and is the
+// wrong tool -- a lock says WHO she is, not how one shot is cropped.
+// camera.framing_notes was already on the shot and nothing read it.
+const CHAR = { entity_code: 'CHR-T', data: { name: 'T', composition: 'lock says waist-up' } };
+const ENV = { entity_code: 'ENV-T', data: { architecture: 'a room', composition: 'env says wide' } };
+
+test('the shot\'s own framing note wins over both locks', () => {
+  const p = compileComposePrompt(CHAR, ENV, null, '9:16', 'shot says tight chest-up');
+  assert.match(p, /\[FRAMING\] shot says tight chest-up/);
+  assert.ok(!p.includes('lock says waist-up'),
+    'a shot that states its framing must not also carry the lock composition, or the two contradict each other');
+});
+
+test('with no shot framing note the character lock still wins over the environment', () => {
+  const p = compileComposePrompt(CHAR, ENV, null, '9:16', null);
+  assert.match(p, /\[FRAMING\] lock says waist-up/);
+});
+
+test('with neither a shot note nor a character composition the environment is the fallback', () => {
+  const p = compileComposePrompt({ entity_code: 'CHR-T', data: { name: 'T' } }, ENV, null, '9:16', null);
+  assert.match(p, /\[FRAMING\] env says wide/);
+});
+
+test('the aspect line is still emitted alongside a shot framing note', () => {
+  const p = compileComposePrompt(CHAR, ENV, null, '9:16', 'shot says tight chest-up');
+  assert.match(p, /\[ASPECT\] 9:16 vertical portrait orientation/);
 });

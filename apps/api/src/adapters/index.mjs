@@ -154,7 +154,15 @@ async function runwayPoll(taskId, key) {
       // and so on) rather than a bare status, so runGenerationLadder's
       // classifier upstream can see words like "moderation" and treat a
       // policy rejection as POLICY instead of blindly retrying.
-      throw new Error(`runway ${task.status}: ${task.failure ?? task.failureCode ?? 'no reason given'}`);
+      //
+      // 21 Aug 2026: carry the failureCode AND the task id, not just the
+      // prose. Runway's generic "An unexpected error occurred" says nothing
+      // on its own, and without the task id there is no way to look the run
+      // up in Runway's own dashboard afterwards. The one real instance of
+      // this so far turned out to be an input frame smaller than the
+      // requested output resolution, which nothing in the message hinted at.
+      const why = [task.failure, task.failureCode].filter(Boolean).join(' / ') || 'no reason given';
+      throw new Error(`runway ${task.status} (task ${taskId}): ${why}`);
     }
   }
   throw new Error('runway generation timed out after 10 minutes');

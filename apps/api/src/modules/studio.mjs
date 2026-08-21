@@ -260,12 +260,37 @@ export function compileComposePrompt(characterLock, environmentLock, styleLock, 
 // engine receives a frame that is ALREADY the right shape and has nothing
 // to reinterpret. Crops rather than pads on purpose: a padded frame would
 // hand the engine letterbox bars to animate.
-async function cropToAspect(srcPath, outPath, aspectRatio) {
-  const [w, h] = String(aspectRatio ?? '9:16').split(':').map(Number);
+// The pixel size each aspect ratio is generated at. These are the video
+// engine's own output resolutions (see runwayRatio() in adapters/index.mjs,
+// which sends exactly these as its `ratio` string), and the first frame is
+// resized to match after cropping.
+//
+// Why the resize exists (21 Aug 2026, second Runway failure of the day):
+// cropping a 1152x1248 Gemini frame to 9:16 leaves 702x1248, which is a
+// correct shape but SMALLER than the 720x1280 the engine renders. Runway
+// accepted the task and then failed it with a bare "An unexpected error
+// occurred", twice, reproducibly, on a frame that differed from a
+// successful run only in its dimensions -- the working run had sent an
+// uncropped 1024x1024. Handing the engine a frame that is already exactly
+// the size it will output removes the guesswork on both sides. The upscale
+// is small (702 -> 720 here, under three percent) and lanczos keeps it
+// clean; the crop before it still guarantees the shape, so this is a pure
+// resize that can never stretch or distort.
+const ENGINE_FRAME_SIZE = { '9:16': [720, 1280], '16:9': [1280, 720], '1:1': [960, 960] };
+
+export async function cropToAspect(srcPath, outPath, aspectRatio) {
+  const ratio = String(aspectRatio ?? '9:16');
+  const [w, h] = ratio.split(':').map(Number);
   if (!w || !h) { await copyFile(srcPath, outPath); return; }
   // ffmpeg picks the largest centred rectangle of the target ratio that
-  // fits inside the source, so nothing is ever upscaled or stretched.
-  const filter = `crop='min(iw,ih*${w}/${h})':'min(ih,iw*${h}/${w})'`;
+  // fits inside the source, so the crop itself never stretches anything.
+  const crop = `crop='min(iw,ih*${w}/${h})':'min(ih,iw*${h}/${w})'`;
+  // Only resize for a ratio the engine actually renders. A project on some
+  // other shape still gets the correct crop; forcing it into one of these
+  // three boxes would stretch the picture, which is worse than leaving the
+  // engine to size it.
+  const box = ENGINE_FRAME_SIZE[ratio];
+  const filter = box ? `${crop},scale=${box[0]}:${box[1]}:flags=lanczos` : crop;
   await execFileP('ffmpeg', ['-y', '-i', srcPath, '-vf', filter, outPath]);
 }
 

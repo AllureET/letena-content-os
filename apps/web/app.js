@@ -185,6 +185,55 @@ function renderScriptImportDraft(payload, scriptId) {
     <textarea id="st-script-draftjson" rows="14">${esc(JSON.stringify(draft, null, 2))}</textarea>
     <div style="margin-top:10px"><button class="primary" data-stscriptapply="${esc(scriptId)}">Apply draft</button></div>`;
 }
+// In-page image preview (owner request, 21 Aug 2026: "cant we have an
+// inpage preview or does the image have to pop up as a new page (maybe
+// that or download can be an option)"). Every reference thumbnail used to
+// be wrapped in a target="_blank" link, which threw the reviewer out of
+// the studio into a bare image tab and lost their scroll position. This
+// opens the full-size image over the page instead, and offers BOTH of the
+// old behaviours as explicit buttons: download, or open in a new tab.
+//
+// Built with inline styles and no markup in index.html on purpose, so the
+// whole feature lives in this one function and nothing else has to change
+// to adopt it. Esc closes, as does clicking the backdrop.
+function imagePreview(url, caption) {
+  if (!url) return;
+  document.getElementById('img-lightbox')?.remove();
+  const wrap = document.createElement('div');
+  wrap.id = 'img-lightbox';
+  wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(12,12,16,.86);' +
+    'display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:24px';
+  const bar = document.createElement('div');
+  bar.style.cssText = 'display:flex;gap:8px;align-items:center;color:#fff;font-size:12px;max-width:92vw';
+  const label = document.createElement('span');
+  label.textContent = caption || '';
+  label.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85';
+  const mkBtn = (text, fn) => {
+    const b = document.createElement('button');
+    b.textContent = text;
+    b.style.cssText = 'font-size:12px;padding:4px 10px;cursor:pointer';
+    b.onclick = (ev) => { ev.stopPropagation(); fn(); };
+    return b;
+  };
+  const dl = document.createElement('a');
+  dl.href = url; dl.download = ''; dl.textContent = 'Download';
+  dl.style.cssText = 'font-size:12px;padding:4px 10px;background:#fff;color:#111;border-radius:4px;text-decoration:none';
+  dl.onclick = (ev) => ev.stopPropagation();
+  bar.append(label, dl,
+    mkBtn('Open in new tab', () => window.open(url, '_blank', 'noopener')),
+    mkBtn('Close', () => wrap.remove()));
+  const img = document.createElement('img');
+  img.src = url;
+  img.style.cssText = 'max-width:92vw;max-height:78vh;border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.5);background:#fff';
+  img.onclick = (ev) => ev.stopPropagation();
+  wrap.append(bar, img);
+  wrap.onclick = () => wrap.remove();
+  const onKey = (ev) => { if (ev.key === 'Escape') { wrap.remove(); document.removeEventListener('keydown', onKey); } };
+  document.addEventListener('keydown', onKey);
+  document.body.appendChild(wrap);
+}
+window.imagePreview = imagePreview;
+
 // kind: false/undefined = normal, true = error (red, 5s), 'warn' = informational
 // flag (amber, 5s) -- used for non-blocking notices like platform-spec warnings.
 const toast = (msg, kind = false) => {
@@ -305,7 +354,7 @@ function assetThumb(a) {
   const u = mediaUrl(a.storage_key);
   const mt = a.mime_type ?? '';
   if (!u) return `<div class="ath none">${esc(a.kind)}</div>`;
-  if (mt.startsWith('image/')) return `<a href="${esc(u)}" target="_blank" rel="noopener" title="Open full size"><img class="ath" src="${esc(u)}" alt="${esc(a.title)}" loading="lazy" onerror="assetImgError(this,'${esc(a.kind)}')"></a>`;
+  if (mt.startsWith('image/')) return `<img class="ath" style="cursor:zoom-in" src="${esc(u)}" alt="${esc(a.title)}" loading="lazy" title="Click to preview" onclick="imagePreview('${esc(u)}', ${JSON.stringify(a.title ?? '').replace(/"/g, '&quot;')})" onerror="assetImgError(this,'${esc(a.kind)}')">`;
   if (mt.startsWith('video/')) return `<video class="ath" src="${esc(u)}" muted loop playsinline preload="metadata"
     onmouseover="this.play().catch(()=>{})" onmouseout="this.pause()"></video>`;
   if (mt.startsWith('audio/')) return `<div class="ath audio">&#9835;<audio controls preload="none" src="${esc(u)}"></audio></div>`;
@@ -1669,21 +1718,22 @@ const screens = {
           ${can('studio.generate') ? `<button data-stlockreftoggle="${esc(l.id)}">Reference tools</button>` : ''}
         </div>
         ${latestRef ? `<div style="margin-top:8px">
-          <a href="${esc(mediaUrl(latestRef.storage_key))}" target="_blank" rel="noopener" title="Open full size">
-            <img class="ath" style="max-width:160px;max-height:160px;border-radius:6px;display:block" src="${esc(mediaUrl(latestRef.storage_key))}" alt="${esc(l.entity_code)} reference" loading="lazy" onerror="assetImgError(this,'REFERENCE_IMAGE')">
-          </a>
-          <div style="font-size:11px;margin-top:2px"><span class="pill p-APPROVED" style="font-size:10px"><span class="d"></span>current</span> <span class="muted">&middot; this is the version used for generation &middot; click it to view full size</span></div>
-          ${refs.length > 1 ? `<div class="muted" style="font-size:11px;margin-top:8px;font-weight:600">Earlier versions -- click one to view, or make it current again:</div>
+          <img class="ath" style="max-width:160px;max-height:160px;border-radius:6px;display:block;cursor:zoom-in" src="${esc(mediaUrl(latestRef.storage_key))}" alt="${esc(l.entity_code)} reference" loading="lazy" title="Click to preview" onclick="imagePreview('${esc(mediaUrl(latestRef.storage_key))}','${esc(l.entity_code)} current reference')" onerror="assetImgError(this,'REFERENCE_IMAGE')">
+          <div style="font-size:11px;margin-top:2px"><span class="pill p-APPROVED" style="font-size:10px"><span class="d"></span>current</span> <span class="muted">&middot; this is the version used for generation &middot; click it to preview</span></div>
+          ${refs.length > 1 ? `<div class="muted" style="font-size:11px;margin-top:8px;font-weight:600">Earlier versions -- click one to preview, or make it current again:</div>
           <div class="flex" style="flex-wrap:wrap;gap:6px;margin-top:4px">
             ${[...new Map(refs.slice(0, -1).filter(r2 => r2.storage_key !== latestRef.storage_key).map(r2 => [r2.storage_key, r2])).values()].reverse().map(r2 => `
               <div style="text-align:center">
-                <a href="${esc(mediaUrl(r2.storage_key))}" target="_blank" rel="noopener" title="Open full size">
-                  <img class="ath" style="max-width:72px;max-height:72px;border-radius:4px;display:block" src="${esc(mediaUrl(r2.storage_key))}" alt="earlier version" loading="lazy" onerror="assetImgError(this,'REFERENCE_IMAGE')">
-                </a>
+                <img class="ath" style="max-width:72px;max-height:72px;border-radius:4px;display:block;cursor:zoom-in" src="${esc(mediaUrl(r2.storage_key))}" alt="earlier version" loading="lazy" title="Click to preview" onclick="imagePreview('${esc(mediaUrl(r2.storage_key))}','${esc(l.entity_code)} earlier version')" onerror="assetImgError(this,'REFERENCE_IMAGE')">
                 <button style="font-size:10px;padding:2px 6px;margin-top:2px" data-strefselect="${esc(l.id)}|${esc(r2.id)}">Make current</button>
               </div>`).join('')}
           </div>` : ''}
         </div>` : `<div class="muted" style="font-size:12px;margin-top:8px">No reference image yet.</div>`}
+        ${can('studio.generate') ? `<div style="margin-top:10px">
+          <button data-stpacktoggle="${esc(l.id)}">Reference pack (sheets)</button>
+          <span class="muted" style="font-size:11px;margin-left:6px">Turnaround, expressions, poses, costume, palette, location angles</span>
+          <div id="stpackbox-${esc(l.id)}" hidden style="margin-top:8px"></div>
+        </div>` : ''}
         ${can('studio.generate') ? `<div id="stlockrefpanel-${esc(l.id)}" hidden style="margin-top:10px;border-top:1px solid #e5e5e5;padding-top:10px">
           <div style="font-size:12px;font-weight:600;margin-bottom:6px">Remix with Gemini</div>
           <div class="muted" style="font-size:11px;margin-bottom:4px">Sends the current reference image back to Gemini with a new instruction (e.g. "add glasses", "same doctor, evening lighting") instead of generating from scratch. Becomes the new current version; the old one stays in history.</div>
@@ -3441,7 +3491,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3553,6 +3603,70 @@ document.addEventListener('click', async (e) => {
       const [lockId, libAssetId] = b.dataset.stlockattach.split('|');
       await api('POST', `/studio/locks/${lockId}/reference/attach`, { library_asset_id: libAssetId });
       toast('Attached from the library. This is now the current reference.'); return render();
+    }
+    if (b.dataset.stpacktoggle) {
+      const lockId = b.dataset.stpacktoggle;
+      const box = document.getElementById(`stpackbox-${lockId}`);
+      if (!box) return;
+      if (!box.hidden) { box.hidden = true; return; }
+      box.hidden = false;
+      box.innerHTML = '<div class="muted" style="font-size:12px">Loading…</div>';
+      const KINDS = ['MASTER', 'TURNAROUND', 'EXPRESSIONS', 'POSES', 'COSTUME_DETAIL', 'COLOR_PALETTE',
+        'LOCATION_ANGLES', 'LOCATION_LAYOUT', 'PROPS', 'OTHER'];
+      const pretty = (k) => k.toLowerCase().replace(/_/g, ' ');
+      try {
+        const r = await api('GET', `/studio/locks/${lockId}/reference-pack`);
+        const items = r.items ?? [];
+        box.innerHTML = `
+          <div class="claimrow">
+            <div class="muted" style="font-size:11px;margin-bottom:6px">Make these anywhere you like (ChatGPT, Midjourney, a real photoshoot) and drop them here. They stay attached to this lock, show up in the asset library, and the composer feeds the most useful one to Gemini as extra identity conditioning. A sheet does <b>not</b> become the composable reference unless you tick the box.</div>
+            <div class="flex" style="gap:6px;flex-wrap:wrap;align-items:flex-end">
+              <div><label style="font-size:11px">Sheet kind</label>
+                <select id="stpackkind-${esc(lockId)}" style="max-width:180px">${KINDS.map(k => `<option value="${k}">${esc(pretty(k))}</option>`).join('')}</select></div>
+              <div><label style="font-size:11px">Image files (up to 12)</label>
+                <input type="file" id="stpackfiles-${esc(lockId)}" accept="image/*" multiple></div>
+              <label class="otpick" style="font-size:11px"><input type="checkbox" id="stpackcurrent-${esc(lockId)}"> also make the first one the current reference</label>
+              <button data-stpackupload="${esc(lockId)}">Upload sheets</button>
+            </div>
+            <div class="muted" style="font-size:11px;margin-top:4px">Every file in one upload is filed under the chosen sheet kind. Upload each kind separately to label them properly.</div>
+          </div>
+          ${items.length ? `<div style="margin-top:10px">${KINDS.filter(k => items.some(i => i.sheet_kind === k)).map(k => `
+            <div style="margin-bottom:8px">
+              <div style="font-size:11px;font-weight:600">${esc(pretty(k))}</div>
+              <div class="flex" style="flex-wrap:wrap;gap:6px;margin-top:3px">
+                ${items.filter(i => i.sheet_kind === k).map(i => `
+                  <img class="ath" style="max-width:88px;max-height:88px;border-radius:4px;cursor:zoom-in" src="${esc(mediaUrl(i.storage_key))}" alt="${esc(pretty(k))}" loading="lazy" title="Click to preview" onclick="imagePreview('${esc(mediaUrl(i.storage_key))}','${esc(pretty(k))}')" onerror="assetImgError(this,'REFERENCE_IMAGE')">`).join('')}
+              </div>
+            </div>`).join('')}</div>`
+            : '<div class="muted" style="font-size:12px;margin-top:8px">No sheets uploaded for this lock yet.</div>'}`;
+      } catch (ex) {
+        box.innerHTML = `<div class="muted" style="font-size:12px">${esc(ex.message)}</div>`;
+      }
+      return;
+    }
+    if (b.dataset.stpackupload) {
+      const lockId = b.dataset.stpackupload;
+      const files = [...(document.getElementById(`stpackfiles-${lockId}`)?.files ?? [])];
+      if (!files.length) return toast('Choose at least one image file.', 'warn');
+      if (files.length > 12) return toast('At most 12 sheets per upload.', 'warn');
+      const oversize = files.find(f => f.size > 8 * 1024 * 1024);
+      if (oversize) return toast(`${oversize.name} is over the 8MB per-sheet cap.`, 'warn');
+      const kind = document.getElementById(`stpackkind-${lockId}`)?.value ?? 'OTHER';
+      const makeCurrent = document.getElementById(`stpackcurrent-${lockId}`)?.checked === true;
+      b.disabled = true; b.textContent = 'Uploading…';
+      try {
+        const sheets = [];
+        for (const [i, f] of files.entries()) {
+          sheets.push({ sheet_kind: kind, image_base64: await fileB64(f),
+            mime_type: f.type || 'image/png', note: f.name,
+            make_current: makeCurrent && i === 0 });
+        }
+        const r = await api('POST', `/studio/locks/${lockId}/reference-pack`, { sheets });
+        toast(`${r.saved.length} sheet(s) added${r.skipped.length ? `, ${r.skipped.length} skipped` : ''}.`);
+      } finally {
+        b.disabled = false; b.textContent = 'Upload sheets';
+      }
+      return render();
     }
     if (b.dataset.strefselect) {
       const [lockId, assetId] = b.dataset.strefselect.split('|');

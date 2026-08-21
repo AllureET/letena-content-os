@@ -34,7 +34,7 @@ process.env.LCOS_STORAGE_DIR = '/tmp/lcos-test-storage';
 
 const { buildServer } = await import('../src/server.mjs');
 const { pool } = await import('../src/core.mjs');
-const { kling, veo } = await import('../src/adapters/index.mjs');
+const { kling, veo, runway } = await import('../src/adapters/index.mjs');
 
 let app, token;
 const login = async (email) => (await app.inject({ method: 'POST', url: '/api/v1/auth/login',
@@ -56,10 +56,15 @@ const newProject = async (title) => {
   assert.equal(r.statusCode, 200, r.body);
   return r.json();
 };
-const newShot = async (projectId, shotCode) => {
+// engine is pinned explicitly (21 Aug 2026): RUNWAY became the system
+// default and the fallback target, so a test that wants to exercise the
+// same-engine retry and the fallback hop has to say which engine it starts
+// on rather than relying on the default. The ladder's mechanics under test
+// are unchanged; only the topology around them moved.
+const newShot = async (projectId, shotCode, engine = 'KLING') => {
   const r = await call('POST', `/studio/projects/${projectId}/shots`,
     { shot_code: shotCode, order_index: 0, duration_target_s: 5,
-      story: { beat: 'a beat' }, generation: { mode_preference: 'text_to_video' } });
+      story: { beat: 'a beat' }, generation: { mode_preference: 'text_to_video', engine } });
   assert.equal(r.statusCode, 200, r.body);
   return r.json();
 };
@@ -96,10 +101,10 @@ test('a PROVIDER_DOWN failure skips the same-engine retry and succeeds via the f
     klingCalls += 1;
     throw new Error('Kling provider is currently unavailable');
   });
-  let veoCalls = 0;
-  t.mock.method(veo, 'textToVideo', async ({ assetId }) => {
-    veoCalls += 1;
-    return { status: 'SUCCEEDED', storage_key: `assets/generated/${assetId}/broll-veo.mp4`,
+  let fallbackCalls = 0;
+  t.mock.method(runway, 'textToVideo', async ({ assetId }) => {
+    fallbackCalls += 1;
+    return { status: 'SUCCEEDED', storage_key: `assets/generated/${assetId}/broll-runway.mp4`,
       provider_job_id: `fallback-${assetId.slice(0, 8)}`, cost_usd: 0 };
   });
 
@@ -110,10 +115,11 @@ test('a PROVIDER_DOWN failure skips the same-engine retry and succeeds via the f
 
   const asset = r.json().asset;
   assert.equal(klingCalls, 1, 'PROVIDER_DOWN gets no same-engine retry in this phase-1 design');
-  assert.equal(veoCalls, 1, 'exactly one fallback attempt on the other engine');
+  assert.equal(fallbackCalls, 1, 'exactly one fallback attempt on the fallback engine');
   assert.equal(asset.generator.attempt_count, 2);
   assert.equal(asset.generator.fallback_used, true);
-  assert.equal(asset.generator.provider, 'VEO', 'provider reflects whichever engine actually produced the asset');
+  assert.equal(asset.generator.provider, 'RUNWAY',
+    'provider reflects whichever engine actually produced the asset; RUNWAY is the fallback target since it is the only implemented adapter');
 });
 
 test('a POLICY failure goes straight to NEEDS_REVIEW: no retry, no fallback, exactly one real call', async (t) => {
@@ -122,10 +128,10 @@ test('a POLICY failure goes straight to NEEDS_REVIEW: no retry, no fallback, exa
     klingCalls += 1;
     throw new Error('rejected by content moderation: blocked content');
   });
-  let veoCalls = 0;
-  t.mock.method(veo, 'textToVideo', async () => {
-    veoCalls += 1;
-    return { status: 'SUCCEEDED', storage_key: 'assets/generated/should-not-be-called/broll-veo.mp4', cost_usd: 0 };
+  let fallbackCalls = 0;
+  t.mock.method(runway, 'textToVideo', async () => {
+    fallbackCalls += 1;
+    return { status: 'SUCCEEDED', storage_key: 'assets/generated/should-not-be-called/broll-runway.mp4', cost_usd: 0 };
   });
 
   const project = await newProject('Retry POLICY case');
@@ -139,7 +145,7 @@ test('a POLICY failure goes straight to NEEDS_REVIEW: no retry, no fallback, exa
   assert.equal(body.attempts[0].engine, 'KLING');
   assert.equal(body.attempts[0].error_class, 'POLICY');
   assert.equal(klingCalls, 1);
-  assert.equal(veoCalls, 0, 'the fallback engine is never a policy workaround');
+  assert.equal(fallbackCalls, 0, 'the fallback engine is never a policy workaround');
 
   const shotAfter = await getShot(project.id, shot.id);
   assert.equal(shotAfter.status, 'NEEDS_REVIEW');
@@ -151,10 +157,10 @@ test('total exhaustion after all 3 attempts returns 502 with the full attempts a
     klingCalls += 1;
     throw new Error('connection reset (ECONNRESET) contacting Kling');
   });
-  let veoCalls = 0;
-  t.mock.method(veo, 'textToVideo', async () => {
-    veoCalls += 1;
-    throw new Error('Veo provider is currently unavailable');
+  let fallbackCalls = 0;
+  t.mock.method(runway, 'textToVideo', async () => {
+    fallbackCalls += 1;
+    throw new Error('Runway provider is currently unavailable');
   });
 
   const project = await newProject('Retry exhaustion case');
@@ -165,7 +171,7 @@ test('total exhaustion after all 3 attempts returns 502 with the full attempts a
   const body = r.json();
   assert.equal(body.code, 'GENERATION_FAILED');
   assert.equal(klingCalls, 2, 'same-engine attempt plus its one TRANSIENT retry');
-  assert.equal(veoCalls, 1, 'then exactly one fallback attempt, and no more after that');
+  assert.equal(fallbackCalls, 1, 'then exactly one fallback attempt, and no more after that');
   assert.equal(body.attempts.length, 3, 'never hide the attempt history from the reviewer');
   assert.equal(body.attempts[0].engine, 'KLING');
   assert.equal(body.attempts[0].attempt_number, 1);
@@ -173,10 +179,41 @@ test('total exhaustion after all 3 attempts returns 502 with the full attempts a
   assert.equal(body.attempts[1].engine, 'KLING');
   assert.equal(body.attempts[1].attempt_number, 2);
   assert.equal(body.attempts[1].error_class, 'TRANSIENT');
-  assert.equal(body.attempts[2].engine, 'VEO');
+  assert.equal(body.attempts[2].engine, 'RUNWAY');
   assert.equal(body.attempts[2].attempt_number, 3);
   assert.equal(body.attempts[2].error_class, 'PROVIDER_DOWN');
 
   const shotAfter = await getShot(project.id, shot.id);
   assert.equal(shotAfter.status, 'NEEDS_REVIEW');
+});
+
+// 21 Aug 2026: RUNWAY is both the default engine and the fallback target,
+// so it is the one engine with nowhere to fall back TO. Rerouting a real
+// Runway outage onto the kling/veo skeletons would burn an attempt and
+// report a misleading second error ("requires KLING_ACCESS_KEY"), hiding
+// the actual cause. The ladder stops instead, and this pins that.
+test('a RUNWAY failure exhausts without rerouting onto an unimplemented engine', async (t) => {
+  let runwayCalls = 0;
+  t.mock.method(runway, 'textToVideo', async () => {
+    runwayCalls += 1;
+    throw new Error('Runway provider is currently unavailable');
+  });
+  let klingCalls = 0;
+  t.mock.method(kling, 'textToVideo', async () => {
+    klingCalls += 1;
+    return { status: 'SUCCEEDED', storage_key: 'assets/generated/should-not-be-called/broll.mp4', cost_usd: 0 };
+  });
+
+  const project = await newProject('Runway no-fallback case');
+  const shot = await newShot(project.id, 'SH-R5', 'RUNWAY');
+  const r = await call('POST', `/studio/shots/${shot.id}/generate`, {});
+  assert.equal(r.statusCode, 502, r.body);
+
+  const body = r.json();
+  assert.equal(body.code, 'GENERATION_FAILED');
+  assert.equal(runwayCalls, 1, 'PROVIDER_DOWN gets no same-engine retry');
+  assert.equal(klingCalls, 0, 'never reroute onto a skeleton adapter that cannot succeed');
+  assert.equal(body.attempts.length, 1);
+  assert.equal(body.attempts[0].engine, 'RUNWAY');
+  assert.equal(body.attempts[0].error_class, 'PROVIDER_DOWN');
 });

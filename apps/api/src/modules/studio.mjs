@@ -75,6 +75,11 @@ const MOCK = () => (process.env.LCOS_ADAPTER_MODE || 'MOCK').toUpperCase() === '
 const ESTIMATED_COST_USD = {
   KLING_VIDEO_PER_S: 0.35,       // Kling generative video, per second of output
   VEO_VIDEO_PER_S: 0.50,         // Veo generative video, per second of output
+  // Runway Gen-4 Turbo: 5 credits/s at $0.01/credit (21 Aug 2026, the
+  // adapter's own default model). Gen-4.5 is 12 credits/s -- the adapter
+  // reports its REAL cost_usd per call, so this estimate only ever gates
+  // the budget check before the call, never what actually gets recorded.
+  RUNWAY_VIDEO_PER_S: 0.05,
   GEMINI_REFERENCE_IMAGE: 0.04,  // Gemini reference/keyframe still, flat per image
   GEMINI_COMPOSE_IMAGE: 0.04,    // Gemini character+environment composite still, flat per image
   SUNO_MUSIC_TRACK: 0.20,        // Suno music bed, flat per generated track
@@ -222,6 +227,37 @@ function negativePromptFor(locks) {
 }
 
 const LOCK_ENTITY_TYPES = ['STYLE', 'CHARACTER', 'ENVIRONMENT', 'PROP'];
+
+// Reference-pack sheet kinds (migration 0039). Mirrors the sections of a
+// standard AI-production character/location reference sheet, which is what
+// the owner builds outside LCOS and needed somewhere to put.
+const SHEET_KINDS = ['MASTER', 'TURNAROUND', 'EXPRESSIONS', 'POSES', 'COSTUME_DETAIL', 'COLOR_PALETTE',
+  'LOCATION_ANGLES', 'LOCATION_LAYOUT', 'PROPS', 'OTHER'];
+
+// Which pack sheet best CONDITIONS a generation for a given entity, in
+// preference order. Gemini accepts at most 3 conditioning images, so the
+// composer sends the lock's current reference plus at most one pack sheet
+// each -- the one that carries the most identity information the flat
+// reference does not: a turnaround for a person, an angle set for a place.
+// Returns a storage_key or null.
+async function bestPackSheetKey(lockId, entityType) {
+  const preference = entityType === 'CHARACTER'
+    ? ['TURNAROUND', 'EXPRESSIONS', 'POSES', 'COSTUME_DETAIL']
+    : entityType === 'ENVIRONMENT'
+      ? ['LOCATION_ANGLES', 'LOCATION_LAYOUT', 'PROPS']
+      : ['MASTER', 'OTHER'];
+  const r = await q(
+    `SELECT storage_key, sheet_kind FROM studio.assets
+     WHERE sheet_kind = ANY($1) AND storage_key IS NOT NULL AND generator->>'lock_id' = $2
+     ORDER BY created_at DESC`,
+    [preference, lockId]);
+  if (!r.rows.length) return null;
+  for (const kind of preference) {
+    const hit = r.rows.find(row => row.sheet_kind === kind);
+    if (hit) return hit.storage_key;
+  }
+  return null;
+}
 
 // Turns the flat field set the studio_lock_drafter agent returns into the
 // nested lock.data shape compileStillPrompt() actually reads (see its own
@@ -528,7 +564,16 @@ async function runGenerationLadder({ project, actorId, engine, engineName, mode,
     if (r.errorClass === 'POLICY') return { success: false, attempts: failedAttempts };
   }
 
-  const fallbackEngineName = engineName === 'VEO' ? 'KLING' : 'VEO';
+  // Fallback target (21 Aug 2026): RUNWAY is the only engine with a real
+  // implemented adapter, so it is what everything else falls back TO, and
+  // a RUNWAY failure falls back to nothing usable -- rerouting a real
+  // provider outage onto a skeleton that throws instantly would just burn
+  // an attempt and report a misleading second error. When RUNWAY is the
+  // engine that failed, the ladder stops here rather than pretending.
+  if (engineName === 'RUNWAY') {
+    return { success: false, attempts: failedAttempts, attemptCount: n, fallbackUsed: false };
+  }
+  const fallbackEngineName = 'RUNWAY';
   const fallbackEngine = videoEngine(fallbackEngineName);
   n += 1;
   r = await attemptGenerationOnce({ project, actorId, engineObj: fallbackEngine, engineLabel: fallbackEngineName, mode, callArgs, attemptNumber: n });
@@ -1376,6 +1421,108 @@ export default async function routes(app) {
     return asset;
   });
 
+  // Reference PACK upload (owner request, 21 Aug 2026): "once you create a
+  // character or background reference, I can use chatgpt to create these,
+  // how can we use it for the LCOS and is there a place where I can insert
+  // it right after we lock in a character and background". This is that
+  // place. The single-image /reference/upload above answers "give this lock
+  // one picture"; this answers "give this lock its whole reference sheet
+  // set" -- a full-body turnaround, an expression sheet, a pose sheet,
+  // costume close-ups, a colour palette, location angles, a layout plan, a
+  // props sheet -- in ONE call, each image declaring what kind of sheet it
+  // is (migration 0039's sheet_kind).
+  //
+  // Why sheet_kind matters rather than just dumping them all in as more
+  // reference images: Gemini's image calls take at most 3 conditioning
+  // images, so something has to CHOOSE which ones to send. Labelled sheets
+  // let compose-first-frame send the master plus the turnaround (identity
+  // from every angle) instead of whichever three images happened to be
+  // appended last. Unlabelled uploads keep working exactly as before.
+  //
+  // The pack does NOT change which image is "current": sheets are stored
+  // and listed, and only an image explicitly marked make_current joins the
+  // lock's reference_asset_ids. A turnaround sheet is a contact sheet of
+  // several small figures -- excellent as identity conditioning, wrong as
+  // the single frame a shot composes from -- so it must never silently
+  // become the thing that gets composed.
+  app.post('/studio/locks/:lockId/reference-pack',
+    { preHandler: requirePerm('studio.generate'), bodyLimit: 48 * 1024 * 1024 }, async (req, reply) => {
+    const lock = await one(`SELECT * FROM studio.locks WHERE id=$1`, [req.params.lockId]);
+    if (!lock) return reply.code(404).send(err(404, 'NOT_FOUND', 'lock not found'));
+    const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [lock.project_id]);
+    const sheets = req.body?.sheets;
+    if (!Array.isArray(sheets) || !sheets.length) {
+      return reply.code(422).send(err(422, 'VALIDATION',
+        'sheets must be a non-empty array of { sheet_kind, image_base64, mime_type?, note?, make_current? }'));
+    }
+    if (sheets.length > 12) {
+      return reply.code(422).send(err(422, 'VALIDATION', 'at most 12 sheets per upload'));
+    }
+    const saved = [];
+    const skipped = [];
+    for (const [i, s] of sheets.entries()) {
+      const reasons = [];
+      if (!SHEET_KINDS.includes(s?.sheet_kind)) reasons.push(`sheet_kind must be one of ${SHEET_KINDS.join(', ')}`);
+      if (!s?.image_base64) reasons.push('image_base64 is required');
+      let buf = null;
+      if (!reasons.length) {
+        try { buf = Buffer.from(s.image_base64, 'base64'); }
+        catch { reasons.push('image_base64 is not valid base64'); }
+        if (buf && buf.length > 8 * 1024 * 1024) reasons.push('each sheet is capped at 8MB');
+      }
+      if (reasons.length) { skipped.push({ index: i, sheet_kind: s?.sheet_kind ?? null, reason: reasons.join('; ') }); continue; }
+      const mt = s.mime_type || 'image/png';
+      const ext = mt === 'image/jpeg' ? 'jpg' : mt === 'image/webp' ? 'webp' : 'png';
+      const assetId = crypto.randomUUID();
+      const key = `assets/uploaded/${assetId}/sheet.${ext}`;
+      await storage.put(key, buf);
+      const asset = await one(
+        `INSERT INTO studio.assets (id, project_id, kind, status, storage_key, generator, prompt_job_code,
+           settings, sheet_kind, sheet_note)
+         VALUES ($1,$2,'REFERENCE_IMAGE','GENERATED',$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [assetId, lock.project_id, key,
+         // lock_id is what scopes this sheet to THIS lock: studio.assets has
+         // no lock_id column (a reference has always been reachable only
+         // through locks.reference_asset_ids), and a pack sheet deliberately
+         // does not join that array, so without recording the owner here a
+         // pack would be project-wide and every lock would show every other
+         // lock's sheets.
+         JSON.stringify({ provider: 'UPLOAD', mime_type: mt, reference_pack: true, lock_id: lock.id }),
+         code('JOB'), JSON.stringify({}), s.sheet_kind, s.note ?? null]);
+      // Only an explicitly-flagged sheet becomes the lock's current
+      // reference; see the note above on why a turnaround must not.
+      if (s.make_current === true) {
+        await q(`UPDATE studio.locks SET reference_asset_ids = array_append(reference_asset_ids, $2) WHERE id=$1`,
+          [lock.id, asset.id]);
+      }
+      await bridgeAssetToLibrary({ asset, kindHint: lock.entity_type,
+        title: `${lock.entity_code} ${s.sheet_kind.toLowerCase().replace(/_/g, ' ')} — ${project.title}`,
+        actorId: req.actor?.id });
+      saved.push(asset);
+    }
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [lock.project_id, req.actor?.id ?? null, `locks/${lock.entity_code}`,
+       `uploaded a reference pack for ${lock.entity_code}: ${saved.map(a => a.sheet_kind).join(', ') || 'nothing accepted'}` +
+       (skipped.length ? ` (${skipped.length} skipped)` : '')]);
+    return { saved, skipped };
+  });
+
+  // Everything hanging off this lock as a structured pack, newest first
+  // per kind. Separate from the lock's reference_asset_ids (the version
+  // history of the ONE composable image) on purpose: a pack is a library
+  // ABOUT the entity, not a queue of candidate frames.
+  app.get('/studio/locks/:lockId/reference-pack', { preHandler: requirePerm('studio.read') }, async (req, reply) => {
+    const lock = await one(`SELECT * FROM studio.locks WHERE id=$1`, [req.params.lockId]);
+    if (!lock) return reply.code(404).send(err(404, 'NOT_FOUND', 'lock not found'));
+    const r = await q(
+      `SELECT id, storage_key, sheet_kind, sheet_note, created_at FROM studio.assets
+       WHERE sheet_kind IS NOT NULL AND storage_key IS NOT NULL
+         AND generator->>'lock_id' = $1
+       ORDER BY created_at DESC`,
+      [lock.id]);
+    return { items: r.rows, sheet_kinds: SHEET_KINDS };
+  });
+
   // Make an OLDER reference version this lock's current one (owner
   // question, 21 Aug 2026: "i dont understand how to change the
   // references"). The convention everywhere in this file is append-only /
@@ -1584,8 +1731,21 @@ export default async function routes(app) {
 
     const assetId = crypto.randomUUID();
     const prompt = compileComposePrompt(characterLock, environmentLock, styleLock);
-    const gen = await gemini.generateImage({ prompt, assetId,
-      referenceImageKeys: [characterRef.storage_key, environmentRef.storage_key] });
+    // Reference-pack conditioning (21 Aug 2026): if either lock has an
+    // uploaded pack, add its most identity-bearing sheet alongside the two
+    // flat references. Gemini caps conditioning at 3 images, so the
+    // character's sheet wins the third slot when both have one -- identity
+    // drift on the presenter is far more noticeable than a background
+    // shifting slightly. With no pack uploaded this is byte-for-byte the
+    // two-image call it has always been.
+    const [charSheet, envSheet] = await Promise.all([
+      bestPackSheetKey(characterLock.id, 'CHARACTER'),
+      bestPackSheetKey(environmentLock.id, 'ENVIRONMENT'),
+    ]);
+    const referenceImageKeys = [characterRef.storage_key, environmentRef.storage_key];
+    if (charSheet) referenceImageKeys.push(charSheet);
+    else if (envSheet) referenceImageKeys.push(envSheet);
+    const gen = await gemini.generateImage({ prompt, assetId, referenceImageKeys });
     const asset = await one(
       `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings)
        VALUES ($1,$2,$3,'KEYFRAME','GENERATED',$4,$5,$6,$7) RETURNING *`,
@@ -1713,10 +1873,19 @@ export default async function routes(app) {
     const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [shot.project_id]);
     const locks = (await q(`SELECT * FROM studio.locks WHERE id = ANY($1)`, [shot.locked_lock_ids])).rows;
 
-    const engine = videoEngine(shot.generation?.engine ?? project.video_engine);
-    const engineName = engine === videoEngine('VEO') ? 'VEO' : 'KLING';
-    const estimatedCost = (engineName === 'VEO' ? ESTIMATED_COST_USD.VEO_VIDEO_PER_S : ESTIMATED_COST_USD.KLING_VIDEO_PER_S)
-      * Number(shot.duration_target_s);
+    // Engine resolution (21 Aug 2026): RUNWAY is the default and the only
+    // engine with a real adapter. Reading the requested name FIRST and
+    // deriving the object from it -- rather than the old identity
+    // comparison against videoEngine('VEO') -- is what lets a third engine
+    // exist at all; the previous two-way check could only ever answer
+    // "VEO or KLING" and would have silently mislabelled RUNWAY as KLING.
+    const requestedEngine = String(shot.generation?.engine ?? project.video_engine ?? 'RUNWAY').toUpperCase();
+    const engineName = ['RUNWAY', 'KLING', 'VEO'].includes(requestedEngine) ? requestedEngine : 'RUNWAY';
+    const engine = videoEngine(engineName);
+    const perSecond = engineName === 'VEO' ? ESTIMATED_COST_USD.VEO_VIDEO_PER_S
+      : engineName === 'KLING' ? ESTIMATED_COST_USD.KLING_VIDEO_PER_S
+      : ESTIMATED_COST_USD.RUNWAY_VIDEO_PER_S;
+    const estimatedCost = perSecond * Number(shot.duration_target_s);
     // Budget check happens BEFORE the shot is touched at all: a refusal
     // here means nothing was attempted, so the shot's status is left
     // exactly as it was rather than being flipped to GENERATING/NEEDS_REVIEW.
@@ -1746,9 +1915,15 @@ export default async function routes(app) {
           'generation.mode_preference is image_to_video but generation.first_frame_asset_id does not resolve to a stored asset'));
       }
     }
+    // durationS/aspectRatio are new (21 Aug 2026) and additive: the Runway
+    // adapter needs both (it bills in whole supported durations and wants
+    // an explicit pixel ratio), and the kling/veo skeletons ignore any
+    // property they do not read, so passing them is safe for every engine.
     const callArgs = mode === 'image_to_video'
-      ? { prompt: motionPrompt, negativePrompt: negative, referenceImageKey: firstFrame.storage_key, assetId }
-      : { prompt: motionPrompt, negativePrompt: negative, assetId };
+      ? { prompt: motionPrompt, negativePrompt: negative, referenceImageKey: firstFrame.storage_key, assetId,
+          durationS: Number(shot.duration_target_s), aspectRatio: project.aspect_ratio }
+      : { prompt: motionPrompt, negativePrompt: negative, assetId,
+          durationS: Number(shot.duration_target_s), aspectRatio: project.aspect_ratio };
 
     // Retry/repair/fallback ladder (playbook 15) replaces what used to be
     // a single unguarded provider call here -- see runGenerationLadder for

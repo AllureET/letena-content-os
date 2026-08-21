@@ -91,10 +91,166 @@ export const veo = {
   },
 };
 
+// ---------- generative video: Runway (the one REAL implementation) ----------
+// Built 21 Aug 2026 on the owner's direction ("I don't want this running
+// through veo. I think runway is cheaper is it not?"). It is, substantially:
+//
+//   Runway Gen-4 Turbo   ~$0.05/s   (5 credits/s at $0.01/credit)
+//   Runway Gen-4.5       ~$0.12/s   (12 credits/s)
+//   Veo 3.1 Fast         ~$0.15/s
+//   Kling (our estimate) ~$0.35/s
+//   Veo 3.1              ~$0.40/s
+//
+// Beyond price, Runway's single developer API also fronts Veo, Kling and
+// Seedance, so this one adapter removes the need to ever finish the two
+// skeletons above. Unlike kling/veo, everything below is a real HTTP
+// implementation, not a throw.
+//
+// Auth is a single bearer key from dev.runwayml.com (NOT the same thing as
+// a Runway app subscription, and not the same as any MCP connection):
+// RUNWAY_API_KEY in the admin settings page. The X-Runway-Version header is
+// required on every call.
+const RUNWAY_BASE = 'https://api.dev.runwayml.com/v1';
+const RUNWAY_VERSION = '2024-11-06';
+const RUNWAY_DEFAULT_I2V_MODEL = 'gen4_turbo';   // cheapest real path: animate a composed first frame
+const RUNWAY_DEFAULT_T2V_MODEL = 'gen4.5';       // gen4_turbo has no text-only mode
+
+// Runway bills in whole supported durations, not arbitrary seconds.
+function runwayDuration(seconds) {
+  const n = Number(seconds) || 5;
+  return n > 7 ? 10 : 5;
+}
+// Runway wants an explicit pixel ratio string, not "9:16".
+function runwayRatio(aspect, model) {
+  const a = String(aspect ?? '9:16');
+  if (model === 'gen4_turbo') return a === '16:9' ? '1280:720' : a === '1:1' ? '960:960' : '720:1280';
+  return a === '16:9' ? '1280:720' : a === '1:1' ? '960:960' : '720:1280';
+}
+
+async function runwayPoll(taskId, key) {
+  // Runway generations take tens of seconds to a few minutes. Poll with a
+  // hard ceiling so a stuck job surfaces as a clear error instead of
+  // hanging the caller's request forever.
+  const deadline = Date.now() + 10 * 60 * 1000;
+  let delayMs = 5000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    delayMs = Math.min(delayMs * 1.3, 20000);
+    const res = await fetch(`${RUNWAY_BASE}/tasks/${taskId}`, {
+      headers: { Authorization: `Bearer ${key}`, 'X-Runway-Version': RUNWAY_VERSION },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`runway task poll ${res.status}${body ? `: ${body.slice(0, 300)}` : ''}`);
+    }
+    const task = await res.json();
+    if (task.status === 'SUCCEEDED') {
+      const url = Array.isArray(task.output) ? task.output[0] : task.output;
+      if (!url) throw new Error('runway reported SUCCEEDED but returned no output url');
+      return url;
+    }
+    if (task.status === 'FAILED' || task.status === 'CANCELLED') {
+      // Surface Runway's own failure text (content moderation, bad input,
+      // and so on) rather than a bare status, so runGenerationLadder's
+      // classifier upstream can see words like "moderation" and treat a
+      // policy rejection as POLICY instead of blindly retrying.
+      throw new Error(`runway ${task.status}: ${task.failure ?? task.failureCode ?? 'no reason given'}`);
+    }
+  }
+  throw new Error('runway generation timed out after 10 minutes');
+}
+
+async function runwayStore(url, key, assetId, suffix) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`runway output download failed: ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  const storageKey = `assets/generated/${assetId}/${suffix}.mp4`;
+  await storage.put(storageKey, buf);
+  return storageKey;
+}
+
+export const runway = {
+  // Animate an existing still (the composed first frame) -- the path Video
+  // Studio actually uses, and the cheap one. The image is sent as a base64
+  // data URI so nothing has to be publicly reachable first.
+  async imageToVideo({ prompt, negativePrompt, referenceImageKey, assetId, durationS, aspectRatio, model }) {
+    if (MOCK()) {
+      const key = `assets/generated/${assetId}/character-broll-runway.mp4`;
+      await storage.put(key, Buffer.from(`MOCK-RUNWAY-I2V ref=${referenceImageKey} ${String(prompt).slice(0, 100)}`));
+      return { status: 'SUCCEEDED', storage_key: key, provider_job_id: `mock-runway-i2v-${assetId.slice(0, 8)}`, cost_usd: 0 };
+    }
+    const key = need('RUNWAY_API_KEY');
+    const useModel = model || RUNWAY_DEFAULT_I2V_MODEL;
+    const imgB64 = readFileSync(storage.localPath(referenceImageKey)).toString('base64');
+    const duration = runwayDuration(durationS);
+    const body = {
+      model: useModel,
+      promptImage: `data:image/png;base64,${imgB64}`,
+      // Runway has no separate negative-prompt field; the convention is to
+      // fold it into the prompt as an explicit avoid-list.
+      promptText: negativePrompt ? `${prompt}\n\nAvoid: ${negativePrompt}` : String(prompt),
+      ratio: runwayRatio(aspectRatio, useModel),
+      duration,
+    };
+    const res = await fetch(`${RUNWAY_BASE}/image_to_video`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'X-Runway-Version': RUNWAY_VERSION, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      throw new Error(`runway image_to_video ${res.status}${errBody ? `: ${errBody.slice(0, 400)}` : ''}`);
+    }
+    const { id } = await res.json();
+    const outUrl = await runwayPoll(id, key);
+    const storageKey = await runwayStore(outUrl, key, assetId, 'character-broll-runway');
+    // Real per-second rates, so spent_usd stops being an estimate the day
+    // this adapter goes live (resolveSpendAmount prefers a real cost_usd).
+    const perS = useModel === 'gen4_turbo' ? 0.05 : 0.12;
+    return { status: 'SUCCEEDED', storage_key: storageKey, provider_job_id: id, cost_usd: Number((perS * duration).toFixed(4)) };
+  },
+
+  async textToVideo({ prompt, negativePrompt, assetId, durationS, aspectRatio, model }) {
+    if (MOCK()) {
+      const key = `assets/generated/${assetId}/broll-runway.mp4`;
+      await storage.put(key, Buffer.from(`MOCK-RUNWAY ${String(prompt).slice(0, 120)}`));
+      return { status: 'SUCCEEDED', storage_key: key, provider_job_id: `mock-runway-${assetId.slice(0, 8)}`, cost_usd: 0 };
+    }
+    const key = need('RUNWAY_API_KEY');
+    const useModel = model || RUNWAY_DEFAULT_T2V_MODEL;
+    const duration = runwayDuration(durationS);
+    const res = await fetch(`${RUNWAY_BASE}/text_to_video`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'X-Runway-Version': RUNWAY_VERSION, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: useModel,
+        promptText: negativePrompt ? `${prompt}\n\nAvoid: ${negativePrompt}` : String(prompt),
+        ratio: runwayRatio(aspectRatio, useModel),
+        duration,
+      }),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      throw new Error(`runway text_to_video ${res.status}${errBody ? `: ${errBody.slice(0, 400)}` : ''}`);
+    }
+    const { id } = await res.json();
+    const outUrl = await runwayPoll(id, key);
+    const storageKey = await runwayStore(outUrl, key, assetId, 'broll-runway');
+    return { status: 'SUCCEEDED', storage_key: storageKey, provider_job_id: id, cost_usd: Number((0.12 * duration).toFixed(4)) };
+  },
+};
+
 // The video engine slot. Everything that generates video asks this, so the
-// vendor is one configuration read, never a hard-wired import.
+// vendor is one configuration read, never a hard-wired import. RUNWAY is
+// the default (21 Aug 2026): it is the only one of the three with a real
+// implementation, and the cheapest. An explicit 'KLING'/'VEO' still
+// resolves to those skeletons so the setting keeps its meaning, but they
+// throw in production mode until someone implements them.
 export function videoEngine(name) {
-  return String(name ?? '').toUpperCase() === 'VEO' ? veo : kling;
+  const n = String(name ?? '').toUpperCase();
+  if (n === 'VEO') return veo;
+  if (n === 'KLING') return kling;
+  return runway;
 }
 
 // ---------- voice: Azure Speech (PRIMARY for Amharic) ----------

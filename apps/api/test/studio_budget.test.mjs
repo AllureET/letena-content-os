@@ -35,10 +35,17 @@ const newProject = async (title, budgetCapUsd) => {
   assert.equal(r.statusCode, 200, r.body);
   return r.json();
 };
+// engine is pinned to KLING (21 Aug 2026) so this file keeps testing the
+// GUARDRAIL MATH rather than the current price list. Every cap and
+// threshold below was chosen against Kling's $0.35/s estimate; RUNWAY
+// became the system default that day at $0.05/s, which would quietly stop
+// these caps from being crossed at all and turn four real assertions into
+// vacuous passes. Pinning keeps the arithmetic under test fixed no matter
+// which engine is cheapest this month.
 const newShot = async (projectId, shotCode, durationTargetS = 5) => {
   const r = await call('POST', `/studio/projects/${projectId}/shots`,
     { shot_code: shotCode, order_index: 0, duration_target_s: durationTargetS,
-      story: { beat: 'a beat' }, generation: { mode_preference: 'text_to_video' } });
+      story: { beat: 'a beat' }, generation: { mode_preference: 'text_to_video', engine: 'KLING' } });
   assert.equal(r.statusCode, 200, r.body);
   return r.json();
 };

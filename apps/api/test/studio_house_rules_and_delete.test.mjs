@@ -157,6 +157,36 @@ test('a shot whose render failed can be deleted even though it never left NEEDS_
   assert.equal(await one(`SELECT id FROM studio.shots WHERE id=$1`, [shot.id]), null);
 });
 
+test('a shot with a composed first frame does not block its own deletion', async () => {
+  // The guard was self-referential on the first real attempt: a shot's own
+  // first frame is by definition "in use by a shot", and that shot is the
+  // one going away. It reported "SH-01 cannot be deleted: SH-01 uses it as
+  // its first frame" and refused every shot deletion outright.
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+  const ch = (await call('POST', `/studio/projects/${projectId}/locks`,
+    { level: 'L1_ENTITY', entity_type: 'CHARACTER', entity_code: 'CHR-SELF', data: { name: 'Self' } })).json();
+  const en = (await call('POST', `/studio/projects/${projectId}/locks`,
+    { level: 'L1_ENTITY', entity_type: 'ENVIRONMENT', entity_code: 'ENV-SELF', data: { architecture: 'a room' } })).json();
+  await call('POST', `/studio/locks/${ch.id}/reference/upload`, { image_base64: PNG });
+  await call('POST', `/studio/locks/${en.id}/reference/upload`, { image_base64: PNG });
+  await call('POST', `/studio/locks/${ch.id}/approve`, {});
+  await call('POST', `/studio/locks/${en.id}/approve`, {});
+  const shot = (await call('POST', `/studio/projects/${projectId}/shots`,
+    { shot_code: 'SH-SELF', order_index: 9, duration_target_s: 5, story: { beat: 'self' },
+      continuity: { characters: ['CHR-SELF'], environment: 'ENV-SELF' },
+      generation: { mode_preference: 'image_to_video' } })).json();
+  const frame = await call('POST', `/studio/shots/${shot.id}/compose-first-frame`, {});
+  assert.equal(frame.statusCode, 200, frame.body);
+
+  const r = await call('DELETE', `/studio/shots/${shot.id}`);
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(await one(`SELECT id FROM studio.assets WHERE id=$1`, [frame.json().asset.id]), null,
+    'the frame goes with the shot it belonged to');
+  // The locks that frame was composed from are untouched.
+  const lock = await one(`SELECT reference_asset_ids FROM studio.locks WHERE id=$1`, [ch.id]);
+  assert.equal(lock.reference_asset_ids.length, 1);
+});
+
 test('a shot holding an accepted video is not deletable', async () => {
   const shot = (await call('POST', `/studio/projects/${projectId}/shots`,
     { shot_code: 'SH-KEEP', order_index: 2, duration_target_s: 5, story: { beat: 'keep' },

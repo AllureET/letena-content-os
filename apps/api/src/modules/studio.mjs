@@ -2582,13 +2582,21 @@ export default async function routes(app) {
 
   // Everything that would break if this asset disappeared, named. Returns a
   // list of reasons; empty means it is safe to remove.
-  async function assetDeleteBlockers(asset) {
+  // ignoreShotId is the shot currently being deleted, if any. Without it
+  // the guard is self-referential and refuses every shot deletion outright:
+  // a shot's own composed first frame is, by definition, "in use by a
+  // shot", and that shot is the one going away. Found on the first real
+  // attempt to delete a failed shot, which reported "SH-01 cannot be
+  // deleted: SH-01 uses it as its first frame". A dependency on something
+  // that is being deleted in the same breath is not a dependency.
+  async function assetDeleteBlockers(asset, ignoreShotId = null) {
     const blockers = [];
     if (asset.status === 'ACCEPTED') {
       blockers.push('it is accepted -- reject it first if you no longer want it');
     }
     const shotAccepted = await one(
-      `SELECT shot_code FROM studio.shots WHERE accepted_asset_id=$1`, [asset.id]);
+      `SELECT shot_code FROM studio.shots WHERE accepted_asset_id=$1 AND ($2::uuid IS NULL OR id <> $2)`,
+      [asset.id, ignoreShotId]);
     if (shotAccepted) blockers.push(`${shotAccepted.shot_code} has it as its accepted video`);
     const finalOf = await one(`SELECT code FROM studio.projects WHERE final_asset_id=$1`, [asset.id]);
     if (finalOf) blockers.push(`it is the final cut of ${finalOf.code}`);
@@ -2596,7 +2604,8 @@ export default async function routes(app) {
       `SELECT entity_code FROM studio.locks WHERE $1 = ANY(reference_asset_ids)`, [asset.id]);
     if (lockUsing) blockers.push(`the ${lockUsing.entity_code} lock uses it as a reference`);
     const shotFrame = await one(
-      `SELECT shot_code FROM studio.shots WHERE generation->>'first_frame_asset_id' = $1::text`, [asset.id]);
+      `SELECT shot_code FROM studio.shots WHERE generation->>'first_frame_asset_id' = $1::text
+       AND ($2::uuid IS NULL OR id <> $2)`, [asset.id, ignoreShotId]);
     if (shotFrame) blockers.push(`${shotFrame.shot_code} uses it as its first frame`);
     return blockers;
   }
@@ -2685,7 +2694,7 @@ export default async function routes(app) {
     // is worth stopping for rather than quietly breaking the lock.
     const own = (await q(`SELECT * FROM studio.assets WHERE shot_id=$1`, [shot.id])).rows;
     for (const a of own) {
-      const blockers = await assetDeleteBlockers(a);
+      const blockers = await assetDeleteBlockers(a, shot.id);
       if (blockers.length) {
         return reply.code(422).send(err(422, 'GUARD_FAILED',
           `${shot.shot_code} cannot be deleted: one of its images is still in use -- ${blockers.join('; ')}.`,

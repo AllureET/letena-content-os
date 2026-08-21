@@ -9,6 +9,30 @@ import { storage, gemini, kling } from '../adapters/index.mjs';
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 const MAX_UPLOAD = 8 * 1024 * 1024; // 8 MB base64 payload bound
 
+// Stored-file extension for an uploaded asset (21 Aug 2026). This used to be
+// `mime_type.split('/')[1].slice(0, 4)`, which is right for png/mp4/wav by
+// luck and wrong for everything else: audio/mpeg became ".mpeg", image/svg+xml
+// became ".svg+", video/quicktime became ".quic". Nothing in the upload path
+// noticed, because the extension is only ever read back by the media route in
+// server.mjs, which maps extension to Content-Type -- so the house background
+// track served as application/octet-stream and would not play in the library's
+// <audio> tag. Map the types we actually accept, and fall back to the old
+// behaviour (sanitised) for anything unlisted so an unusual upload still
+// stores rather than failing.
+const UPLOAD_EXT = {
+  'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a',
+  'audio/aac': 'aac', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/ogg': 'ogg',
+  'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov',
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/gif': 'gif',
+  'image/webp': 'webp', 'image/svg+xml': 'svg', 'application/json': 'json',
+  'application/pdf': 'pdf', 'text/plain': 'txt',
+};
+function uploadExt(mimeType) {
+  const m = String(mimeType ?? '').split(';')[0].trim().toLowerCase();
+  if (UPLOAD_EXT[m]) return UPLOAD_EXT[m];
+  return (m.split('/')[1] ?? 'bin').replace(/[^a-z0-9]/g, '').slice(0, 5) || 'bin';
+}
+
 export default async function routes(app) {
   // bodyLimit override (21 Aug 2026): MAX_UPLOAD below bounds the payload at
   // 8MB, but Fastify's GLOBAL default in server.mjs is 2MB -- so every
@@ -36,7 +60,7 @@ export default async function routes(app) {
       }
       const buf = Buffer.from(content_base64, 'base64');
       bytes = buf.length;
-      const ext = (mime_type.split('/')[1] ?? 'bin').slice(0, 4);
+      const ext = uploadExt(mime_type);
       storageKey = `assets/raw/${crypto.randomUUID()}/${title.replace(/[^\w.-]+/g, '_').slice(0, 60)}.${ext}`;
       await storage.put(storageKey, buf);
     }

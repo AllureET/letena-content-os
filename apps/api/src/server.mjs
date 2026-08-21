@@ -112,9 +112,19 @@ export async function buildServer() {
         || !fs.statSync(full).isFile()) {
       return reply.code(404).send(err(404, 'NOT_FOUND', 'media'));
     }
-    const types = { mp4: 'video/mp4', webm: 'video/webm', png: 'image/png', jpg: 'image/jpeg',
-      jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
-      mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', json: 'application/json' };
+    // 21 Aug 2026: 'mpeg', 'm4a', 'mov' and 'aac' were added after the house
+    // background track uploaded as audio/mpeg came back through this route as
+    // application/octet-stream and would not play in the library's <audio>
+    // tag. The upload path in modules/assets.mjs derives the stored file's
+    // extension from the mime SUBTYPE, so audio/mpeg lands on disk as .mpeg,
+    // not .mp3, and this table had no row for it. assets.mjs now maps mime
+    // types to real extensions, but files already on disk keep the extension
+    // they were written with, so both halves of the fix are needed.
+    const types = { mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+      webp: 'image/webp', svg: 'image/svg+xml',
+      mp3: 'audio/mpeg', mpeg: 'audio/mpeg', mpga: 'audio/mpeg', m4a: 'audio/mp4',
+      aac: 'audio/aac', wav: 'audio/wav', ogg: 'audio/ogg', json: 'application/json' };
     const ext = full.split('.').pop().toLowerCase();
     reply.type(types[ext] ?? 'application/octet-stream');
     return reply.send(fs.createReadStream(full));

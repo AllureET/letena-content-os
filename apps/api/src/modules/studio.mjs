@@ -168,6 +168,51 @@ async function attachReferenceAssets(locks) {
 
 // Still/keyframe prompt grammar (playbook 12.2), used for lock reference
 // generation and any first-frame still a shot needs.
+// The house rules every image prompt carries (21 Aug 2026, owner: "why
+// would your remix prompt say that, cant you set some standards for it so
+// it sticks to the main themes always").
+//
+// It happened because a remix prompt is free text, written once, in the
+// moment, and nothing underneath it held the line. Asked to take the books
+// off a shelf, the model filled the room with woven baskets and clay pots
+// until the doctor's office read as a craft shop, and Letena's teal and
+// mustard barely registered. Nothing was wrong with the instruction; there
+// was simply no floor beneath it.
+//
+// So there is one now, and it is appended LAST to every image prompt this
+// module sends -- lock references, composed first frames, and remixes
+// alike -- and it says outright that it wins over anything above it. Last
+// because these models weight the end of a prompt most heavily, and
+// because a one-off instruction should be able to change what is in the
+// room without being able to change what Letena looks like.
+//
+// The no-print rule is not house style, it is a hard technical constraint:
+// Runway's output check rejects generations made from input carrying
+// lettering (INTERNAL.BAD_OUTPUT.CODE01), which cost a whole evening
+// before it was understood. Everything with a screen or a label is named
+// explicitly, because "no text" alone was not enough -- book spines,
+// labelled boxes and device displays all read as text to the check.
+//
+// The logo rule is older and stands for a different reason: an image model
+// asked for the Letena logo invents one, and an invented logo shipping as
+// Letena's is worse than no logo. The real mark is composited by the
+// overlay system, which uses the actual file.
+export const HOUSE_IMAGE_RULES = [
+  '[HOUSE RULES -- these override anything above them and are never optional]',
+  'BRAND PALETTE: deep teal, warm mustard/gold, terracotta, soft cream, warm walnut wood. These colours must be clearly present and must read as a deliberate palette, not as scattered accents.',
+  'PEOPLE: Ethiopian, in an Ethiopian setting. Warm, dignified, unhurried. Never a Western stock-photo clinic.',
+  'SETTING: whatever the description asks for, it must still read at a glance as a real Letena space -- a sexual and reproductive health consultation room, a clinical office, or a warm podcast/studio corner. Never a shop, a gallery, a market stall, a craft display, or a home.',
+  'PROPS: real furniture and real clinical or studio objects belong here. Decorative Ethiopian craft (baskets, pottery, weaving) is an accent on one surface at most, never the theme of the room.',
+  'NO PRINT ANYWHERE: no books with visible spines, no labels, no packaging, no signage, no posters, no papers, no charts, no lettering, no numbers, no logos, no watermarks, and no lit screens or device displays. This is a hard technical requirement, not a stylistic preference: a video engine given a frame that carries lettering rejects what it generates from it.',
+  'NEVER draw the Letena logo, wordmark, or any badge, patch or embroidery standing in for one. Leave those surfaces plain; the real mark is composited afterwards.',
+].join('\n');
+
+// Every image prompt in this module goes through here on its way out, so
+// there is exactly one place the house rules can be missed from.
+export function withHouseRules(prompt) {
+  return `${String(prompt ?? '').trim()}\n\n${HOUSE_IMAGE_RULES}`;
+}
+
 export function compileStillPrompt(lock) {
   const d = lock.data ?? {};
   const lines = [];
@@ -184,8 +229,8 @@ export function compileStillPrompt(lock) {
   if (d.composition) lines.push(`[COMPOSITION] ${d.composition}`);
   if (d.lighting) lines.push(`[LIGHTING] ${d.lighting}`);
   if (d.aspect_ratio) lines.push(`[ASPECT] ${d.aspect_ratio}`);
-  lines.push('Positive, visual description only. No embedded text, subtitles, logos, or watermark.');
-  return lines.join('\n');
+  lines.push('Positive, visual description only.');
+  return withHouseRules(lines.join('\n'));
 }
 
 // Composition prompt grammar (Video Studio "character into background"
@@ -249,8 +294,8 @@ export function compileComposePrompt(characterLock, environmentLock, styleLock, 
     lines.push(`[ASPECT] ${aspectRatio} vertical portrait orientation. Compose for this frame shape, not a square.`);
   }
   if (styleLock?.data?.motion_grammar) lines.push(`STYLE OF MOTION: ${styleLock.data.motion_grammar}`);
-  lines.push('Positive, visual description only. No embedded text, subtitles, logos, or watermark.');
-  return lines.join('\n');
+  lines.push('Positive, visual description only.');
+  return withHouseRules(lines.join('\n'));
 }
 
 // Gemini's image models return a fixed square (1024x1024) no matter what
@@ -1856,7 +1901,12 @@ export default async function routes(app) {
       return reply.code(422).send(err(422, 'BUDGET_EXCEEDED', e.message));
     }
     const assetId = crypto.randomUUID();
-    const gen = await gemini.generateImage({ prompt, assetId, referenceImageKeys: [source.storage_key] });
+    // The instruction is the person's; the house rules underneath it are
+    // not negotiable. This is the call that went wrong on 21 Aug: a remix
+    // asked to take the books off a shelf and got a room full of pottery
+    // back, because free text was the only thing steering it.
+    const gen = await gemini.generateImage({ prompt: withHouseRules(prompt), assetId,
+      referenceImageKeys: [source.storage_key] });
     const asset = await one(
       `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings, source_asset_id)
        VALUES ($1,$2,$3,$4,'GENERATED',$5,$6,$7,$8,$9) RETURNING *`,
@@ -2509,6 +2559,136 @@ export default async function routes(app) {
   // slightly cold" -- a thought worth recording against the clip without
   // passing or failing it. Written to the project's event timeline, which
   // is the one place a human already reads the history of a shot.
+  // Deleting failed work (21 Aug 2026, owner: "We should be able to delete
+  // failed ones easier"). Video Studio accumulates dead ends fast --
+  // rejected takes, frames from a room that was wrong, shots whose every
+  // render attempt failed -- and until now nothing could be removed, so a
+  // project's history filled with things nobody would ever use again.
+  //
+  // These are generated artifacts, not records of anything that happened to
+  // a person, so a real delete is the right call rather than a hidden flag.
+  // The guards below are what make that safe: anything the project still
+  // depends on refuses to be deleted and says which thing depends on it, so
+  // a delete can never quietly break a shot, a lock, or a finished cut. The
+  // library mirror in lcos.assets is deliberately left alone -- once
+  // something is in the shared asset library it belongs to the library.
+
+  // Everything that would break if this asset disappeared, named. Returns a
+  // list of reasons; empty means it is safe to remove.
+  async function assetDeleteBlockers(asset) {
+    const blockers = [];
+    if (asset.status === 'ACCEPTED') {
+      blockers.push('it is accepted -- reject it first if you no longer want it');
+    }
+    const shotAccepted = await one(
+      `SELECT shot_code FROM studio.shots WHERE accepted_asset_id=$1`, [asset.id]);
+    if (shotAccepted) blockers.push(`${shotAccepted.shot_code} has it as its accepted video`);
+    const finalOf = await one(`SELECT code FROM studio.projects WHERE final_asset_id=$1`, [asset.id]);
+    if (finalOf) blockers.push(`it is the final cut of ${finalOf.code}`);
+    const lockUsing = await one(
+      `SELECT entity_code FROM studio.locks WHERE $1 = ANY(reference_asset_ids)`, [asset.id]);
+    if (lockUsing) blockers.push(`the ${lockUsing.entity_code} lock uses it as a reference`);
+    const shotFrame = await one(
+      `SELECT shot_code FROM studio.shots WHERE generation->>'first_frame_asset_id' = $1::text`, [asset.id]);
+    if (shotFrame) blockers.push(`${shotFrame.shot_code} uses it as its first frame`);
+    return blockers;
+  }
+
+  // Removes one asset and the things that only exist because of it. QC
+  // reports cascade in the schema; a remix or a split panel that points back
+  // at it has its lineage pointer cleared rather than being deleted too,
+  // because those are separate pictures a person may still be using.
+  async function deleteAssetRow(assetId) {
+    await q(`UPDATE studio.assets SET source_asset_id = NULL WHERE source_asset_id = $1`, [assetId]);
+    await q(`DELETE FROM studio.assets WHERE id=$1`, [assetId]);
+  }
+
+  app.delete('/studio/assets/:assetId', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const asset = await one(`SELECT * FROM studio.assets WHERE id=$1`, [req.params.assetId]);
+    if (!asset) return reply.code(404).send(err(404, 'NOT_FOUND', 'asset not found'));
+    const blockers = await assetDeleteBlockers(asset);
+    if (blockers.length) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `That cannot be deleted yet: ${blockers.join('; ')}.`, { guard: 'assetInUse', blockers }));
+    }
+    await deleteAssetRow(asset.id);
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [asset.project_id, req.actor?.id ?? null, asset.id,
+       `deleted a ${String(asset.kind).toLowerCase()} asset (${String(asset.status).toLowerCase()})`]);
+    return { ok: true, deleted: asset.id };
+  });
+
+  // Clear out a project's dead ends in one go. Deliberately narrow: only
+  // assets a person or QC already ruled out, never anything merely unused,
+  // and every skip is reported with the reason rather than silently left
+  // behind. "Rejected" here means exactly that plus QC_BLOCKED, which is
+  // QC's own refusal and can never be accepted anyway.
+  app.post('/studio/projects/:id/assets/prune-rejected',
+    { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!project) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+    const candidates = (await q(
+      `SELECT * FROM studio.assets WHERE project_id=$1 AND status IN ('REJECTED','QC_BLOCKED')
+       ORDER BY created_at`, [project.id])).rows;
+    const deleted = [];
+    const kept = [];
+    for (const a of candidates) {
+      const blockers = await assetDeleteBlockers(a);
+      if (blockers.length) { kept.push({ id: a.id, kind: a.kind, reason: blockers.join('; ') }); continue; }
+      await deleteAssetRow(a.id);
+      deleted.push({ id: a.id, kind: a.kind, status: a.status });
+    }
+    if (deleted.length) {
+      await q(`INSERT INTO studio.events (project_id, actor_id, note) VALUES ($1,$2,$3)`,
+        [project.id, req.actor?.id ?? null,
+         `cleared ${deleted.length} rejected or QC-blocked asset(s)${kept.length ? `, kept ${kept.length} still in use` : ''}`]);
+    }
+    return { deleted, kept };
+  });
+
+  // A shot and everything generated for it. Only while it is still work in
+  // progress: a shot with an accepted video is part of the cut, and a shot
+  // a later one continues from is holding up that shot's first frame.
+  app.delete('/studio/shots/:shotId', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const shot = await one(`SELECT * FROM studio.shots WHERE id=$1`, [req.params.shotId]);
+    if (!shot) return reply.code(404).send(err(404, 'NOT_FOUND', 'shot not found'));
+    if (!['DRAFT', 'STALE'].includes(shot.status)) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `${shot.shot_code} is ${shot.status}. Only a shot still in draft can be deleted; reject its video first if you want it gone.`,
+        { guard: 'shotNotDraft' }));
+    }
+    if (shot.accepted_asset_id) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `${shot.shot_code} has an accepted video and is part of the cut.`, { guard: 'shotAccepted' }));
+    }
+    const dependent = await one(
+      `SELECT shot_code FROM studio.shots WHERE project_id=$1 AND generation->>'continued_from_shot_id' = $2::text
+       ORDER BY order_index LIMIT 1`, [shot.project_id, shot.id]);
+    if (dependent) {
+      return reply.code(422).send(err(422, 'GUARD_FAILED',
+        `${dependent.shot_code} continues from ${shot.shot_code}, so deleting it would leave that shot without the frame it was built on.`,
+        { guard: 'shotHasContinuity' }));
+    }
+    // Its own assets go with it, subject to the same guards -- a frame this
+    // shot produced may have been picked up as a lock's reference, and that
+    // is worth stopping for rather than quietly breaking the lock.
+    const own = (await q(`SELECT * FROM studio.assets WHERE shot_id=$1`, [shot.id])).rows;
+    for (const a of own) {
+      const blockers = await assetDeleteBlockers(a);
+      if (blockers.length) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          `${shot.shot_code} cannot be deleted: one of its images is still in use -- ${blockers.join('; ')}.`,
+          { guard: 'shotAssetInUse' }));
+      }
+    }
+    for (const a of own) await deleteAssetRow(a.id);
+    await q(`DELETE FROM studio.shots WHERE id=$1`, [shot.id]);
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [shot.project_id, req.actor?.id ?? null, `shots/${shot.shot_code}`,
+       `deleted shot ${shot.shot_code} and ${own.length} image(s) generated for it`]);
+    return { ok: true, deleted_shot: shot.shot_code, deleted_assets: own.length };
+  });
+
   app.post('/studio/assets/:assetId/note', { preHandler: requirePerm('studio.read') }, async (req, reply) => {
     const asset = await one(`SELECT * FROM studio.assets WHERE id=$1`, [req.params.assetId]);
     if (!asset) return reply.code(404).send(err(404, 'NOT_FOUND', 'asset not found'));

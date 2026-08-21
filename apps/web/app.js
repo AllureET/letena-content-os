@@ -1862,7 +1862,11 @@ const screens = {
           ${qc.continuity?.notes ? `<div class="muted" style="font-size:11px;margin-top:2px">Continuity: ${esc(qc.continuity.notes)}</div>` : ''}
         </div>` : ''}
         ${video.settings?.review_note ? `<div class="muted" style="font-size:11px;margin-top:6px">Last comment: ${esc(video.settings.review_note)}</div>` : ''}
-        ${done ? `<div class="muted" style="font-size:11px;margin-top:6px">Already ${esc(video.status.toLowerCase())}. Open Assets &amp; QC for the full history of this shot.</div>` : `
+        ${done ? `<div class="flex" style="margin-top:6px;gap:6px;align-items:center">
+          <span class="muted" style="font-size:11px">Already ${esc(video.status.toLowerCase())}. Open Assets &amp; QC for the full history.</span>
+          ${video.status === 'REJECTED' && can('studio.write')
+            ? `<button style="font-size:11px;padding:2px 8px" data-stassetdelete="${esc(video.id)}">Delete</button>` : ''}
+        </div>` : `
         <textarea id="strevnote-${esc(video.id)}" style="margin-top:6px"
           placeholder="What is right or wrong about this take (optional)"></textarea>
         <div class="flex" style="margin-top:6px;gap:6px;flex-wrap:wrap">
@@ -1950,7 +1954,12 @@ const screens = {
       </div>`;
     };
 
-    const shotsHtml = shots.length ? `<div class="card"><table>
+    const shotsHtml = shots.length ? `<div class="card">
+      ${can('studio.write') ? `<div class="flex" style="justify-content:flex-end;margin-bottom:6px">
+        <button style="font-size:11px;padding:2px 8px" data-stpruneassets="${esc(p.id)}"
+          title="Removes every take this project has rejected or QC has blocked. Anything a lock, a shot or the final cut still uses is kept and reported.">Clear rejected takes</button>
+      </div>` : ''}
+      <table>
       <tr><th>Shot</th><th>Beat</th><th>Status</th><th>Duration (s)</th><th>Asset</th><th></th></tr>
       ${shots.map(s => {
         const beat = s.story?.beat ?? '';
@@ -1969,6 +1978,9 @@ const screens = {
               ${can('studio.generate') ? `<button data-stshotgenerate="${esc(s.id)}">Generate</button>` : ''}
               ${can('studio.generate') ? `<button data-stshotvoiceshow="${esc(s.id)}">Add voice</button>` : ''}
               <button data-stassets="${esc(s.id)}">Assets &amp; QC</button>
+              ${editable && can('studio.write')
+                ? `<button data-stshotdelete="${esc(s.id)}"
+                    title="Removes this shot and the images generated for it. Only while it is still a draft.">Delete shot</button>` : ''}
             </div>
             ${editable && can('studio.write') ? `<div class="claimrow" style="margin-top:8px">
               <label>Duration target (s)</label>
@@ -3650,7 +3662,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -4033,7 +4045,10 @@ document.addEventListener('click', async (e) => {
               ? (a.status === 'QC_BLOCKED'
                 ? `<button disabled title="QC blocked this asset. It cannot be accepted until it is regenerated and passes QC.">Accept</button>`
                 : `<button class="approve" data-stassetaccept="${esc(a.id)}">Accept</button>`)
-              : ''}</div>
+              : ''}
+            ${can('studio.write') && a.status !== 'ACCEPTED'
+              ? `<button style="font-size:11px;padding:2px 8px" data-stassetdelete="${esc(a.id)}"
+                  title="Removes it for good. Refused if a lock, a shot or the final cut still uses it.">Delete</button>` : ''}</div>
           ${mediaFor(a)}
           ${(a.qc_reports ?? []).map(q => `<div style="margin-top:6px">
             ${pill(q.disposition)}
@@ -4063,6 +4078,47 @@ document.addEventListener('click', async (e) => {
       b.disabled = true; b.textContent = 'Rejecting…';
       const r = await api('POST', `/studio/assets/${id}/reject`, { note });
       toast(`Rejected. The shot is back to ${r.shot_status ?? 'DRAFT'} so you can change it and generate again.`);
+      return render();
+    }
+    // Deleting failed work. Destructive, so every one of these is two
+    // clicks: the first turns the button into its own confirmation, the
+    // second does it. No browser dialog -- a modal here would block the
+    // page, and a button that changes under your finger is honest enough.
+    if (b.dataset.stassetdelete) {
+      if (b.dataset.armed !== '1') {
+        b.dataset.armed = '1'; b.textContent = 'Delete for good?';
+        b.style.color = 'var(--risk-high, #b42318)';
+        setTimeout(() => { if (b.dataset.armed === '1') { b.dataset.armed = ''; b.textContent = 'Delete'; b.style.color = ''; } }, 5000);
+        return;
+      }
+      b.disabled = true; b.textContent = 'Deleting…';
+      await api('DELETE', `/studio/assets/${b.dataset.stassetdelete}`);
+      toast('Deleted.'); return render();
+    }
+    if (b.dataset.stshotdelete) {
+      if (b.dataset.armed !== '1') {
+        b.dataset.armed = '1'; b.textContent = 'Delete this shot for good?';
+        b.style.color = 'var(--risk-high, #b42318)';
+        setTimeout(() => { if (b.dataset.armed === '1') { b.dataset.armed = ''; b.textContent = 'Delete shot'; b.style.color = ''; } }, 5000);
+        return;
+      }
+      b.disabled = true; b.textContent = 'Deleting…';
+      const r = await api('DELETE', `/studio/shots/${b.dataset.stshotdelete}`);
+      toast(`Deleted ${r.deleted_shot}${r.deleted_assets ? ` and ${r.deleted_assets} image(s)` : ''}.`);
+      return render();
+    }
+    if (b.dataset.stpruneassets) {
+      if (b.dataset.armed !== '1') {
+        b.dataset.armed = '1'; b.textContent = 'Clear them for good?';
+        b.style.color = 'var(--risk-high, #b42318)';
+        setTimeout(() => { if (b.dataset.armed === '1') { b.dataset.armed = ''; b.textContent = 'Clear rejected takes'; b.style.color = ''; } }, 5000);
+        return;
+      }
+      b.disabled = true; b.textContent = 'Clearing…';
+      const r = await api('POST', `/studio/projects/${b.dataset.stpruneassets}/assets/prune-rejected`, {});
+      toast(r.deleted.length
+        ? `Cleared ${r.deleted.length}${r.kept.length ? `, kept ${r.kept.length} still in use` : ''}.`
+        : 'Nothing to clear.');
       return render();
     }
     if (b.dataset.stassetnote) {

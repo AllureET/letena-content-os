@@ -63,7 +63,15 @@ test('a still/keyframe prompt compiles deterministically from a lock, no model c
       wardrobe_variants: { default: 'ochre jacket' }, style_summary: 'gouache' } });
   assert.ok(prompt.includes('Maya'));
   assert.ok(prompt.includes('ochre jacket'));
-  assert.ok(prompt.includes('No embedded text'));
+  // The old assertion here looked for the single line 'No embedded text,
+  // subtitles, logos, or watermark'. That line was replaced on 21 Aug 2026
+  // by the house rules block, which says the same thing far more
+  // specifically (book spines, labels, packaging, signage, screens) because
+  // the vague version was not enough to keep lettering out of a frame, and
+  // a frame carrying lettering is what a video engine's output check
+  // rejects. Assert the rule still holds, not the exact old wording.
+  assert.match(prompt, /no lettering/);
+  assert.match(prompt, /NEVER draw the Letena logo/);
 });
 
 test('generate a reference image for the character lock', async () => {

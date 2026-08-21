@@ -41,7 +41,13 @@ after(async () => { await app.close(); await pool.end(); });
 
 test('the house rules name the palette, the setting, and the no-print rule', () => {
   for (const must of ['teal', 'mustard', 'terracotta', 'Ethiopian', 'consultation',
-    'no books with visible spines', 'no lit screens', 'NEVER draw the Letena logo']) {
+    'no books with visible spines', 'no lit screens', 'NEVER draw the Letena logo',
+    // Added 22 Aug 2026 after two rounds of the same mistake: told to take
+    // the books off the shelf, the model filled it with pottery; told to
+    // drop the pottery, it filled it with stacked towels and the room read
+    // as a gym. The rule that stops it is not a longer ban list, it is
+    // saying what the surfaces are FOR.
+    'must be something that room actually uses', 'DECORATIVE CRAFT: none']) {
     assert.ok(HOUSE_IMAGE_RULES.includes(must), `the house rules must state: ${must}`);
   }
 });

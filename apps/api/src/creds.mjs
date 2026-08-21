@@ -45,6 +45,8 @@ export const CRED_REGISTRY = [
     hint: 'Carousels and statics.' },
   { key: 'SUNO_API_KEY', label: 'Suno API key', group: 'Production services', secret: true,
     hint: 'Music and score generation for Video Studio projects.' },
+  { key: 'DEFAULT_MUSIC_ASSET_ID', label: 'House background track', group: 'Production services', secret: false,
+    hint: 'Asset id of the track every Video Studio assembly uses by default. Upload the track to the Asset library as kind AUDIO_MUSIC, then paste its id here. A project that generates its own music, or that passes an explicit music_asset_id, still wins over this.' },
   { key: 'TELEGRAM_BOT_TOKEN', label: 'Telegram bot token', group: 'Publishing', secret: true,
     hint: 'Publishes approved videos to the channel.' },
   { key: 'TELEGRAM_CHANNEL', label: 'Telegram channel', group: 'Publishing', secret: false,

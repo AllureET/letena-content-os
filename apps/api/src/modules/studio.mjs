@@ -48,7 +48,7 @@
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { q, one, audit, requirePerm, err } from '../core.mjs';
 import { storage, videoEngine, gemini, suno, azureSpeech } from '../adapters/index.mjs';
@@ -198,7 +198,27 @@ export function compileStillPrompt(lock) {
 // than inventing a second one, and ends with the same no-embedded-text
 // rule. Pure function, no I/O, same discipline as compileStillPrompt and
 // compileMotionPrompt above.
-export function compileComposePrompt(characterLock, environmentLock, styleLock) {
+// aspectRatio added 21 Aug 2026 after the first real end-to-end run came
+// back badly framed (owner: "Why is she looking away from the camera and
+// at an angle when this is supposed to be a straight forward talking head
+// video?"). Two things were wrong and this fixes the first:
+//
+// This function was DROPPING both locks' own `composition` field on the
+// floor. compileStillPrompt reads d.composition and always has; the
+// compose path never did, so a CHARACTER lock that explicitly said
+// "vertical 9:16 waist-up portrait, subject centered, facing camera
+// directly as if speaking to a viewer" had that instruction silently
+// discarded, and the model was left to frame the shot however it liked.
+// The [COMPOSITION] line below only ever talked about preserving identity,
+// which reads as "put these two things in one picture", not "and here is
+// how the picture is framed".
+//
+// The second half of the fix is not in this function: Gemini returns a
+// fixed 1024x1024 SQUARE image whatever the prompt asks for, and that
+// square was being handed straight to the video engine with a 9:16 ratio
+// request, so the engine reframed it and the composition drifted again.
+// See cropToAspect() and its call in compose-first-frame.
+export function compileComposePrompt(characterLock, environmentLock, styleLock, aspectRatio) {
   const cd = characterLock.data ?? {};
   const ed = environmentLock.data ?? {};
   const lines = [];
@@ -210,9 +230,35 @@ export function compileComposePrompt(characterLock, environmentLock, styleLock) 
   lines.push(`[ENVIRONMENT] ${[ed.architecture, ed.palette, ed.time, ed.weather].filter(Boolean).join('; ')}`);
   lines.push(`[COMPOSITION] Place the [SUBJECT] into the [ENVIRONMENT], preserving the character's identity, wardrobe, and physical features EXACTLY as locked, and preserving the environment's architecture, palette, and setting EXACTLY as locked. Do not invent a different character or a different place -- this is the same character, this is the same place, seen together for the first time.`);
   if (ed.lighting || cd.lighting) lines.push(`[LIGHTING] ${ed.lighting ?? cd.lighting}`);
+  // FRAMING is load-bearing and was missing entirely until 21 Aug 2026.
+  // The character's own composition wins (it describes how the PERSON is
+  // framed, which is what a presenter shot is about); the environment's is
+  // the fallback for a shot with no character framing note.
+  const framing = cd.composition ?? ed.composition;
+  if (framing) lines.push(`[FRAMING] ${framing}`);
+  if (aspectRatio) {
+    lines.push(`[ASPECT] ${aspectRatio} vertical portrait orientation. Compose for this frame shape, not a square.`);
+  }
   if (styleLock?.data?.motion_grammar) lines.push(`STYLE OF MOTION: ${styleLock.data.motion_grammar}`);
   lines.push('Positive, visual description only. No embedded text, subtitles, logos, or watermark.');
   return lines.join('\n');
+}
+
+// Gemini's image models return a fixed square (1024x1024) no matter what
+// the prompt asks for. Handing that square to a video engine along with a
+// 9:16 request makes the engine reframe it -- which is exactly how a
+// centred, camera-facing presenter ended up off-centre and angled on the
+// first real run. Centre-cropping to the target shape first means the
+// engine receives a frame that is ALREADY the right shape and has nothing
+// to reinterpret. Crops rather than pads on purpose: a padded frame would
+// hand the engine letterbox bars to animate.
+async function cropToAspect(srcPath, outPath, aspectRatio) {
+  const [w, h] = String(aspectRatio ?? '9:16').split(':').map(Number);
+  if (!w || !h) { await copyFile(srcPath, outPath); return; }
+  // ffmpeg picks the largest centred rectangle of the target ratio that
+  // fits inside the source, so nothing is ever upscaled or stretched.
+  const filter = `crop='min(iw,ih*${w}/${h})':'min(ih,iw*${h}/${w})'`;
+  await execFileP('ffmpeg', ['-y', '-i', srcPath, '-vf', filter, outPath]);
 }
 
 // Motion prompt grammar (playbook 12.3): subject/camera/scene motion,
@@ -1746,7 +1792,7 @@ export default async function routes(app) {
     ]);
 
     const assetId = crypto.randomUUID();
-    const prompt = compileComposePrompt(characterLock, environmentLock, styleLock);
+    const prompt = compileComposePrompt(characterLock, environmentLock, styleLock, project.aspect_ratio);
     // Reference-pack conditioning (21 Aug 2026): if either lock has an
     // uploaded pack, add its most identity-bearing sheet alongside the two
     // flat references. Gemini caps conditioning at 3 images, so the
@@ -1762,6 +1808,22 @@ export default async function routes(app) {
     if (charSheet) referenceImageKeys.push(charSheet);
     else if (envSheet) referenceImageKeys.push(envSheet);
     const gen = await gemini.generateImage({ prompt, assetId, referenceImageKeys });
+    // Crop the square Gemini returns down to the project's real frame shape
+    // BEFORE it is stored as the shot's first frame, so the video engine
+    // receives the composition that was actually approved rather than
+    // reframing a square itself. Never fatal: a crop failure leaves the
+    // original frame in place, which is exactly the pre-21-Aug behaviour.
+    if (!MOCK()) {
+      try {
+        const src = storage.localPath(gen.storage_key);
+        const cropped = `${src}.crop.png`;
+        await cropToAspect(src, cropped, project.aspect_ratio);
+        await storage.put(gen.storage_key, await readFile(cropped));
+      } catch (e) {
+        await q(`INSERT INTO studio.events (project_id, note) VALUES ($1,$2)`,
+          [project.id, `could not crop the composed frame to ${project.aspect_ratio}, keeping the square original: ${e.message}`]).catch(() => {});
+      }
+    }
     const asset = await one(
       `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings)
        VALUES ($1,$2,$3,'KEYFRAME','GENERATED',$4,$5,$6,$7) RETURNING *`,
@@ -2242,7 +2304,47 @@ export default async function routes(app) {
     // music_asset_id is validated up front, against the SAME three
     // possible problems every time, so the error always names the
     // accurate one rather than a generic "invalid music_asset_id".
+    // House music (21 Aug 2026, owner: "can you upload that onto the OS so
+    // it becomes the general background song unless we want to change it").
+    // Until now music was strictly per-project: assemble() only accepted a
+    // studio.assets MUSIC row belonging to THIS project, so the same track
+    // had to be regenerated (and paid for) for every new project, and there
+    // was no way to say "this is our track, use it by default".
+    //
+    // Resolution order, most specific first:
+    //   1. an explicit music_asset_id in the request  (unchanged)
+    //   2. a MUSIC asset already generated in this project
+    //   3. the house track named by the DEFAULT_MUSIC_ASSET_ID setting
+    //   4. no music at all                            (unchanged)
+    // The house track lives in lcos.assets (the shared library) rather than
+    // studio.assets, because it belongs to the organisation and not to any
+    // one project -- which is exactly why the project_id guard below has to
+    // be skipped for it, and why it is resolved into a plain
+    // {storage_key} shape rather than pretending to be a project asset.
     let musicAsset = null;
+    if (!b.music_asset_id && b.use_house_music !== false) {
+      const own = await one(
+        `SELECT * FROM studio.assets WHERE project_id=$1 AND kind='MUSIC' AND storage_key IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1`, [p.id]);
+      if (own) {
+        musicAsset = own;
+      } else {
+        const houseId = cred('DEFAULT_MUSIC_ASSET_ID');
+        if (houseId) {
+          const house = await one(
+            `SELECT id, storage_key, title FROM lcos.assets WHERE id=$1 AND is_active AND storage_key IS NOT NULL`,
+            [houseId]);
+          // A misconfigured house track is a loud event, not a silent
+          // no-music assembly: the operator set this deliberately and
+          // should hear about it rather than wonder where the music went.
+          if (house) musicAsset = { id: house.id, storage_key: house.storage_key, house: true, title: house.title };
+          else {
+            await q(`INSERT INTO studio.events (project_id, note) VALUES ($1,$2)`,
+              [p.id, `DEFAULT_MUSIC_ASSET_ID is set to ${houseId} but that is not an active library asset with stored audio; assembling with no music`]).catch(() => {});
+          }
+        }
+      }
+    }
     if (b.music_asset_id) {
       musicAsset = await one(`SELECT * FROM studio.assets WHERE id=$1`, [b.music_asset_id]);
       if (!musicAsset) {

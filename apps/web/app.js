@@ -196,9 +196,17 @@ function renderScriptImportDraft(payload, scriptId) {
 // Built with inline styles and no markup in index.html on purpose, so the
 // whole feature lives in this one function and nothing else has to change
 // to adopt it. Esc closes, as does clicking the backdrop.
+// 21 Aug 2026 follow-up: this opens VIDEO and AUDIO too, not just stills
+// (owner: "it says succeeded, but I dont see the full video anywhere on
+// the OS in an inline player or the clips"). Kind is sniffed from the file
+// extension so every existing imagePreview() call site keeps working
+// untouched.
 function imagePreview(url, caption) {
   if (!url) return;
   document.getElementById('img-lightbox')?.remove();
+  const ext = String(url).split('?')[0].split('.').pop().toLowerCase();
+  const isVideo = ['mp4', 'mov', 'webm', 'm4v'].includes(ext);
+  const isAudio = ['mp3', 'wav', 'm4a', 'aac', 'ogg'].includes(ext);
   const wrap = document.createElement('div');
   wrap.id = 'img-lightbox';
   wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(12,12,16,.86);' +
@@ -222,11 +230,22 @@ function imagePreview(url, caption) {
   bar.append(label, dl,
     mkBtn('Open in new tab', () => window.open(url, '_blank', 'noopener')),
     mkBtn('Close', () => wrap.remove()));
-  const img = document.createElement('img');
-  img.src = url;
-  img.style.cssText = 'max-width:92vw;max-height:78vh;border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.5);background:#fff';
-  img.onclick = (ev) => ev.stopPropagation();
-  wrap.append(bar, img);
+  let media;
+  if (isVideo) {
+    media = document.createElement('video');
+    media.src = url; media.controls = true; media.autoplay = true; media.loop = true; media.playsInline = true;
+    media.style.cssText = 'max-width:92vw;max-height:78vh;border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.5);background:#000';
+  } else if (isAudio) {
+    media = document.createElement('audio');
+    media.src = url; media.controls = true; media.autoplay = false;
+    media.style.cssText = 'width:min(560px,90vw)';
+  } else {
+    media = document.createElement('img');
+    media.src = url;
+    media.style.cssText = 'max-width:92vw;max-height:78vh;border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.5);background:#fff';
+  }
+  media.onclick = (ev) => ev.stopPropagation();
+  wrap.append(bar, media);
   wrap.onclick = () => wrap.remove();
   const onKey = (ev) => { if (ev.key === 'Escape') { wrap.remove(); document.removeEventListener('keydown', onKey); } };
   document.addEventListener('keydown', onKey);
@@ -3869,15 +3888,39 @@ document.addEventListener('click', async (e) => {
       try {
         const r = await api('GET', `/studio/shots/${id}/assets`);
         const items = r.items ?? [];
+        // Every asset now shows its actual media, not just a status pill
+        // (owner, 21 Aug 2026: "it says succeeded, but I dont see the full
+        // video anywhere on the OS in an inline player or the clips (so I
+        // can remix them)"). A VIDEO gets a real inline player, a still
+        // gets a clickable thumbnail, and both get a preview button that
+        // opens the lightbox with download and new-tab options.
+        const mediaFor = (a) => {
+          const u = mediaUrl(a.storage_key);
+          if (!u) return '';
+          const ext = String(a.storage_key).split('.').pop().toLowerCase();
+          if (['mp4', 'mov', 'webm'].includes(ext)) {
+            return `<video src="${esc(u)}" controls playsinline preload="metadata"
+              style="margin-top:6px;max-width:240px;max-height:320px;border-radius:6px;display:block;background:#000"></video>`;
+          }
+          if (['mp3', 'wav', 'm4a'].includes(ext)) {
+            return `<audio src="${esc(u)}" controls preload="none" style="margin-top:6px;width:240px;display:block"></audio>`;
+          }
+          return `<img src="${esc(u)}" loading="lazy" alt="${esc(a.kind ?? '')}" title="Click to preview"
+            onclick="imagePreview('${esc(u)}','${esc(a.kind ?? '')}')"
+            style="margin-top:6px;max-width:180px;max-height:180px;border-radius:6px;display:block;cursor:zoom-in">`;
+        };
         box.innerHTML = items.length ? items.map(a => `<div class="claimrow" style="margin-top:8px">
           <div class="flex"><b>${esc(a.kind ?? '')}</b>${pill(a.status)}
             <span class="muted">${esc(a.generator?.provider ?? '')}</span>
+            ${a.cost_usd != null ? `<span class="muted">$${esc(String(a.cost_usd))}</span>` : ''}
             <span class="spacer"></span>
+            ${a.storage_key ? `<button style="font-size:11px;padding:2px 8px" onclick="imagePreview('${esc(mediaUrl(a.storage_key))}','${esc(a.kind ?? '')}')">Preview &amp; download</button>` : ''}
             ${can('studio.approve') && a.status !== 'ACCEPTED'
               ? (a.status === 'QC_BLOCKED'
                 ? `<button disabled title="QC blocked this asset. It cannot be accepted until it is regenerated and passes QC.">Accept</button>`
                 : `<button class="approve" data-stassetaccept="${esc(a.id)}">Accept</button>`)
               : ''}</div>
+          ${mediaFor(a)}
           ${(a.qc_reports ?? []).map(q => `<div style="margin-top:6px">
             ${pill(q.disposition)}
             ${(q.technical?.issues ?? []).length ? `<div class="muted" style="font-size:12px;margin-top:4px">Issues: ${q.technical.issues.map(x => esc(x)).join('; ')}</div>` : ''}

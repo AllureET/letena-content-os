@@ -127,6 +127,36 @@ function runwayRatio(aspect, model) {
   return a === '16:9' ? '1280:720' : a === '1:1' ? '960:960' : '720:1280';
 }
 
+// Runway's promptText, and the negative prompt that must NOT go into it.
+//
+// 21 Aug 2026, three straight failures with INTERNAL.BAD_OUTPUT.CODE01.
+// Runway has no negative-prompt field, so this adapter originally folded
+// the studio's negative list in as "Avoid: identity mutation, duplicate
+// subjects, extra limbs, fused hands, unintended text, subtitles, logo,
+// watermark, ... no written text of any kind in the image". That is
+// exactly backwards for this model: promptText is a POSITIVE description,
+// and naming "logo", "watermark", "subtitles", "text", "extra limbs" in it
+// asks the model to put those things in the picture. Runway's own docs
+// list "logos, watermarks, or overlaid text" and "prompts requesting
+// explicit text generation" as the most common causes of
+// INTERNAL.BAD_OUTPUT.01, which is the code we got.
+//
+// So the negative prompt is deliberately DROPPED on this engine rather
+// than translated. It stays in the adapter interface because the kling and
+// veo skeletons take a real negative field, and because dropping it in the
+// caller would hide the decision from anyone reading the Runway path.
+// Steering away from artifacts on Runway belongs in positive phrasing in
+// the motion prompt.
+//
+// The length cap is Runway's documented 1000-character promptText limit.
+// Nothing the studio compiles today comes close, but a long temporal-beats
+// list plus a performance note could, and losing a whole generation to a
+// 400 for the sake of a slice is a bad trade.
+const RUNWAY_PROMPT_MAX = 1000;
+function runwayPromptText(prompt) {
+  return String(prompt ?? '').slice(0, RUNWAY_PROMPT_MAX);
+}
+
 async function runwayPoll(taskId, key) {
   // Runway generations take tens of seconds to a few minutes. Poll with a
   // hard ceiling so a stuck job surfaces as a clear error instead of
@@ -197,9 +227,7 @@ export const runway = {
     const body = {
       model: useModel,
       promptImage: `data:image/png;base64,${imgB64}`,
-      // Runway has no separate negative-prompt field; the convention is to
-      // fold it into the prompt as an explicit avoid-list.
-      promptText: negativePrompt ? `${prompt}\n\nAvoid: ${negativePrompt}` : String(prompt),
+      promptText: runwayPromptText(prompt),
       ratio: runwayRatio(aspectRatio, useModel),
       duration,
     };
@@ -238,7 +266,7 @@ export const runway = {
       headers: { Authorization: `Bearer ${key}`, 'X-Runway-Version': RUNWAY_VERSION, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: useModel,
-        promptText: negativePrompt ? `${prompt}\n\nAvoid: ${negativePrompt}` : String(prompt),
+        promptText: runwayPromptText(prompt),
         ratio: runwayRatio(aspectRatio, useModel),
         duration,
       }),

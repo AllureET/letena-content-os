@@ -28,10 +28,17 @@ export const CRED_REGISTRY = [
     hint: 'Microsoft Azure Speech for Amharic voice (am-ET voices).' },
   { key: 'AZURE_SPEECH_REGION', label: 'Azure Speech region', group: 'Production services', secret: false,
     hint: 'For example westeurope or eastus.' },
+  // Runway is the default video engine as of 21 Aug 2026 and the only one
+  // with a real implemented adapter, so its key sits directly above the two
+  // Kling fields it supersedes.
+  { key: 'RUNWAY_API_KEY', label: 'Runway API key', group: 'Production services', secret: true,
+    hint: 'Video generation, and the default engine. Get this from the developer portal at dev.runwayml.com (Settings, API Keys) — it is NOT the same as a Runway app subscription. Starts with key_. Without it, Video Studio cannot generate video at all.' },
+  { key: 'RUNWAY_MODEL', label: 'Runway model', group: 'Production services', secret: false,
+    hint: 'Blank uses gen4_turbo for image-to-video (about $0.05 per second, the cheapest real path) and gen4.5 for text-only. Set gen4.5 for higher quality at about $0.12 per second.' },
   { key: 'KLING_ACCESS_KEY', label: 'Kling access key', group: 'Production services', secret: true,
-    hint: 'Generative b-roll. Never anatomy.' },
+    hint: 'Legacy. The Kling adapter is an unimplemented skeleton that throws in production; Runway above is the working engine, and its API can reach Kling models too. Setting this alone does not enable Kling.' },
   { key: 'KLING_SECRET_KEY', label: 'Kling secret key', group: 'Production services', secret: true,
-    hint: 'Pairs with the access key.' },
+    hint: 'Pairs with the access key. See the note above: the Kling adapter is not implemented.' },
   { key: 'GEMINI_API_KEY', label: 'Gemini API key', group: 'Production services', secret: true,
     hint: 'Image generation.' },
   { key: 'CANVA_ACCESS_TOKEN', label: 'Canva access token', group: 'Production services', secret: true,

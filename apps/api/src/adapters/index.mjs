@@ -180,7 +180,10 @@ export const runway = {
       return { status: 'SUCCEEDED', storage_key: key, provider_job_id: `mock-runway-i2v-${assetId.slice(0, 8)}`, cost_usd: 0 };
     }
     const key = need('RUNWAY_API_KEY');
-    const useModel = model || RUNWAY_DEFAULT_I2V_MODEL;
+    // Precedence: an explicit per-shot model, else the RUNWAY_MODEL
+    // setting, else the cheap default. Same order as every other adapter
+    // here reads its own settings.
+    const useModel = model || cred('RUNWAY_MODEL') || RUNWAY_DEFAULT_I2V_MODEL;
     const imgB64 = readFileSync(storage.localPath(referenceImageKey)).toString('base64');
     const duration = runwayDuration(durationS);
     const body = {
@@ -217,7 +220,10 @@ export const runway = {
       return { status: 'SUCCEEDED', storage_key: key, provider_job_id: `mock-runway-${assetId.slice(0, 8)}`, cost_usd: 0 };
     }
     const key = need('RUNWAY_API_KEY');
-    const useModel = model || RUNWAY_DEFAULT_T2V_MODEL;
+    // gen4_turbo has no text-only mode, so a RUNWAY_MODEL of gen4_turbo is
+    // deliberately ignored on this path rather than sent and rejected.
+    const configured = cred('RUNWAY_MODEL');
+    const useModel = model || (configured && configured !== 'gen4_turbo' ? configured : RUNWAY_DEFAULT_T2V_MODEL);
     const duration = runwayDuration(durationS);
     const res = await fetch(`${RUNWAY_BASE}/text_to_video`, {
       method: 'POST',

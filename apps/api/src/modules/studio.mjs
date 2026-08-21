@@ -101,6 +101,7 @@ const ESTIMATED_COST_USD = {
   SUNO_MUSIC_TRACK: 0.20,        // Suno music bed, flat per generated track
   AZURE_TTS_PER_CHAR: 0.000016,  // Azure neural TTS, per character of input text
   GEMINI_REMIX_IMAGE: 0.04,      // Gemini image-edit on an existing reference/keyframe, flat per remix
+  GEMINI_SHEET_SPLIT: 0.01,      // one vision read of a reference sheet to find its individual pictures
 };
 
 // ===========================================================================
@@ -329,26 +330,46 @@ const LOCK_ENTITY_TYPES = ['STYLE', 'CHARACTER', 'ENVIRONMENT', 'PROP'];
 const SHEET_KINDS = ['MASTER', 'TURNAROUND', 'EXPRESSIONS', 'POSES', 'COSTUME_DETAIL', 'COLOR_PALETTE',
   'LOCATION_ANGLES', 'LOCATION_LAYOUT', 'PROPS', 'OTHER'];
 
-// Which pack sheet best CONDITIONS a generation for a given entity, in
-// preference order. Gemini accepts at most 3 conditioning images, so the
-// composer sends the lock's current reference plus at most one pack sheet
-// each -- the one that carries the most identity information the flat
-// reference does not: a turnaround for a person, an angle set for a place.
-// Returns a storage_key or null.
-async function bestPackSheetKey(lockId, entityType) {
-  const preference = entityType === 'CHARACTER'
-    ? ['TURNAROUND', 'EXPRESSIONS', 'POSES', 'COSTUME_DETAIL']
-    : entityType === 'ENVIRONMENT'
-      ? ['LOCATION_ANGLES', 'LOCATION_LAYOUT', 'PROPS']
-      : ['MASTER', 'OTHER'];
+// What a single picture cut out of a reference sheet can be (see
+// gemini.detectSheetPanels). TEXT_BLOCK is in the list on purpose: a
+// heading or a caption strip is recorded as seen and skipped, rather than
+// silently dropped, so a sheet that split badly is obvious on screen.
+const PANEL_USES = ['FRONT', 'THREE_QUARTER', 'SIDE', 'BACK', 'EXPRESSION', 'POSE', 'COSTUME_DETAIL',
+  'SWATCH', 'LOCATION_ANGLE', 'LOCATION_LAYOUT', 'PROP', 'TEXT_BLOCK', 'OTHER'];
+
+// Which cut-out piece best conditions a generation, in preference order
+// (21 Aug 2026, owner: "break it down into the individual pieces so we can
+// use whats needed"). This is the safe half of the reference-pack idea:
+// the SHEET is a document and never goes to the image model, but a single
+// picture taken off it is exactly the extra angle on the presenter's face
+// that a flat reference does not carry.
+//
+// Two hard rules. A piece is only eligible if the vision pass said no
+// lettering falls inside it -- that is the whole reason the sheets were
+// pulled out of conditioning in the first place, and a piece is only
+// useful here if it is a picture and nothing else. And TEXT_BLOCK and
+// SWATCH are never eligible whatever the flag says: a colour chip tells an
+// image model to fill the frame with that colour.
+const PANEL_PREFERENCE = {
+  CHARACTER: ['FRONT', 'THREE_QUARTER', 'EXPRESSION', 'POSE', 'COSTUME_DETAIL', 'SIDE'],
+  ENVIRONMENT: ['LOCATION_ANGLE', 'LOCATION_LAYOUT', 'PROP'],
+  PROP: ['PROP', 'OTHER'],
+  STYLE: ['OTHER'],
+};
+
+async function bestPanelKey(lockId, entityType) {
+  const preference = PANEL_PREFERENCE[entityType] ?? ['OTHER'];
   const r = await q(
-    `SELECT storage_key, sheet_kind FROM studio.assets
-     WHERE sheet_kind = ANY($1) AND storage_key IS NOT NULL AND generator->>'lock_id' = $2
-     ORDER BY created_at DESC`,
-    [preference, lockId]);
+    `SELECT storage_key, settings->>'panel_use' AS panel_use FROM studio.assets
+     WHERE generator->>'provider' = 'SHEET_SPLIT'
+       AND generator->>'lock_id' = $1
+       AND storage_key IS NOT NULL
+       AND settings->>'panel_has_text' = 'false'
+       AND settings->>'panel_use' = ANY($2)
+     ORDER BY created_at DESC`, [lockId, preference]);
   if (!r.rows.length) return null;
-  for (const kind of preference) {
-    const hit = r.rows.find(row => row.sheet_kind === kind);
+  for (const use of preference) {
+    const hit = r.rows.find(row => row.panel_use === use);
     if (hit) return hit.storage_key;
   }
   return null;
@@ -1615,7 +1636,147 @@ export default async function routes(app) {
          AND generator->>'lock_id' = $1
        ORDER BY created_at DESC`,
       [lock.id]);
-    return { items: r.rows, sheet_kinds: SHEET_KINDS };
+    // Each sheet carries the individual pictures cut off it, so the screen
+    // can show a sheet and its pieces together rather than as two
+    // unrelated lists (21 Aug 2026). A sheet nobody has split yet just has
+    // an empty array, which is also how the UI knows to offer the button.
+    const panels = (await q(
+      `SELECT id, storage_key, source_asset_id, settings, created_at FROM studio.assets
+       WHERE generator->>'provider' = 'SHEET_SPLIT' AND generator->>'lock_id' = $1
+         AND storage_key IS NOT NULL
+       ORDER BY created_at`, [lock.id])).rows;
+    const bySheet = new Map();
+    for (const p of panels) {
+      const row = { id: p.id, storage_key: p.storage_key, label: p.settings?.panel_label ?? '',
+        use: p.settings?.panel_use ?? 'OTHER', has_text: p.settings?.panel_has_text === true,
+        usable_as_reference: p.settings?.panel_has_text === false
+          && !['TEXT_BLOCK', 'SWATCH'].includes(p.settings?.panel_use) };
+      if (!bySheet.has(p.source_asset_id)) bySheet.set(p.source_asset_id, []);
+      bySheet.get(p.source_asset_id).push(row);
+    }
+    for (const item of r.rows) item.panels = bySheet.get(item.id) ?? [];
+    return { items: r.rows, sheet_kinds: SHEET_KINDS, panel_uses: PANEL_USES };
+  });
+
+  // Break a reference sheet into its individual pictures (21 Aug 2026,
+  // owner: "why dont you take the character and location reference and
+  // just break it down into the individual pieces so we can use whats
+  // needed"). A vision pass finds each picture and returns a box that
+  // excludes its caption; ffmpeg cuts them out; each becomes its own asset
+  // the person can look at and pick from.
+  //
+  // Nothing is deleted and the sheet is not modified. Splitting twice adds
+  // a second set rather than replacing the first, matching the append-only
+  // convention every other reference mechanism in this file follows: the
+  // newest of anything wins and history stays readable.
+  app.post('/studio/locks/:lockId/reference-pack/:assetId/split',
+    { preHandler: requirePerm('studio.generate') }, async (req, reply) => {
+    const lock = await one(`SELECT * FROM studio.locks WHERE id=$1`, [req.params.lockId]);
+    if (!lock) return reply.code(404).send(err(404, 'NOT_FOUND', 'lock not found'));
+    const sheet = await one(`SELECT * FROM studio.assets WHERE id=$1`, [req.params.assetId]);
+    if (!sheet || !sheet.storage_key) return reply.code(404).send(err(404, 'NOT_FOUND', 'sheet not found'));
+    if (sheet.generator?.lock_id !== lock.id) {
+      return reply.code(422).send(err(422, 'VALIDATION',
+        'that sheet does not belong to this lock -- split it from the lock it was uploaded to'));
+    }
+    if (!sheet.sheet_kind) {
+      return reply.code(422).send(err(422, 'VALIDATION',
+        'only a reference-pack sheet can be split; this asset is not one'));
+    }
+    const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [lock.project_id]);
+    let budget;
+    try {
+      budget = await checkAndSpendBudget(project, ESTIMATED_COST_USD.GEMINI_SHEET_SPLIT, req.actor,
+        req.body?.override_budget === true);
+    } catch (e) {
+      if (!(e instanceof BudgetExceededError)) throw e;
+      return reply.code(422).send(err(422, 'BUDGET_EXCEEDED', e.message));
+    }
+
+    const sheetPath = storage.localPath(sheet.storage_key);
+    const detected = await gemini.detectSheetPanels({
+      imageBase64: (await readFile(sheetPath)).toString('base64'),
+      mimeType: 'image/png',
+    });
+
+    // Real pixel size, so the model's fractions can be turned into a crop.
+    // In MOCK mode the "sheet" on disk is a text placeholder that ffprobe
+    // cannot read, so fall back to a nominal size rather than failing: the
+    // point of the mock path is to exercise the plumbing, not the pixels.
+    let sheetW = 1000, sheetH = 1400;
+    if (!MOCK()) {
+      try {
+        const { stdout } = await execFileP('ffprobe', ['-v', 'error', '-select_streams', 'v:0',
+          '-show_entries', 'stream=width,height', '-of', 'csv=p=0', sheetPath]);
+        const [w, h] = stdout.trim().split(',').map(Number);
+        if (w > 0 && h > 0) { sheetW = w; sheetH = h; }
+      } catch { /* keep the nominal size */ }
+    }
+
+    const saved = [];
+    const skipped = [];
+    for (const [i, panel] of (detected.panels ?? []).entries()) {
+      const b = panel?.box ?? {};
+      const nums = [b.x, b.y, b.w, b.h].map(Number);
+      const reasons = [];
+      if (nums.some(n => !Number.isFinite(n))) reasons.push('box needs numeric x, y, w and h');
+      else {
+        if (nums[2] <= 0 || nums[3] <= 0) reasons.push('box has no width or height');
+        if (nums[0] < 0 || nums[1] < 0 || nums[0] + nums[2] > 1.001 || nums[1] + nums[3] > 1.001) {
+          reasons.push('box falls outside the sheet');
+        }
+        // A "piece" that is most of the page is the sheet again, not a
+        // picture off it, and conditioning on it would reintroduce exactly
+        // the problem splitting is meant to solve.
+        if (nums[2] > 0.9 && nums[3] > 0.9) reasons.push('box covers the whole sheet, so it is not a piece of it');
+      }
+      const use = PANEL_USES.includes(panel?.use) ? panel.use : 'OTHER';
+      if (reasons.length) { skipped.push({ index: i, label: panel?.label ?? '', reason: reasons.join('; ') }); continue; }
+
+      const [x, y, w, h] = nums;
+      const px = Math.max(0, Math.round(x * sheetW));
+      const py = Math.max(0, Math.round(y * sheetH));
+      const pw = Math.max(1, Math.min(sheetW - px, Math.round(w * sheetW)));
+      const ph = Math.max(1, Math.min(sheetH - py, Math.round(h * sheetH)));
+
+      const assetId = crypto.randomUUID();
+      const key = `assets/generated/${assetId}/panel.png`;
+      const outPath = storage.localPath(key);
+      await mkdir(join(outPath, '..'), { recursive: true });
+      if (MOCK()) {
+        await storage.put(key, Buffer.from(`MOCK-PANEL ${use} ${px},${py},${pw},${ph}`));
+      } else {
+        try {
+          await execFileP('ffmpeg', ['-y', '-i', sheetPath, '-vf', `crop=${pw}:${ph}:${px}:${py}`, outPath]);
+        } catch (e) {
+          skipped.push({ index: i, label: panel?.label ?? '', reason: `crop failed: ${e.message}` });
+          continue;
+        }
+      }
+      // has_text is stored as the model gave it, pessimism included, and
+      // read back as a string comparison in bestPanelKey -- so an absent or
+      // non-boolean answer is treated as "has text" and never conditions.
+      const hasText = panel?.has_text !== false;
+      const asset = await one(
+        `INSERT INTO studio.assets (id, project_id, kind, status, storage_key, generator, prompt_job_code, settings, source_asset_id)
+         VALUES ($1,$2,'REFERENCE_IMAGE','GENERATED',$3,$4,$5,$6,$7) RETURNING id, storage_key`,
+        [assetId, project.id, key,
+         JSON.stringify({ provider: 'SHEET_SPLIT', lock_id: lock.id, model: 'gemini-2.5-flash',
+           split_from_asset_id: sheet.id }),
+         code('JOB'),
+         JSON.stringify({ panel_label: String(panel?.label ?? '').slice(0, 120), panel_use: use,
+           panel_has_text: hasText, panel_box: { x, y, w, h }, split_from_sheet_kind: sheet.sheet_kind }),
+         sheet.id]);
+      saved.push({ id: asset.id, label: String(panel?.label ?? '').slice(0, 120), use, has_text: hasText,
+        usable_as_reference: !hasText && !['TEXT_BLOCK', 'SWATCH'].includes(use) });
+    }
+
+    const usable = saved.filter(p => p.usable_as_reference).length;
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [project.id, req.actor?.id ?? null, `locks/${lock.entity_code}`,
+       `split the ${sheet.sheet_kind} sheet into ${saved.length} pieces, ${usable} of them clean enough to generate from`]);
+
+    return { saved, skipped, usable_count: usable, budget };
   });
 
   // Make an OLDER reference version this lock's current one (owner
@@ -1630,18 +1791,41 @@ export default async function routes(app) {
     if (!lock) return reply.code(404).send(err(404, 'NOT_FOUND', 'lock not found'));
     const assetId = req.body?.asset_id;
     if (!assetId) return reply.code(422).send(err(422, 'VALIDATION', 'asset_id is required'));
-    if (!(lock.reference_asset_ids ?? []).includes(assetId)) {
-      return reply.code(422).send(err(422, 'VALIDATION',
-        'asset_id is not one of this lock\'s reference versions -- use /reference/attach for a library asset instead'));
+    // Two things can be selected: an earlier reference version of this
+    // lock, and a single picture cut off one of this lock's own sheets
+    // (21 Aug 2026). The second is why splitting exists -- "use whats
+    // needed" means picking one piece and making it the reference -- and a
+    // piece is not a reference version until someone picks it, so it
+    // cannot already be in the array. Anything else is still refused, and
+    // the refusal still points at /reference/attach for a library asset.
+    const known = (lock.reference_asset_ids ?? []).includes(assetId);
+    if (!known) {
+      const panel = await one(
+        `SELECT id, settings FROM studio.assets
+         WHERE id=$1 AND generator->>'provider' = 'SHEET_SPLIT' AND generator->>'lock_id' = $2`,
+        [assetId, lock.id]);
+      if (!panel) {
+        return reply.code(422).send(err(422, 'VALIDATION',
+          'asset_id is neither one of this lock\'s reference versions nor a piece split off one of its sheets -- use /reference/attach for a library asset instead'));
+      }
+      // A piece carrying lettering is exactly what splitting was meant to
+      // get away from, so it can be looked at but not made the reference.
+      if (panel.settings?.panel_has_text !== false) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          'that piece has lettering in it. Using it as the reference would put text back into everything composed from this lock, which is what splitting the sheet was for. Pick a piece that is only a picture.',
+          { guard: 'panelHasText' }));
+      }
     }
-    if (lock.reference_asset_ids[lock.reference_asset_ids.length - 1] === assetId) {
+    if ((lock.reference_asset_ids ?? [])[lock.reference_asset_ids.length - 1] === assetId) {
       return { ok: true, already_current: true };
     }
     await q(`UPDATE studio.locks SET reference_asset_ids = array_append(reference_asset_ids, $2) WHERE id=$1`,
       [lock.id, assetId]);
     await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
       [lock.project_id, req.actor?.id ?? null, `locks/${lock.entity_code}`,
-       `re-selected an earlier reference version as current for ${lock.entity_code}`]);
+       known
+         ? `re-selected an earlier reference version as current for ${lock.entity_code}`
+         : `made a piece split off a reference sheet the current reference for ${lock.entity_code}`]);
     return { ok: true, already_current: false };
   });
 
@@ -1827,20 +2011,44 @@ export default async function routes(app) {
     const assetId = crypto.randomUUID();
     const prompt = compileComposePrompt(characterLock, environmentLock, styleLock, project.aspect_ratio,
       shot.camera?.framing_notes ?? null);
-    // Reference-pack conditioning (21 Aug 2026): if either lock has an
-    // uploaded pack, add its most identity-bearing sheet alongside the two
-    // flat references. Gemini caps conditioning at 3 images, so the
-    // character's sheet wins the third slot when both have one -- identity
-    // drift on the presenter is far more noticeable than a background
-    // shifting slightly. With no pack uploaded this is byte-for-byte the
-    // two-image call it has always been.
-    const [charSheet, envSheet] = await Promise.all([
-      bestPackSheetKey(characterLock.id, 'CHARACTER'),
-      bestPackSheetKey(environmentLock.id, 'ENVIRONMENT'),
+    // Reference packs are NOT fed to the image model. Written 21 Aug 2026,
+    // removed the same evening, and the reason matters enough to keep here.
+    //
+    // The idea was that a lock's most identity-bearing sheet could ride
+    // along as a third conditioning image and hold the presenter's face
+    // steady. What a reference sheet actually is, in practice, is a
+    // typeset DOCUMENT: the character sheet Letena uses has a title, seven
+    // numbered section headings, a labelled field list, per-pose captions,
+    // and a row of hex codes, all on a white page. Handing that to an image
+    // model as something to compose from asks it to reproduce a page of
+    // print, and it partly does -- which is how three consecutive Runway
+    // generations died on INTERNAL.BAD_OUTPUT.CODE01, whose documented
+    // first cause is "logos, watermarks, or overlaid text in input media".
+    //
+    // Every sheet kind has this problem, not just TURNAROUND: contact
+    // sheets, palettes and location grids are all captioned documents. So
+    // the packs stay exactly where they belong, as reference material a
+    // person looks at, and nothing goes to the model that a person did not
+    // choose as a picture. A specific sheet CAN still drive composition --
+    // crop the frame you want and attach it with /reference/upload, or pick
+    // an existing image with /reference/attach. Both already existed.
+    //
+    // What DOES ride in the third slot is a single picture cut off a sheet
+    // by /reference-pack/:assetId/split, and only one the vision pass
+    // confirmed carries no lettering. That is the useful half of the idea
+    // the sheets were reached for: an extra angle on the presenter's face,
+    // as a photograph rather than as a page about her. Gemini takes at most
+    // three conditioning images, so the character's piece wins the slot
+    // when both locks have one -- identity drift on the presenter is far
+    // more noticeable than a background shifting slightly. With nothing
+    // split yet this is byte-for-byte the two-image call.
+    const [charPanel, envPanel] = await Promise.all([
+      bestPanelKey(characterLock.id, 'CHARACTER'),
+      bestPanelKey(environmentLock.id, 'ENVIRONMENT'),
     ]);
     const referenceImageKeys = [characterRef.storage_key, environmentRef.storage_key];
-    if (charSheet) referenceImageKeys.push(charSheet);
-    else if (envSheet) referenceImageKeys.push(envSheet);
+    if (charPanel) referenceImageKeys.push(charPanel);
+    else if (envPanel) referenceImageKeys.push(envPanel);
     const gen = await gemini.generateImage({ prompt, assetId, referenceImageKeys });
     // Crop the square Gemini returns down to the project's real frame shape
     // BEFORE it is stored as the shot's first frame, so the video engine

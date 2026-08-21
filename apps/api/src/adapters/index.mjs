@@ -445,6 +445,65 @@ export const gemini = {
     try { segments = JSON.parse(jsonText); } catch { segments = [{ start_s: 0, end_s: null, speaker: 'doctor', text }]; }
     return { status: 'SUCCEEDED', segments, cost_usd: null };
   },
+  // Break a reference SHEET into its individual pictures (21 Aug 2026,
+  // owner: "why dont you take the character and location reference and just
+  // break it down into the individual pieces so we can use whats needed").
+  //
+  // A reference sheet is a typeset document -- a grid of small pictures with
+  // a title, section headings and a caption under every panel. That makes
+  // the whole sheet useless as a conditioning image, because an image model
+  // handed a page of print tries to reproduce print (three Runway
+  // generations died on exactly that). The pictures ON it are excellent
+  // references. This locates them.
+  //
+  // The boxes must exclude captions, which is the entire point and the one
+  // thing a geometric row/column split cannot do: the caption sits inside
+  // the same cell as the picture it labels, so cutting on the gutters keeps
+  // the words. A vision model can see where the photograph stops and the
+  // lettering starts.
+  //
+  // Returns normalised boxes (0-1 of width/height) so the caller can crop at
+  // whatever the real pixel size turns out to be, plus a coarse `use` tag
+  // and a has_text flag per panel. has_text is what decides whether a piece
+  // is safe to condition on, so the model is told to be pessimistic: if it
+  // is unsure whether lettering is inside the box, say true.
+  async detectSheetPanels({ imageBase64, mimeType = 'image/png' }) {
+    if (MOCK()) {
+      return { status: 'SUCCEEDED', cost_usd: 0, panels: [
+        { label: 'front view', use: 'FRONT', has_text: false, box: { x: 0.05, y: 0.10, w: 0.20, h: 0.35 } },
+        { label: 'three quarter view', use: 'THREE_QUARTER', has_text: false, box: { x: 0.28, y: 0.10, w: 0.20, h: 0.35 } },
+        { label: 'title block', use: 'TEXT_BLOCK', has_text: true, box: { x: 0.00, y: 0.00, w: 1.00, h: 0.06 } },
+      ] };
+    }
+    const uses = 'FRONT, THREE_QUARTER, SIDE, BACK, EXPRESSION, POSE, COSTUME_DETAIL, SWATCH, '
+      + 'LOCATION_ANGLE, LOCATION_LAYOUT, PROP, TEXT_BLOCK, OTHER';
+    const parts = [
+      { text: `This is a reference sheet: a page of small pictures with headings and captions. Find every individual PICTURE on it.
+
+For each picture return a box that contains ONLY the picture. Exclude the caption or label printed under, over or beside it, and exclude any heading above it. Crop tight to the image itself; it is better to lose a few pixels of the picture than to include one letter.
+
+Return strict JSON and nothing else:
+{"panels":[{"label":"short plain description, lowercase","use":"one of: ${uses}","has_text":true or false,"box":{"x":0-1,"y":0-1,"w":0-1,"h":0-1}}]}
+
+x and y are the top-left corner as a fraction of the full image width and height. w and h are the width and height as fractions. use is your best guess at what the picture shows. has_text is true if ANY lettering, number, caption, watermark or logo falls inside the box you returned -- if you are not sure, say true. Include colour swatches and material squares as their own panels with use SWATCH. Include blocks that are purely type, with use TEXT_BLOCK and has_text true, so the caller knows they were seen and skipped.` },
+      { inlineData: { mimeType, data: imageBase64 } },
+    ];
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${need('GEMINI_API_KEY')}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts }] }),
+    });
+    if (!res.ok) throw new Error(`gemini sheet split ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const d = await res.json();
+    const text = d.candidates?.[0]?.content?.parts?.map(p => p.text).join('') ?? '{}';
+    const jsonText = text.replace(/^```json?\s*/i, '').replace(/```\s*$/, '');
+    let parsed;
+    try { parsed = JSON.parse(jsonText); } catch {
+      throw new Error(`gemini sheet split returned unparseable JSON: ${text.slice(0, 300)}`);
+    }
+    return { status: 'SUCCEEDED', panels: Array.isArray(parsed.panels) ? parsed.panels : [], cost_usd: null };
+  },
+
   // Video Studio automated continuity QC (playbook 19.2, phase 1, 18 Aug
   // 2026). This is the honest version of "AI checks continuity": a vision
   // model comparing one candidate frame against the locked reference

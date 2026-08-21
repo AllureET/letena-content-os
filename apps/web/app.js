@@ -3650,7 +3650,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3778,7 +3778,7 @@ document.addEventListener('click', async (e) => {
         const items = r.items ?? [];
         box.innerHTML = `
           <div class="claimrow">
-            <div class="muted" style="font-size:11px;margin-bottom:6px">Make these anywhere you like (ChatGPT, Midjourney, a real photoshoot) and drop them here. They stay attached to this lock, show up in the asset library, and the composer feeds the most useful one to Gemini as extra identity conditioning. A sheet does <b>not</b> become the composable reference unless you tick the box.</div>
+            <div class="muted" style="font-size:11px;margin-bottom:6px">Make these anywhere you like (ChatGPT, Midjourney, a real photoshoot) and drop them here. They stay attached to this lock and show up in the asset library. A whole sheet is never fed to the image model, because a sheet is a document: the headings and captions on it come back as garbled lettering in the picture. Break a sheet into pieces instead, and the individual pictures off it can be used. A sheet does <b>not</b> become the composable reference unless you tick the box.</div>
             <div class="flex" style="gap:6px;flex-wrap:wrap;align-items:flex-end">
               <div><label style="font-size:11px">Sheet kind</label>
                 <select id="stpackkind-${esc(lockId)}" style="max-width:180px">${KINDS.map(k => `<option value="${k}">${esc(pretty(k))}</option>`).join('')}</select></div>
@@ -3792,10 +3792,32 @@ document.addEventListener('click', async (e) => {
           ${items.length ? `<div style="margin-top:10px">${KINDS.filter(k => items.some(i => i.sheet_kind === k)).map(k => `
             <div style="margin-bottom:8px">
               <div style="font-size:11px;font-weight:600">${esc(pretty(k))}</div>
-              <div class="flex" style="flex-wrap:wrap;gap:6px;margin-top:3px">
-                ${items.filter(i => i.sheet_kind === k).map(i => `
-                  <img class="ath" style="max-width:88px;max-height:88px;border-radius:4px;cursor:zoom-in" src="${esc(mediaUrl(i.storage_key))}" alt="${esc(pretty(k))}" loading="lazy" title="Click to preview" onclick="imagePreview('${esc(mediaUrl(i.storage_key))}','${esc(pretty(k))}')" onerror="assetImgError(this,'REFERENCE_IMAGE')">`).join('')}
-              </div>
+              ${items.filter(i => i.sheet_kind === k).map(i => `
+                <div class="claimrow" style="margin-top:4px">
+                  <div class="flex" style="gap:8px;align-items:flex-start">
+                    <img class="ath" style="max-width:88px;max-height:88px;border-radius:4px;cursor:zoom-in" src="${esc(mediaUrl(i.storage_key))}" alt="${esc(pretty(k))}" loading="lazy" title="Click to preview" onclick="imagePreview('${esc(mediaUrl(i.storage_key))}','${esc(pretty(k))}')" onerror="assetImgError(this,'REFERENCE_IMAGE')">
+                    <div style="flex:1">
+                      ${i.sheet_note ? `<div class="muted" style="font-size:11px">${esc(i.sheet_note)}</div>` : ''}
+                      <button style="font-size:11px;padding:2px 8px;margin-top:4px" data-stpacksplit="${esc(lockId)}|${esc(i.id)}"
+                        title="Finds every individual picture on this sheet and cuts it out, leaving the captions behind">
+                        ${(i.panels ?? []).length ? 'Split again' : 'Break into pieces'}</button>
+                      ${(i.panels ?? []).length ? `<span class="muted" style="font-size:11px;margin-left:6px">${(i.panels ?? []).filter(x => x.usable_as_reference).length} of ${(i.panels ?? []).length} usable</span>` : ''}
+                    </div>
+                  </div>
+                  ${(i.panels ?? []).length ? `<div class="flex" style="flex-wrap:wrap;gap:6px;margin-top:6px">
+                    ${(i.panels ?? []).map(pn => `<div style="width:78px">
+                      <img style="width:78px;height:78px;object-fit:cover;border-radius:4px;cursor:zoom-in;display:block;${pn.usable_as_reference ? '' : 'opacity:.45'}"
+                        src="${esc(mediaUrl(pn.storage_key))}" loading="lazy" title="${esc(pn.label || pn.use)}"
+                        onclick="imagePreview('${esc(mediaUrl(pn.storage_key))}','${esc(pn.label || pn.use)}')"
+                        onerror="assetImgError(this,'REFERENCE_IMAGE')">
+                      <div class="muted" style="font-size:10px;margin-top:2px;line-height:1.2">${esc((pn.label || pn.use).slice(0, 28))}</div>
+                      ${pn.usable_as_reference
+                        ? `<button style="font-size:10px;padding:1px 5px;margin-top:2px" data-stpanelref="${esc(lockId)}|${esc(pn.id)}"
+                            title="Make this single picture the lock's current reference">Use this</button>`
+                        : `<div class="muted" style="font-size:10px;margin-top:2px">${pn.has_text ? 'has lettering' : 'not a picture'}</div>`}
+                    </div>`).join('')}
+                  </div>` : ''}
+                </div>`).join('')}
             </div>`).join('')}</div>`
             : '<div class="muted" style="font-size:12px;margin-top:8px">No sheets uploaded for this lock yet.</div>'}`;
       } catch (ex) {
@@ -3825,6 +3847,26 @@ document.addEventListener('click', async (e) => {
       } finally {
         b.disabled = false; b.textContent = 'Upload sheets';
       }
+      return render();
+    }
+    // Break a sheet into its individual pictures, and use one of them.
+    // 21 Aug 2026, owner: "why dont you take the character and location
+    // reference and just break it down into the individual pieces so we
+    // can use whats needed".
+    if (b.dataset.stpacksplit) {
+      const [lockId, assetId] = b.dataset.stpacksplit.split('|');
+      b.disabled = true; b.textContent = 'Reading the sheet…';
+      try {
+        const r = await api('POST', `/studio/locks/${lockId}/reference-pack/${assetId}/split`, {});
+        toast(`${r.saved.length} piece(s) cut out, ${r.usable_count} clean enough to generate from${r.skipped.length ? `. ${r.skipped.length} skipped.` : '.'}`);
+      } finally { b.disabled = false; }
+      return render();
+    }
+    if (b.dataset.stpanelref) {
+      const [lockId, assetId] = b.dataset.stpanelref.split('|');
+      b.disabled = true; b.textContent = 'Setting…';
+      await api('POST', `/studio/locks/${lockId}/reference/select`, { asset_id: assetId });
+      toast('That piece is now this lock\'s current reference.');
       return render();
     }
     if (b.dataset.strefselect) {

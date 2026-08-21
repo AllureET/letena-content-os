@@ -169,3 +169,51 @@ test('an explicit VEO engine on the shot still resolves to VEO', async () => {
   assert.equal(gen.json().asset.generator.provider, 'VEO',
     'the engine setting must keep its meaning even though RUNWAY is the default');
 });
+
+// Pack sheets never reach the image model (21 Aug 2026, added the evening
+// the conditioning was removed). A reference sheet is a typeset document --
+// Letena's has a title, seven numbered headings, per-pose captions and a
+// row of hex codes on a white page -- and feeding one to an image model as
+// something to compose from asks it to reproduce print. Three consecutive
+// Runway generations died on INTERNAL.BAD_OUTPUT.CODE01, whose documented
+// first cause is text in the input media. The pack is reference material
+// for a person; only images a person chose as pictures go to the model.
+test('composing a first frame conditions on the two lock references only, never a pack sheet', async () => {
+  const proj = (await call('POST', '/studio/projects',
+    { title: 'Pack conditioning test', format: 'explainer', aspect_ratio: '9:16', language: 'am' })).json();
+  const ch = (await call('POST', `/studio/projects/${proj.id}/locks`,
+    { level: 'L1_ENTITY', entity_type: 'CHARACTER', entity_code: 'CHR-COND', data: { name: 'Cond' } })).json();
+  const en = (await call('POST', `/studio/projects/${proj.id}/locks`,
+    { level: 'L1_ENTITY', entity_type: 'ENVIRONMENT', entity_code: 'ENV-COND', data: { architecture: 'a room' } })).json();
+
+  // One real reference on each lock, plus a fat pack on both.
+  const chRef = (await call('POST', `/studio/locks/${ch.id}/reference/upload`, { image_base64: PNG })).json();
+  const enRef = (await call('POST', `/studio/locks/${en.id}/reference/upload`, { image_base64: PNG })).json();
+  await call('POST', `/studio/locks/${ch.id}/reference-pack`,
+    { sheets: [{ sheet_kind: 'TURNAROUND', image_base64: PNG }, { sheet_kind: 'EXPRESSIONS', image_base64: PNG }] });
+  await call('POST', `/studio/locks/${en.id}/reference-pack`,
+    { sheets: [{ sheet_kind: 'LOCATION_ANGLES', image_base64: PNG }] });
+  await call('POST', `/studio/locks/${ch.id}/approve`, {});
+  await call('POST', `/studio/locks/${en.id}/approve`, {});
+
+  const shot = (await call('POST', `/studio/projects/${proj.id}/shots`,
+    { shot_code: 'SH-COND', order_index: 0, duration_target_s: 5, story: { beat: 'conditioning check' },
+      continuity: { characters: ['CHR-COND'], environment: 'ENV-COND' },
+      generation: { mode_preference: 'image_to_video' } })).json();
+
+  const r = await call('POST', `/studio/shots/${shot.id}/compose-first-frame`, {});
+  assert.equal(r.statusCode, 200, r.body);
+
+  // The MOCK Gemini adapter records what it was conditioned on, so the
+  // count is checkable without reaching for the provider.
+  const asset = await one(`SELECT settings, generator FROM studio.assets WHERE id=$1`, [r.json().asset.id]);
+  const used = asset.generator?.reference_image_keys ?? asset.settings?.reference_image_keys ?? null;
+  if (used) {
+    assert.equal(used.length, 2, 'exactly the character reference and the environment reference');
+    assert.ok(used.includes(chRef.storage_key) && used.includes(enRef.storage_key));
+  }
+  // Whatever the adapter records, the pack itself must be untouched and
+  // still be there for a person to look at.
+  const pack = (await call('GET', `/studio/locks/${ch.id}/reference-pack`)).json();
+  assert.equal(pack.items.length, 2, 'removing the conditioning must not remove the pack');
+});

@@ -10,7 +10,16 @@ const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 const MAX_UPLOAD = 8 * 1024 * 1024; // 8 MB base64 payload bound
 
 export default async function routes(app) {
-  app.post('/production/assets', { preHandler: requirePerm('asset.manage') }, async (req, reply) => {
+  // bodyLimit override (21 Aug 2026): MAX_UPLOAD below bounds the payload at
+  // 8MB, but Fastify's GLOBAL default in server.mjs is 2MB -- so every
+  // upload between those two numbers died at a bare 413 before this
+  // handler's friendly 422 could ever run, making that check dead code and
+  // the 8MB allowance a fiction. Found while uploading the house music
+  // track (a 2.9MB mp3, base64 3.9MB). 12MB of headroom here lets a real
+  // 8MB asset through base64 expansion (~1.34x) and still refuse politely
+  // at MAX_UPLOAD rather than dropping the connection.
+  app.post('/production/assets',
+    { preHandler: requirePerm('asset.manage'), bodyLimit: 12 * 1024 * 1024 }, async (req, reply) => {
     const { title, kind, origin, description, content_base64, mime_type,
       people_present, people_consent_ref, tags = [], topic_codes = [] } = req.body ?? {};
     if (!title || !kind || !mime_type) {

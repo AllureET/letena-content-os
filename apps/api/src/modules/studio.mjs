@@ -514,21 +514,44 @@ async function presenterPlate(projectId) {
 // level rather than from one shot's locked_lock_ids, because the plate
 // belongs to the project and not to any single shot. Returns a message
 // instead of throwing so both callers can answer 422 in their own voice.
-async function composeLocksForProject(projectId) {
+// A project can carry several active locks of the same type -- STU-2EBF97A2
+// has three ENVIRONMENTs, two of them abandoned experiments. Picking one of
+// them blind is exactly the class of bug the plate exists to end, so when
+// the choice is ambiguous this refuses and names the candidates instead of
+// guessing which room the whole video is set in.
+async function composeLocksForProject(projectId, pick = {}) {
   const rows = (await q(
     `SELECT * FROM studio.locks WHERE project_id=$1 AND is_active ORDER BY version DESC`,
     [projectId])).rows;
-  const characterLock = rows.find(l => l.entity_type === 'CHARACTER');
-  const environmentLock = rows.find(l => l.entity_type === 'ENVIRONMENT');
+  const choose = (type, explicitId) => {
+    const all = rows.filter(l => l.entity_type === type);
+    if (explicitId) return { lock: all.find(l => l.id === explicitId), all, explicit: true };
+    return { lock: all.length === 1 ? all[0] : null, all, explicit: false };
+  };
+  const ch = choose('CHARACTER', pick.characterLockId);
+  const en = choose('ENVIRONMENT', pick.environmentLockId);
+  const characterLock = ch.lock;
+  const environmentLock = en.lock;
   const styleLock = rows.find(l => l.entity_type === 'STYLE');
-  const problem =
+  const ambiguous = (type, r, field) => {
+    if (r.lock || !r.all.length) return null;
+    if (r.explicit) return `${field} does not match an active ${type} lock on this project`;
+    return `this project has ${r.all.length} active ${type} locks (${r.all.map(l => l.entity_code).join(', ')})`
+      + ` -- pass ${field} to say which one the whole video is set in, rather than having one picked for you`;
+  };
+  // The ternary chain below MUST stay parenthesised. `a ?? b ?? c ? d : e`
+  // parses as `(a ?? b ?? c) ? d : e`, which made every call report "no
+  // active CHARACTER lock" on a project that plainly had one.
+  const problem = ambiguous('CHARACTER', ch, 'character_lock_id')
+    ?? ambiguous('ENVIRONMENT', en, 'environment_lock_id')
+    ?? (
     !characterLock ? 'this project has no active CHARACTER lock -- create and approve one first'
     : !environmentLock ? 'this project has no active ENVIRONMENT lock -- create and approve one first'
     : !characterLock.approved_at ? 'the CHARACTER lock is not approved yet -- approve it before composing the presenter plate'
     : !environmentLock.approved_at ? 'the ENVIRONMENT lock is not approved yet -- approve it before composing the presenter plate'
     : !characterLock.reference_asset_ids?.length ? 'the CHARACTER lock has no reference image yet -- generate one via POST /studio/locks/:lockId/reference first'
     : !environmentLock.reference_asset_ids?.length ? 'the ENVIRONMENT lock has no reference image yet -- generate one via POST /studio/locks/:lockId/reference first'
-    : null;
+    : null);
   return { characterLock, environmentLock, styleLock, problem };
 }
 
@@ -2270,8 +2293,9 @@ export default async function routes(app) {
     const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
     if (!project) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
 
-    const { characterLock, environmentLock, styleLock, problem } = await composeLocksForProject(project.id);
-    if (problem) return reply.code(422).send(err(422, 'GUARD_FAILED', problem));
+    const { characterLock, environmentLock, styleLock, problem } = await composeLocksForProject(project.id,
+      { characterLockId: req.body?.character_lock_id, environmentLockId: req.body?.environment_lock_id });
+    if (problem) return reply.code(422).send(err(422, 'GUARD_FAILED', problem, { guard: 'plateLockChoice' }));
 
     const estimatedCost = ESTIMATED_COST_USD.GEMINI_COMPOSE_IMAGE;
     let budget;

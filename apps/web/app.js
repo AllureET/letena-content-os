@@ -1710,6 +1710,8 @@ const screens = {
     const livePlate = plates.find(a => a.status === 'ACCEPTED');
     const newerPlate = plates.find(a => a.status !== 'ACCEPTED'
       && (!livePlate || new Date(a.created_at) > new Date(livePlate.created_at)));
+    const plateChars = locks.filter(l => l.entity_type === 'CHARACTER');
+    const plateEnvs = locks.filter(l => l.entity_type === 'ENVIRONMENT');
     const plateCut = new Set(p.plate_cut_shot_ids ?? []);
     const staleShots = livePlate
       ? shots.filter(s => s.generation?.first_frame_asset_id && !plateCut.has(s.id))
@@ -1749,6 +1751,16 @@ const screens = {
         Accepting a plate does not overwrite pictures you already approved. Run
         &ldquo;Compose first frame&rdquo; on each to cut it from the plate instead.
       </div>` : ''}
+      ${can('studio.generate') && (plateChars.length > 1 || plateEnvs.length > 1) ? `<div class="grid2" style="margin-top:8px">
+        <div><label>Presenter</label><select id="st-plate-char">
+          ${plateChars.map(l => `<option value="${esc(l.id)}">${esc(l.entity_code)}</option>`).join('')}
+        </select></div>
+        <div><label>Room</label><select id="st-plate-env">
+          ${plateEnvs.map(l => `<option value="${esc(l.id)}">${esc(l.entity_code)}</option>`).join('')}
+        </select></div>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:4px">This project has more than one active lock, so say
+        which one the whole video is set in rather than having one picked for you.</div>` : ''}
       ${can('studio.generate') ? `<button style="margin-top:8px" data-stplatecompose="${esc(p.id)}">${
         plates.length ? 'Compose another plate' : 'Compose the presenter plate'}</button>` : ''}
       <div id="stplatebox"></div>`;
@@ -4040,7 +4052,9 @@ document.addEventListener('click', async (e) => {
       const box = document.getElementById('stplatebox');
       b.disabled = true; const was = b.textContent; b.textContent = 'Composing…';
       try {
-        const r = await api('POST', `/studio/projects/${b.dataset.stplatecompose}/presenter-plate`, {});
+        const r = await api('POST', `/studio/projects/${b.dataset.stplatecompose}/presenter-plate`, {
+          character_lock_id: elv('st-plate-char') || undefined,
+          environment_lock_id: elv('st-plate-env') || undefined });
         if (box) {
           box.innerHTML = `<div class="claimrow" style="margin-top:8px">
             <div style="font-size:12px"><b>Plate composed.</b> Look at it before accepting it --

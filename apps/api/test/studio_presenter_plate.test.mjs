@@ -165,3 +165,32 @@ test('accepting a plate does not silently rewrite frames a person already approv
   assert.equal(after.first_frame_asset_id, before.first_frame_asset_id,
     'replacing approved pictures behind the producer is worse than the drift being fixed');
 });
+
+// 22 Aug 2026. STU-2EBF97A2 carries three active ENVIRONMENT locks, two of
+// them abandoned experiments. A plate route that picks one of them blind is
+// the same bug the plate exists to end, one level up: instead of six rooms
+// that drift, you get one room chosen by accident.
+test('an ambiguous room is refused, not guessed', async () => {
+  const second = (await call('POST', `/studio/projects/${projectId}/locks`,
+    { level: 'L1_ENTITY', entity_type: 'ENVIRONMENT', entity_code: 'ENV-PL-2', data: { name: 'ENV-PL-2' } })).json();
+  await call('POST', `/studio/locks/${second.id}/reference/upload`, { image_base64: PNG });
+  await call('POST', `/studio/locks/${second.id}/approve`, {});
+
+  const r = await call('POST', `/studio/projects/${projectId}/presenter-plate`, {});
+  assert.equal(r.statusCode, 422);
+  assert.equal(r.json().guard, 'plateLockChoice');
+  assert.match(r.json().detail, /2 active ENVIRONMENT locks/);
+  assert.match(r.json().detail, /ENV-PL/, 'the refusal names the candidates so the choice can be made');
+
+  const ok = await call('POST', `/studio/projects/${projectId}/presenter-plate`,
+    { environment_lock_id: second.id });
+  assert.equal(ok.statusCode, 200, ok.body);
+  assert.equal(ok.json().environment_lock.entity_code, 'ENV-PL-2');
+});
+
+test('a lock id that is not on this project is refused rather than ignored', async () => {
+  const r = await call('POST', `/studio/projects/${projectId}/presenter-plate`,
+    { environment_lock_id: '00000000-0000-0000-0000-000000000000' });
+  assert.equal(r.statusCode, 422);
+  assert.match(r.json().detail, /does not match an active ENVIRONMENT lock/);
+});

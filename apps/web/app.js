@@ -1769,6 +1769,18 @@ const screens = {
     // are speculative fields another engineer's concurrent guardrail work may
     // add tonight; shown only if present, never assumed.
     let budgetHtml = '';
+    // Changing the cap in place (22 Aug 2026, owner mid-run: "raise the cap
+    // to 20"). The cap was set once at creation and never again, so the only
+    // ways out were overriding the budget on every call or starting the
+    // project over. Shown whether or not a cap exists, because "this project
+    // has no ceiling" is a state a producer may well want to end.
+    const capEditHtml = (p) => can('studio.approve') ? `<div class="flex" style="gap:6px;margin-top:8px;align-items:center">
+      <input id="st-budget-cap" style="width:110px;font-size:12px" placeholder="new cap, USD"
+        value="${p.budget_cap_usd != null ? esc(String(Number(p.budget_cap_usd).toFixed(2))) : ''}">
+      <button style="font-size:12px" data-stbudget="${esc(p.id)}">Set cap</button>
+      ${p.budget_cap_usd != null ? `<button style="font-size:12px" data-stbudgetclear="${esc(p.id)}">Remove cap</button>` : ''}
+    </div>` : '';
+
     if (p.budget_cap_usd != null) {
       const spent = Number(p.spent_usd ?? 0);
       const cap = Number(p.budget_cap_usd);
@@ -1780,6 +1792,14 @@ const screens = {
         <div class="meter"><div class="meter-fill ${pct >= 100 ? 'full' : pct >= 75 ? 'warn' : ''}" style="width:${pct}%"></div></div>
         ${p.budget_pct != null ? `<div class="muted" style="font-size:11px;margin-top:4px">${esc(String(p.budget_pct))}% of cap</div>` : ''}
         ${p.budget_warning ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">${esc(p.budget_warning)}</div>` : ''}
+        ${capEditHtml(p)}
+      </div>`;
+    } else {
+      budgetHtml = `<div style="max-width:380px;margin-top:10px">
+        <div class="flex" style="justify-content:space-between">
+          <span style="font-size:12px">Budget</span>
+          <span class="mono" style="font-size:12px">$${Number(p.spent_usd ?? 0).toFixed(2)} spent, no cap</span></div>
+        ${capEditHtml(p)}
       </div>`;
     }
 
@@ -3767,7 +3787,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stbudget],[data-stbudgetclear],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -4047,6 +4067,24 @@ document.addEventListener('click', async (e) => {
     if (b.dataset.stscrolltolocks) {
       document.getElementById('st-locks-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       return;
+    }
+    if (b.dataset.stbudget) {
+      const raw = elv('st-budget-cap');
+      const n = Number(raw);
+      if (!raw || !Number.isFinite(n) || n <= 0) { toast('Enter a positive amount', true); return; }
+      await api('POST', `/studio/projects/${b.dataset.stbudget}/budget`, { budget_cap_usd: n });
+      toast(`Cap set to $${n.toFixed(2)}`);
+      return render();
+    }
+    if (b.dataset.stbudgetclear) {
+      if (b.dataset.confirm !== '1') {
+        b.dataset.confirm = '1'; b.textContent = 'Click again to remove';
+        setTimeout(() => { b.dataset.confirm = ''; b.textContent = 'Remove cap'; }, 4000);
+        return;
+      }
+      await api('POST', `/studio/projects/${b.dataset.stbudgetclear}/budget`, { budget_cap_usd: null });
+      toast('Cap removed. This project now has no ceiling.');
+      return render();
     }
     if (b.dataset.stplatecompose) {
       const box = document.getElementById('stplatebox');

@@ -1217,6 +1217,57 @@ export default async function routes(app) {
   // the default list without touching its locks/shots/assets/events. Gated
   // on studio.approve, same tier as /state and /assemble, since removing a
   // whole project from view is a project-level decision, not a working edit.
+  // Change a project's budget cap after it exists (22 Aug 2026, owner:
+  // "raise the cap to 20"). The cap could be set once, at creation, and
+  // never again -- so a project that turned out to need more had exactly
+  // two options, both bad: override_budget on every single call, which
+  // defeats the point of having a cap, or start a new project and lose the
+  // work. A cap you cannot revise is not a budget, it is a wall.
+  //
+  // studio.approve, not studio.write: raising a spending limit is an
+  // approval, and the same permission already guards assembly and accepting
+  // work. Every change is written to the event timeline with both numbers,
+  // because "who raised this and to what" is the first question anyone asks
+  // of a project that overspent.
+  app.post('/studio/projects/:id/budget', { preHandler: requirePerm('studio.approve') }, async (req, reply) => {
+    const p = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+
+    const raw = req.body?.budget_cap_usd;
+    // null is meaningful and is not the same as leaving the field out: it
+    // clears the cap entirely, which is what a project with no ceiling
+    // already stores. Sending nothing at all is a malformed request.
+    if (raw === undefined) {
+      return reply.code(422).send(err(422, 'VALIDATION',
+        'budget_cap_usd is required; pass a positive number to set a cap, or null to remove the cap entirely'));
+    }
+    let cap = null;
+    if (raw !== null) {
+      cap = Number(raw);
+      if (!Number.isFinite(cap) || cap <= 0) {
+        return reply.code(422).send(err(422, 'VALIDATION',
+          `budget_cap_usd must be a positive number or null, got ${JSON.stringify(raw)}`));
+      }
+      const spent = Number(p.spent_usd ?? 0);
+      if (cap < spent) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          `this project has already spent $${spent.toFixed(2)}, so a cap of $${cap.toFixed(2)} would be below its own spend`
+          + ' -- lowering a cap cannot un-spend money, and a cap under spend would block every further call with no way back',
+          { guard: 'capBelowSpend', spent_usd: spent }));
+      }
+    }
+    const updated = await one(
+      `UPDATE studio.projects SET budget_cap_usd=$2, updated_at=now() WHERE id=$1 RETURNING budget_cap_usd, spent_usd`,
+      [p.id, cap]);
+    const was = p.budget_cap_usd == null ? 'no cap' : `$${Number(p.budget_cap_usd).toFixed(2)}`;
+    const now = cap == null ? 'no cap' : `$${cap.toFixed(2)}`;
+    await q(`INSERT INTO studio.events (project_id, actor_id, note) VALUES ($1,$2,$3)`,
+      [p.id, req.actor?.id ?? null, `budget cap changed from ${was} to ${now} (spent $${Number(updated.spent_usd ?? 0).toFixed(2)})`]);
+    await audit(null, { actor: req.actor, action: 'studio.project.budget', objectType: 'STUDIO_PROJECT',
+      objectId: p.id, objectCode: p.code });
+    return { id: p.id, budget_cap_usd: updated.budget_cap_usd, spent_usd: updated.spent_usd };
+  });
+
   app.post('/studio/projects/:id/archive', { preHandler: requirePerm('studio.approve') }, async (req, reply) => {
     const p = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
     if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));

@@ -16,7 +16,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -99,4 +99,40 @@ test('no narration leaves the picture exactly as it was', async () => {
   const r = await layVoiceOntoVideo({ workDir: dir, videoPath: video, voiceTracks: [] });
   assert.equal(r.path, video, 'a project with no voice must not be re-encoded for nothing');
   assert.equal(r.heldS, 0);
+});
+
+// 22 Aug 2026, owner: "i dont hear any narration just the music". He was
+// watching a cached render, but measuring the file to prove that turned up a
+// real defect underneath: amix normalizes by input count unless told not to,
+// so mixing the music in was halving the narration it was mixed against.
+// 6dB is the difference between a voice sitting over a bed and a voice
+// sitting in it.
+test('mixing music in does not turn the narration down', async () => {
+  const src = await readFile(new URL('../src/modules/studio.mjs', import.meta.url), 'utf8');
+  const mixer = src.slice(src.indexOf('async function mixMusicOntoVideo'));
+  const body = mixer.slice(0, mixer.indexOf('\n}\n'));
+  const amixCalls = body.match(/amix=[^`'"]+/g) ?? [];
+  assert.ok(amixCalls.length, 'the music mixer should still be mixing something');
+  for (const call of amixCalls) {
+    assert.match(call, /normalize=0/,
+      `amix defaults to dividing by input count, which silently attenuates the voice: ${call}`);
+  }
+});
+
+// The same trap, guarded at its other site. layVoiceOntoVideo already had
+// the comment explaining it; this makes the comment enforceable.
+test('mixing six lines together does not turn each of them down', async () => {
+  const src = await readFile(new URL('../src/modules/studio.mjs', import.meta.url), 'utf8');
+  const layer = src.slice(src.indexOf('export async function layVoiceOntoVideo'));
+  const body = layer.slice(0, layer.indexOf('\n}\n'));
+  for (const call of body.match(/amix=[^`'"]+/g) ?? []) {
+    assert.match(call, /normalize=0/, call);
+  }
+});
+
+test('the assembled cut records whether it has narration on it', async () => {
+  const src = await readFile(new URL('../src/modules/studio.mjs', import.meta.url), 'utf8');
+  assert.match(src, /\.\.\.settingsBase,\s*\.\.\.\(voiceReport \? \{ voice: voiceReport \} : \{\}\)/,
+    'the voice report must be stored on the asset, not only returned to whoever pressed Assemble -- '
+    + 'otherwise the screen can never tell a producer what they are looking at');
 });

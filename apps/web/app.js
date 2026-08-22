@@ -1696,6 +1696,63 @@ const screens = {
         catch { assetsByShot.set(s.id, []); }
       }));
 
+    // The presenter plate (22 Aug 2026, owner on the first finished cut:
+    // "the girl and th ebackground change 5 diffeent times").
+    //
+    // Sits above Locks because it is the decision those locks exist to
+    // serve: one picture of the presenter in her room, reviewed once, that
+    // every shot is then cut out of. The panel has to make the ACCEPTED
+    // one obvious, because an accepted plate silently changes what "Compose
+    // first frame" does on every shot below, and a producer who cannot see
+    // which plate is live cannot tell why a shot came back framed the way
+    // it did.
+    const plates = p.presenter_plates ?? [];
+    const livePlate = plates.find(a => a.status === 'ACCEPTED');
+    const newerPlate = plates.find(a => a.status !== 'ACCEPTED'
+      && (!livePlate || new Date(a.created_at) > new Date(livePlate.created_at)));
+    const plateCut = new Set(p.plate_cut_shot_ids ?? []);
+    const staleShots = livePlate
+      ? shots.filter(s => s.generation?.first_frame_asset_id && !plateCut.has(s.id))
+      : [];
+    const plateCard = (a, label, tone) => `<div class="claimrow" style="border-left-color:${tone};margin-top:6px">
+      <div style="display:flex;gap:10px;align-items:flex-start">
+        <img class="ath" style="max-width:120px" src="${esc(mediaUrl(a.storage_key))}"
+          alt="presenter plate" loading="lazy" onerror="assetImgError(this,'KEYFRAME')">
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;font-weight:600">${esc(label)}</div>
+          <div class="muted" style="font-size:11px;margin-top:2px">composed ${dt(a.created_at)}</div>
+          ${a.status !== 'ACCEPTED' && can('studio.approve')
+            ? `<button style="margin-top:6px" data-stplateaccept="${esc(a.id)}">Use this plate for every shot</button>`
+            : ''}
+          ${a.status !== 'ACCEPTED' && can('studio.write')
+            ? `<button style="margin-top:6px;margin-left:6px" data-stplatedelete="${esc(a.id)}">Discard</button>`
+            : ''}
+        </div>
+      </div>
+    </div>`;
+    const plateHtml = `
+      <div class="eyebrow" style="margin-top:20px">Presenter plate</div>
+      <div class="claimrow" style="font-size:12px">
+        One picture of the presenter in her room, cut into every shot's first frame.
+        Without it each shot composes its own frame from the same locks and comes back
+        as a slightly different woman in a slightly different room, because a lock
+        constrains the description the model reads and never the pixels it draws.
+        ${livePlate
+          ? 'Shots now cut their first frame from the accepted plate below. No image is generated and nothing is spent.'
+          : 'No plate is accepted yet, so every shot still composes its own first frame.'}
+      </div>
+      ${livePlate ? plateCard(livePlate, '✓ In use — every shot is cut from this', 'var(--risk-routine)') : ''}
+      ${newerPlate ? plateCard(newerPlate, livePlate ? 'Newer, not in use yet' : 'Composed — not in use until you accept it', 'var(--risk-mod)') : ''}
+      ${livePlate && staleShots.length ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">
+        ${staleShots.length} shot${staleShots.length === 1 ? '' : 's'} still use a first frame composed before this
+        plate: ${staleShots.map(x => `<span class="mono">${esc(x.shot_code)}</span>`).join(', ')}.
+        Accepting a plate does not overwrite pictures you already approved. Run
+        &ldquo;Compose first frame&rdquo; on each to cut it from the plate instead.
+      </div>` : ''}
+      ${can('studio.generate') ? `<button style="margin-top:8px" data-stplatecompose="${esc(p.id)}">${
+        plates.length ? 'Compose another plate' : 'Compose the presenter plate'}</button>` : ''}
+      <div id="stplatebox"></div>`;
+
     // Budget: only shown when a cap was actually set. budget_pct/budget_warning
     // are speculative fields another engineer's concurrent guardrail work may
     // add tonight; shown only if present, never assumed.
@@ -1906,7 +1963,11 @@ const screens = {
       const charLock = attached.find(l => l.entity_type === 'CHARACTER');
       const envLock = attached.find(l => l.entity_type === 'ENVIRONMENT');
       const ready = lockReady(charLock) && lockReady(envLock);
-      const alreadySet = s.generation?.first_frame_asset_id && s.generation?.mode_preference === 'image_to_video';
+        // talking_head composes a first frame too -- the frame is what the
+      // narration animates -- so checking only for image_to_video hid the
+      // "first frame set" line on exactly the shots that most need it.
+      const alreadySet = s.generation?.first_frame_asset_id
+        && ['image_to_video', 'talking_head'].includes(s.generation?.mode_preference);
       return `<div class="claimrow" style="margin-bottom:8px">
         <div style="font-size:11px;font-weight:600;margin-bottom:2px">Step-by-step first frame (optional)</div>
         ${stepLine(1, 'Character', charLock)}
@@ -2034,6 +2095,29 @@ const screens = {
       <div style="margin-top:12px"><button class="primary" data-stmusic="${esc(id)}">Generate music</button></div>
     </div>` : '';
 
+    // The rough cut, on the page (22 Aug 2026, owner: "where is the rough
+    // cut on the page"). Assembly has always written final_asset_id and the
+    // screen has never read it, so the only way to watch what you just built
+    // was to already know its storage key. Same gap as a shot sitting in
+    // NEEDS_REVIEW with nothing to review it with.
+    //
+    // The cache-busting query is not decoration. Re-assembling writes to the
+    // SAME storage key every time, so the browser happily serves the previous
+    // render and the producer watches an old cut and reports old faults --
+    // which is exactly what happened tonight with the narration fix.
+    const fa = p.final_asset;
+    const cutHtml = fa ? `<div class="card"><div class="eyebrow">Rough cut</div>
+      <div class="sub" style="margin-bottom:8px">Assembled ${dt(fa.created_at)}${
+        fa.settings?.shot_count ? ` from ${esc(String(fa.settings.shot_count))} shots` : ''}${
+        fa.settings?.voice?.lines ? `, with ${esc(String(fa.settings.voice.lines))} lines of narration laid on the timeline` : ''}.</div>
+      <video controls playsinline preload="metadata" style="max-width:320px;width:100%;border-radius:8px"
+        src="${esc(mediaUrl(fa.storage_key))}&amp;v=${esc(String(new Date(fa.created_at).getTime()))}"></video>
+      <div class="muted" style="font-size:11px;margin-top:6px">
+        Re-assembling overwrites this same file, so if a change you expected is missing, reload the page before
+        judging it -- you may be watching the previous render out of cache.
+      </div>
+    </div>` : '';
+
     const assembleHtml = can('studio.approve') ? `<div class="card"><div class="eyebrow">Assemble</div>
       <div class="sub" style="margin-bottom:8px">Stitches every accepted shot asset (plus music, if given) into the rough cut, then burns in every approved overlay as a final pass. Every shot needs an accepted asset, and every overlay on this project needs to be approved (or removed), before this will run.</div>
       <div class="grid2">
@@ -2157,6 +2241,7 @@ const screens = {
       ${p.archived_at ? `<div class="claimrow" style="border-left-color:var(--risk-mod);margin-top:6px;font-size:12px">This project is archived and hidden from the Video Studio list. Nothing about its locks, shots, or generated assets was deleted -- unarchive to bring it back into view.</div>` : ''}
       ${budgetHtml}
       ${importBriefHtml}
+      ${plateHtml}
       <div class="eyebrow" style="margin-top:20px" id="st-locks-anchor">Locks</div>
       ${locksHtml}
       ${newLockHtml}
@@ -2168,6 +2253,7 @@ const screens = {
       ${newOverlayHtml}
       ${musicHtml}
       ${assembleHtml}
+      ${cutHtml}
       ${eventsHtml}`;
   },
 
@@ -3669,7 +3755,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -3950,6 +4036,40 @@ document.addEventListener('click', async (e) => {
       document.getElementById('st-locks-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       return;
     }
+    if (b.dataset.stplatecompose) {
+      const box = document.getElementById('stplatebox');
+      b.disabled = true; const was = b.textContent; b.textContent = 'Composing…';
+      try {
+        const r = await api('POST', `/studio/projects/${b.dataset.stplatecompose}/presenter-plate`, {});
+        if (box) {
+          box.innerHTML = `<div class="claimrow" style="margin-top:8px">
+            <div style="font-size:12px"><b>Plate composed.</b> Look at it before accepting it --
+              once accepted, every shot's first frame is cut from this picture and nothing else.</div>
+            <img class="ath" style="margin-top:6px;max-width:220px" src="${esc(mediaUrl(r.asset?.storage_key))}"
+              alt="presenter plate" loading="lazy" onerror="assetImgError(this,'KEYFRAME')">
+          </div>`;
+        }
+        toast('Plate composed. Accept it to put it in use.');
+      } finally { b.disabled = false; b.textContent = was; }
+      return render();
+    }
+    if (b.dataset.stplateaccept) {
+      await api('POST', `/studio/assets/${b.dataset.stplateaccept}/accept`, {});
+      toast('Plate in use. Compose first frame on any shot now cuts from it.');
+      return render();
+    }
+    // Two-step, same as every other delete in this screen: an accidental
+    // click here throws away the picture the whole video is cut from.
+    if (b.dataset.stplatedelete) {
+      if (b.dataset.confirm !== '1') {
+        b.dataset.confirm = '1'; b.textContent = 'Click again to discard';
+        setTimeout(() => { b.dataset.confirm = ''; b.textContent = 'Discard'; }, 4000);
+        return;
+      }
+      await api('DELETE', `/studio/assets/${b.dataset.stplatedelete}`);
+      toast('Plate discarded');
+      return render();
+    }
     if (b.dataset.stshotcompose) {
       const id = b.dataset.stshotcompose;
       const box = document.getElementById(`stcomposebox-${id}`);
@@ -3958,9 +4078,12 @@ document.addEventListener('click', async (e) => {
         const r = await api('POST', `/studio/shots/${id}/compose-first-frame`, {});
         if (box) {
           box.innerHTML = `<div class="claimrow" style="margin-top:8px">
-            <div style="font-size:12px"><b>&check; First frame composed</b> from
+            <div style="font-size:12px">${r.cut_from_presenter_plate
+              ? `<b>&check; First frame cut from the presenter plate.</b> No new picture was drawn, so this
+                 shot cannot drift from the others. Click Generate below to render the video from it.`
+              : `<b>&check; First frame composed</b> from
               ${esc(r.character_lock?.entity_code ?? '')} + ${esc(r.environment_lock?.entity_code ?? '')}.
-              This shot is now set to image_to_video mode using this frame -- click Generate below to render the video from it.</div>
+              This shot is now set to image_to_video mode using this frame -- click Generate below to render the video from it.`}</div>
             <img class="ath" style="margin-top:6px;max-width:200px" src="${esc(mediaUrl(r.asset?.storage_key))}"
               alt="composed first frame" loading="lazy" onerror="assetImgError(this,'KEYFRAME')">
           </div>`;

@@ -460,6 +460,78 @@ async function bestPanelKey(lockId, entityType) {
   return null;
 }
 
+// ---------- The presenter plate (22 Aug 2026) ----------
+//
+// Owner, watching the first finished cut of the spotting-on-the-pill
+// script: "the girl and th ebackground change 5 diffeent times".
+//
+// He was right and the cause was mine. Every shot composed its own first
+// frame from the same locks, and I had claimed that costs nothing
+// visually. It costs everything. A lock is a text description plus a
+// reference photo; the image model re-interprets both from scratch on
+// every call, so six shots came back as six slightly different women in
+// six slightly different rooms. Locks constrain the description. They
+// have never constrained the pixels.
+//
+// Frame-chaining (continue-from-previous, below) is the usual answer to
+// drift and it is the wrong one for this format. The last frame of a
+// talking-head clip is a woman caught mid-syllable with her mouth open;
+// starting the next shot from there gives a presenter who lurches between
+// every sentence. Chaining suits a moving narrative, not a locked-off
+// piece to camera.
+//
+// For a presenter video the honest fix is that there is only ONE picture.
+// She sits in the same chair in the same room for the whole video, so
+// compose that once, look at it once, and let every shot use it. Shot
+// sizes still vary, because the crop is taken from the one plate instead
+// of being generated again -- same face, same room, same light, tighter
+// or wider. Drift stops being unlikely and becomes impossible.
+//
+// The plate must be composed loose enough that a CLOSE crop still has a
+// head in it. SHOT_SIZES.CLOSE takes 48% of the frame, so the plate is
+// framed as a medium-wide with real air around her.
+const PLATE_FRAMING = [
+  'Framing: she is seated square-on to the lens, centred in frame, facing the camera directly.',
+  'Medium-wide: her head, shoulders and upper body are all visible, with clear space above her head and to both sides.',
+  'The camera is at her eye level, straight on, not above or below and not off to one side.',
+  'She is looking into the lens as though speaking to one person.',
+  'This single frame will be cropped tighter for some shots, so leave room around her rather than filling the frame with her face.',
+].join(' ');
+
+// The plate a project's shots should be cut from: the newest ACCEPTED one.
+// ACCEPTED and not merely GENERATED on purpose -- this image decides what
+// the entire video looks like, so a person sees it before six shots are
+// built on it.
+async function presenterPlate(projectId) {
+  return one(
+    `SELECT * FROM studio.assets
+     WHERE project_id=$1 AND shot_id IS NULL AND kind='KEYFRAME'
+       AND settings->>'role' = 'presenter_plate' AND status='ACCEPTED'
+     ORDER BY created_at DESC LIMIT 1`, [projectId]);
+}
+
+// The same three locks compose-first-frame needs, resolved at PROJECT
+// level rather than from one shot's locked_lock_ids, because the plate
+// belongs to the project and not to any single shot. Returns a message
+// instead of throwing so both callers can answer 422 in their own voice.
+async function composeLocksForProject(projectId) {
+  const rows = (await q(
+    `SELECT * FROM studio.locks WHERE project_id=$1 AND is_active ORDER BY version DESC`,
+    [projectId])).rows;
+  const characterLock = rows.find(l => l.entity_type === 'CHARACTER');
+  const environmentLock = rows.find(l => l.entity_type === 'ENVIRONMENT');
+  const styleLock = rows.find(l => l.entity_type === 'STYLE');
+  const problem =
+    !characterLock ? 'this project has no active CHARACTER lock -- create and approve one first'
+    : !environmentLock ? 'this project has no active ENVIRONMENT lock -- create and approve one first'
+    : !characterLock.approved_at ? 'the CHARACTER lock is not approved yet -- approve it before composing the presenter plate'
+    : !environmentLock.approved_at ? 'the ENVIRONMENT lock is not approved yet -- approve it before composing the presenter plate'
+    : !characterLock.reference_asset_ids?.length ? 'the CHARACTER lock has no reference image yet -- generate one via POST /studio/locks/:lockId/reference first'
+    : !environmentLock.reference_asset_ids?.length ? 'the ENVIRONMENT lock has no reference image yet -- generate one via POST /studio/locks/:lockId/reference first'
+    : null;
+  return { characterLock, environmentLock, styleLock, problem };
+}
+
 // Turns the flat field set the studio_lock_drafter agent returns into the
 // nested lock.data shape compileStillPrompt() actually reads (see its own
 // field reads above: d.wardrobe_variants?.default, not a flat
@@ -995,7 +1067,13 @@ async function mixMusicOntoVideo({ workDir, videoPath, musicAsset, hasVoice }) {
   const outPath = join(workDir, 'assembled-with-music.mp4');
   const filter = videoInfo.hasAudio
     ? `[1:a]volume=${musicVolume},atrim=0:${videoInfo.durationS.toFixed(3)},asetpts=PTS-STARTPTS[music];` +
-      `[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]`
+      // normalize=0 for the same reason layVoiceOntoVideo needs it: amix
+      // defaults to dividing every input by the input count, so mixing the
+      // music in was quietly halving the narration underneath it. The music
+      // is already scaled to musicVolume before it gets here, so nothing
+      // needs normalising -- and the voice belongs at the level Azure
+      // produced it, not 6dB down because a second stream exists.
+      `[0:a][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
     : `[1:a]volume=${musicVolume},atrim=0:${videoInfo.durationS.toFixed(3)},asetpts=PTS-STARTPTS[aout]`;
   await execFileP('ffmpeg', ['-y', '-i', videoPath, '-stream_loop', '-1', '-i', musicLocalPath,
     '-filter_complex', filter, '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', outPath]);
@@ -1038,7 +1116,38 @@ export default async function routes(app) {
     await attachReferenceAssets(locks);
     const shots = (await q(`SELECT * FROM studio.shots WHERE project_id=$1 ORDER BY order_index`, [p.id])).rows;
     const events = (await q(`SELECT * FROM studio.events WHERE project_id=$1 ORDER BY at DESC LIMIT 50`, [p.id])).rows;
-    return { ...p, locks, shots, events };
+    // Presenter plates, newest first. The screen needs both the accepted one
+    // (what shots are actually being cut from) and any newer unaccepted
+    // retry, so it can say which is which rather than showing one picture
+    // and leaving the producer to guess whether it is the live one.
+    const presenterPlates = (await q(
+      `SELECT * FROM studio.assets
+       WHERE project_id=$1 AND shot_id IS NULL AND kind='KEYFRAME'
+         AND settings->>'role' = 'presenter_plate'
+       ORDER BY created_at DESC LIMIT 6`, [p.id])).rows;
+    // Which shots are actually cut from the live plate. Accepting a plate
+    // does NOT retroactively change shots that already composed their own
+    // frame, and it should not -- silently replacing approved pictures is
+    // worse than drift. But the producer has to be able to SEE which shots
+    // are still on their own frame, or the panel says "in use" while half
+    // the video quietly is not.
+    const live = presenterPlates.find(a => a.status === 'ACCEPTED');
+    const plateCutShotIds = live
+      ? (await q(`SELECT DISTINCT shot_id FROM studio.assets
+                  WHERE project_id=$1 AND source_asset_id=$2
+                    AND generator->>'provider' = 'PLATE_CROP' AND shot_id IS NOT NULL`,
+          [p.id, live.id])).rows.map(r => r.shot_id)
+      : [];
+    // The assembled cut itself (22 Aug 2026, owner: "where is the rough cut
+    // on the page"). It was nowhere. Assembly wrote final_asset_id and the
+    // screen never read it, so the only way to watch what you had just built
+    // was to know the storage key. Exactly the same shape of gap as a shot
+    // sitting in NEEDS_REVIEW with nothing to review it with.
+    const finalAsset = p.final_asset_id
+      ? await one(`SELECT * FROM studio.assets WHERE id=$1`, [p.final_asset_id])
+      : null;
+    return { ...p, locks, shots, events, presenter_plates: presenterPlates,
+      plate_cut_shot_ids: plateCutShotIds, final_asset: finalAsset };
   });
 
   // Manual state transition. Phase 1 does not gate this against
@@ -2149,6 +2258,85 @@ export default async function routes(app) {
   // still and points the shot's generation block at it, so the existing
   // /generate route picks it up as an image_to_video first frame exactly
   // as it already knows how to.
+  // Compose the one picture the whole video is cut from. See PLATE_FRAMING
+  // and presenterPlate() above for why this exists at all.
+  //
+  // Deliberately project-level: it takes the project's own active locks,
+  // not a shot's, because a plate that belonged to a shot would be one
+  // more thing that can differ per shot. Regenerating is just calling this
+  // again -- the newest ACCEPTED plate wins, so an unreviewed retry cannot
+  // quietly change what the shots are being cut from.
+  app.post('/studio/projects/:id/presenter-plate', { preHandler: requirePerm('studio.generate') }, async (req, reply) => {
+    const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!project) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+
+    const { characterLock, environmentLock, styleLock, problem } = await composeLocksForProject(project.id);
+    if (problem) return reply.code(422).send(err(422, 'GUARD_FAILED', problem));
+
+    const estimatedCost = ESTIMATED_COST_USD.GEMINI_COMPOSE_IMAGE;
+    let budget;
+    try {
+      budget = await checkAndSpendBudget(project, estimatedCost, req.actor, req.body?.override_budget === true);
+    } catch (e) {
+      if (!(e instanceof BudgetExceededError)) throw e;
+      return reply.code(422).send(err(422, 'BUDGET_EXCEEDED', e.message));
+    }
+
+    const characterRefId = characterLock.reference_asset_ids[characterLock.reference_asset_ids.length - 1];
+    const environmentRefId = environmentLock.reference_asset_ids[environmentLock.reference_asset_ids.length - 1];
+    const [characterRef, environmentRef] = await Promise.all([
+      one(`SELECT storage_key FROM studio.assets WHERE id=$1`, [characterRefId]),
+      one(`SELECT storage_key FROM studio.assets WHERE id=$1`, [environmentRefId]),
+    ]);
+
+    const assetId = crypto.randomUUID();
+    const prompt = compileComposePrompt(characterLock, environmentLock, styleLock,
+      project.aspect_ratio, PLATE_FRAMING);
+    const [charPanel, envPanel] = await Promise.all([
+      bestPanelKey(characterLock.id, 'CHARACTER'),
+      bestPanelKey(environmentLock.id, 'ENVIRONMENT'),
+    ]);
+    const referenceImageKeys = [characterRef.storage_key, environmentRef.storage_key];
+    if (charPanel) referenceImageKeys.push(charPanel);
+    else if (envPanel) referenceImageKeys.push(envPanel);
+
+    const gen = await gemini.generateImage({ prompt, assetId, referenceImageKeys });
+    // Cropped to the project's aspect at WIDE and no tighter. Every shot's
+    // own framing is taken from inside this, so cropping the plate itself
+    // would throw away the headroom the tighter sizes need.
+    if (!MOCK()) {
+      try {
+        const src = storage.localPath(gen.storage_key);
+        const cropped = `${src}.crop.png`;
+        await cropToAspect(src, cropped, project.aspect_ratio, 'WIDE');
+        await storage.put(gen.storage_key, await readFile(cropped));
+      } catch (e) {
+        await q(`INSERT INTO studio.events (project_id, note) VALUES ($1,$2)`,
+          [project.id, `could not crop the presenter plate to ${project.aspect_ratio}, keeping the square original: ${e.message}`]).catch(() => {});
+      }
+    }
+
+    const asset = await one(
+      `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings)
+       VALUES ($1,$2,NULL,'KEYFRAME','GENERATED',$3,$4,$5,$6) RETURNING *`,
+      [assetId, project.id, gen.storage_key,
+       JSON.stringify({ provider: 'GEMINI', role: 'presenter_plate',
+         composed_from: { character_lock_id: characterLock.id, environment_lock_id: environmentLock.id } }),
+       code('JOB'), JSON.stringify({ role: 'presenter_plate', prompt })]);
+
+    await bridgeAssetToLibrary({ asset, kindHint: null,
+      title: `presenter plate — ${project.title}`, actorId: req.actor?.id });
+    await spendBudget(project.id, resolveSpendAmount(gen, estimatedCost));
+    await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+      [project.id, req.actor?.id ?? null, asset.id,
+       'composed a presenter plate -- accept it and every shot will be cut from this one picture instead of composing its own']);
+
+    return { asset, needs_acceptance: true,
+      character_lock: { id: characterLock.id, entity_code: characterLock.entity_code },
+      environment_lock: { id: environmentLock.id, entity_code: environmentLock.entity_code },
+      ...(budget.warning ? { budget_warning: budget.warning } : {}) };
+  });
+
   app.post('/studio/shots/:shotId/compose-first-frame', { preHandler: requirePerm('studio.generate') }, async (req, reply) => {
     const shot = await one(`SELECT * FROM studio.shots WHERE id=$1`, [req.params.shotId]);
     if (!shot) return reply.code(404).send(err(404, 'NOT_FOUND', 'shot not found'));
@@ -2181,6 +2369,63 @@ export default async function routes(app) {
     if (!environmentLock.reference_asset_ids?.length) {
       return reply.code(422).send(err(422, 'GUARD_FAILED',
         'the ENVIRONMENT lock has no reference image yet -- generate one via POST /studio/locks/:lockId/reference first'));
+    }
+
+    // The presenter plate short-circuit (22 Aug 2026). When the project has
+    // an ACCEPTED plate, this shot's first frame is a CROP of that one
+    // picture rather than a fresh composition: the same pixels, taken
+    // tighter or wider for this shot's size. Nothing is generated, nothing
+    // is spent, and drift does not become less likely, it becomes
+    // impossible -- there is only one image to drift from.
+    //
+    // body.fresh === true forces the old per-shot composition, for a shot
+    // that genuinely is a different picture: a cutaway, an insert, a second
+    // location. That is a real need and the plate should not outlaw it.
+    const plate = req.body?.fresh === true ? null : await presenterPlate(project.id);
+    if (plate) {
+      const assetId = crypto.randomUUID();
+      let key = `assets/generated/${assetId}/first-frame.png`;
+      try {
+        const outPath = storage.localPath(key);
+        await mkdir(join(outPath, '..'), { recursive: true });
+        if (MOCK()) {
+          await storage.put(key, await readFile(storage.localPath(plate.storage_key)));
+        } else {
+          await cropToAspect(storage.localPath(plate.storage_key), outPath,
+            project.aspect_ratio, shot.camera?.shot_size);
+          await storage.put(key, await readFile(outPath));
+        }
+      } catch (e) {
+        // The crop failed. Fall back to the plate at full width rather than
+        // composing something new: a shot that is framed wider than asked
+        // for is a framing miss, and a shot regenerated from scratch is the
+        // exact drift this mechanism exists to stop. Take the miss.
+        key = plate.storage_key;
+        await q(`INSERT INTO studio.events (project_id, note) VALUES ($1,$2)`,
+          [project.id, `could not crop the presenter plate for ${shot.shot_code}, using it at full width instead: ${e.message}`]).catch(() => {});
+      }
+      const asset = await one(
+        `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings, source_asset_id)
+         VALUES ($1,$2,$3,'KEYFRAME','GENERATED',$4,$5,$6,$7,$8) RETURNING *`,
+        [assetId, project.id, shot.id, key,
+         JSON.stringify({ provider: 'PLATE_CROP', presenter_plate_asset_id: plate.id }),
+         code('JOB'),
+         JSON.stringify({ cut_from_presenter_plate: plate.id, shot_size: shot.camera?.shot_size ?? 'WIDE' }),
+         plate.id]);
+      const plateMode = shot.generation?.mode_preference === 'talking_head'
+        ? 'talking_head' : 'image_to_video';
+      await q(`UPDATE studio.shots
+               SET generation = (generation - 'continued_from_shot_id') || $2::jsonb, updated_at=now()
+               WHERE id=$1`,
+        [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: plateMode })]);
+      await bridgeAssetToLibrary({ asset, kindHint: null,
+        title: `${shot.shot_code} first frame — ${project.title}`, actorId: req.actor?.id });
+      await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+        [project.id, req.actor?.id ?? null, `shots/${shot.shot_code}`,
+         `cut ${shot.shot_code}'s first frame from the presenter plate at ${shot.camera?.shot_size ?? 'WIDE'}, so it cannot drift from the other shots`]);
+      return { asset, cut_from_presenter_plate: plate.id,
+        character_lock: { id: characterLock.id, entity_code: characterLock.entity_code },
+        environment_lock: { id: environmentLock.id, entity_code: environmentLock.entity_code } };
     }
 
     const estimatedCost = ESTIMATED_COST_USD.GEMINI_COMPOSE_IMAGE;
@@ -2378,8 +2623,13 @@ export default async function routes(app) {
     // Same field-merge discipline as compose-first-frame: only touch
     // generation.first_frame_asset_id/mode_preference/continued_from_shot_id,
     // preserve every other existing key, and do not flip shot.status.
+    // Same mode_preference care as compose-first-frame: a talking-head shot
+    // that continues from an earlier one is still a talking-head shot, and
+    // hard-coding image_to_video here demoted it to Runway with no complaint.
+    const chainMode = shot.generation?.mode_preference === 'talking_head'
+      ? 'talking_head' : 'image_to_video';
     await q(`UPDATE studio.shots SET generation = generation || $2::jsonb, updated_at=now() WHERE id=$1`,
-      [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: 'image_to_video',
+      [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: chainMode,
         continued_from_shot_id: sourceShot.id })]);
 
     await bridgeAssetToLibrary({ asset, kindHint: null,
@@ -3372,7 +3622,12 @@ export default async function routes(app) {
     const finalAsset = await one(
       `INSERT INTO studio.assets (project_id, kind, status, storage_key, generator, settings)
        VALUES ($1,'FINAL_CUT','GENERATED',$2,$3,$4) RETURNING *`,
-      [p.id, finalKey, JSON.stringify({ tool: generatorTool }), JSON.stringify(settingsBase)]);
+      // The voice report goes into settings, not just the response body.
+      // Otherwise the only place it exists is the reply to whoever pressed
+      // Assemble, and the screen cannot afterwards tell a producer whether
+      // the cut they are looking at has narration on it at all.
+      [p.id, finalKey, JSON.stringify({ tool: generatorTool }),
+       JSON.stringify({ ...settingsBase, ...(voiceReport ? { voice: voiceReport } : {}) })]);
     await q(`UPDATE studio.projects SET final_asset_id=$2, state='ROUGH_CUT_VALIDATED', updated_at=now() WHERE id=$1`,
       [p.id, finalAsset.id]);
     await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,

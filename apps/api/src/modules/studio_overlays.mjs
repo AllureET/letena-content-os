@@ -35,7 +35,12 @@ import { readFile } from 'node:fs/promises';
 // compilation (this file).
 // ===========================================================================
 export const OVERLAY_KINDS = ['TITLE_CARD', 'LABEL', 'DOOR_CARD', 'ICON'];
-export const ANCHORS = ['top', 'upper-third', 'top-right', 'right-center', 'center'];
+// 'lower-third' and 'bottom' added 22 Aug 2026. Until then every anchor this
+// system had put a card in the top or the middle of the frame, which for a
+// vertical talking head is precisely where the head is. There was no way to
+// place a card safely even by hand.
+export const ANCHORS = ['top', 'upper-third', 'top-right', 'right-center', 'center',
+  'lower-third', 'bottom'];
 export const ANIMATION_IN_TYPES = ['none', 'fade', 'slide-left', 'slide-right'];
 export const ANIMATION_OUT_TYPES = ['none', 'fade'];
 export const FONT_FAMILIES = ['bold', 'regular'];
@@ -158,8 +163,14 @@ function fontFaceDefs(boldB64, regB64) {
 </style></defs>`;
 }
 
+// The embedded family stays FIRST so any renderer that honours @font-face
+// keeps using the exact bundled file, and the real fontconfig family follows
+// as the one librsvg can actually resolve. A card that falls all the way
+// through to sans-serif will draw Latin and tofu the Amharic, which is
+// exactly the failure this ordering exists to prevent.
 function fontFamilyName(dataFontFamily) {
-  return dataFontFamily === 'regular' ? 'EthiopicRegular' : 'EthiopicBold';
+  const embedded = dataFontFamily === 'regular' ? 'EthiopicRegular' : 'EthiopicBold';
+  return `${embedded}, '${ETHIOPIC_FAMILY}', sans-serif`;
 }
 
 // No real text-shaping engine available at compile time (that is librsvg's
@@ -193,8 +204,55 @@ function resolveAnchorXY(anchor, insetPx, boxW, boxH, canvasW, canvasH) {
     case 'top-right': return { x: canvasW - boxW - inset, y: inset };
     case 'right-center': return { x: canvasW - boxW - inset, y: (canvasH - boxH) / 2 };
     case 'center': return { x: (canvasW - boxW) / 2, y: (canvasH - boxH) / 2 };
+    case 'lower-third': return { x: (canvasW - boxW) / 2, y: canvasH * 2 / 3 - boxH / 2 };
+    case 'bottom': return { x: (canvasW - boxW) / 2, y: canvasH - boxH - inset };
     default: return { x: (canvasW - boxW) / 2, y: inset };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Never cover the presenter's face (22 Aug 2026).
+//
+// Owner, on the first cut with cards burned in: "do you see how it blocks her
+// face in some of them, it should never do that." The title card landed across
+// her eyes and the keyword label across her forehead, because 'upper-third' is
+// where a vertical talking head keeps its head. Every anchor this system had
+// pointed at the top or the middle of the frame.
+//
+// So placement is now a rule with a fact behind it rather than a better guess.
+// Given the box the head occupies, a card that would overlap it is moved into
+// whichever clear band is taller: above the hair or below the chin. The card
+// never shrinks and never moves sideways, because a card that jumps position
+// between shots is less jarring than one that changes size, and a caller who
+// asked for a centred card wants it centred.
+//
+// If neither band can hold the card, it goes as low as the frame allows and
+// the caller is told, since at that point the honest answer is that the shot
+// is framed too tight for a card that size and a person should know.
+const FACE_PAD_FRAC = 0.03;
+
+export function placeClearOfFace({ x, y, boxW, boxH, canvasW, canvasH, faceBox, insetPx = 24 }) {
+  if (!faceBox) return { x, y, moved: false, reason: null };
+  const pad = canvasH * FACE_PAD_FRAC;
+  const faceTop = Math.max(0, faceBox.y * canvasH - pad);
+  const faceBottom = Math.min(canvasH, (faceBox.y + faceBox.h) * canvasH + pad);
+  const faceLeft = faceBox.x * canvasW;
+  const faceRight = (faceBox.x + faceBox.w) * canvasW;
+
+  const overlapsVertically = y < faceBottom && y + boxH > faceTop;
+  const overlapsHorizontally = x < faceRight && x + boxW > faceLeft;
+  if (!overlapsVertically || !overlapsHorizontally) return { x, y, moved: false, reason: null };
+
+  const roomAbove = faceTop - insetPx;
+  const roomBelow = canvasH - insetPx - faceBottom;
+  if (roomAbove >= boxH && roomAbove >= roomBelow) {
+    return { x, y: Math.max(insetPx, faceTop - boxH - insetPx / 2), moved: true, reason: 'above the head' };
+  }
+  if (roomBelow >= boxH) {
+    return { x, y: Math.min(canvasH - boxH - insetPx, faceBottom + insetPx / 2), moved: true, reason: 'below the chin' };
+  }
+  return { x, y: Math.max(0, canvasH - boxH - insetPx), moved: true,
+    reason: 'neither band fits this card, so it was pushed to the bottom edge; the shot is framed too tight for a card this size' };
 }
 
 // TITLE_CARD and LABEL share this compiler: a rounded box with centered
@@ -230,7 +288,7 @@ function wrapTextLines(text, fontSizePx, maxWidthPx, maxLines = 2) {
   return lines;
 }
 
-function compileCardSvg(data, canvasW, canvasH, boldB64, regB64) {
+function compileCardSvg(data, canvasW, canvasH, boldB64, regB64, faceBox) {
   const d = data ?? {};
   let fontSize = Number(d.font_size_px ?? 28);
   const inset = Number(d.position?.inset_px ?? 24);
@@ -274,7 +332,12 @@ function compileCardSvg(data, canvasW, canvasH, boldB64, regB64) {
   const lineHeight = Math.round(fontSize * 1.3);
   const boxW = Math.max(1, Math.min(maxBoxW, Math.round(widest + padX * 2)));
   const boxH = Math.round(lines.length * lineHeight + padY * 2 - (lineHeight - fontSize));
-  const { x, y } = resolveAnchorXY(d.position?.anchor ?? 'top', inset, boxW, boxH, canvasW, canvasH);
+  const anchored = resolveAnchorXY(d.position?.anchor ?? 'top', inset, boxW, boxH, canvasW, canvasH);
+  // avoid_face defaults ON. A card that covers the presenter is never what
+  // anyone wanted; opting out has to be the deliberate choice, not the default.
+  const { x, y } = d.position?.avoid_face === false
+    ? anchored
+    : placeClearOfFace({ ...anchored, boxW, boxH, canvasW, canvasH, faceBox, insetPx: inset });
   const rx = Number(d.corner_radius_px ?? 12);
   const bgOpacity = d.background_opacity ?? 1;
   const textCX = x + boxW / 2;
@@ -350,11 +413,15 @@ ${fontFaceDefs(boldB64, regB64)}
 // caller (studio.mjs's assemble route, which already has the asset's
 // storage_key) and passed in; compileOverlaySvg does not touch storage
 // itself, keeping it a pure function of its arguments.
-function compileIconSvg(data, canvasW, canvasH, iconBase64, iconMime = 'image/png') {
+function compileIconSvg(data, canvasW, canvasH, iconBase64, iconMime = 'image/png', faceBox) {
   const d = data ?? {};
   const widthPx = Number(d.width_px ?? 96);
   const heightPx = widthPx; // icons in the library are square; no separate height field in the schema
-  const { x, y } = resolveAnchorXY(d.position?.anchor ?? 'top-right', d.position?.inset_px, widthPx, heightPx, canvasW, canvasH);
+  const anchoredIcon = resolveAnchorXY(d.position?.anchor ?? 'top-right', d.position?.inset_px, widthPx, heightPx, canvasW, canvasH);
+  const { x, y } = d.position?.avoid_face === false
+    ? anchoredIcon
+    : placeClearOfFace({ ...anchoredIcon, boxW: widthPx, boxH: heightPx, canvasW, canvasH, faceBox,
+        insetPx: Number(d.position?.inset_px ?? 24) });
   const image = iconBase64
     ? `<image x="${x}" y="${y}" width="${widthPx}" height="${heightPx}" href="data:${iconMime};base64,${iconBase64}"/>`
     // No icon bytes resolved (e.g. compileOverlaySvg called for validation/
@@ -372,17 +439,19 @@ function compileIconSvg(data, canvasW, canvasH, iconBase64, iconMime = 'image/pn
 // DOOR_CARD this is the flat preview (see compileDoorCardSvg above) --
 // the real per-line-staggered burn-in goes through compileOverlayLayerSvg
 // instead, driven by planOverlayLayers.
-export function compileOverlaySvg(overlay, canvasWidth, canvasHeight, ethiopicFontBase64Bold, ethiopicFontBase64Regular, iconBase64Png) {
+export function compileOverlaySvg(overlay, canvasWidth, canvasHeight, ethiopicFontBase64Bold, ethiopicFontBase64Regular, iconBase64Png, faceBox) {
   const kind = overlay.kind;
   const data = overlay.data ?? {};
   if (kind === 'TITLE_CARD' || kind === 'LABEL') {
-    return compileCardSvg(data, canvasWidth, canvasHeight, ethiopicFontBase64Bold, ethiopicFontBase64Regular);
+    return compileCardSvg(data, canvasWidth, canvasHeight, ethiopicFontBase64Bold, ethiopicFontBase64Regular, faceBox);
   }
   if (kind === 'DOOR_CARD') {
+    // A door card is a full-frame background with its own lines on it. There is
+    // no presenter left to cover, so face clearance does not apply to it.
     return compileDoorCardSvg(data, canvasWidth, canvasHeight, ethiopicFontBase64Bold, ethiopicFontBase64Regular);
   }
   if (kind === 'ICON') {
-    return compileIconSvg(data, canvasWidth, canvasHeight, iconBase64Png);
+    return compileIconSvg(data, canvasWidth, canvasHeight, iconBase64Png, 'image/png', faceBox);
   }
   throw new Error(`compileOverlaySvg: unknown overlay kind '${kind}'`);
 }
@@ -442,10 +511,10 @@ export function planOverlayLayers(overlays) {
 // kind except a door card's background/line pieces) this is exactly
 // compileOverlaySvg; for door-card background/line pieces it delegates to
 // the dedicated sub-compilers above.
-export function compileOverlayLayerSvg(layer, overlay, canvasWidth, canvasHeight, boldB64, regB64, iconBase64Png) {
+export function compileOverlayLayerSvg(layer, overlay, canvasWidth, canvasHeight, boldB64, regB64, iconBase64Png, faceBox) {
   if (layer.role === 'background') return compileDoorCardBackgroundSvg(overlay.data, canvasWidth, canvasHeight);
   if (layer.role === 'line') return compileDoorCardLineSvg(overlay.data, layer.lineIndex, canvasWidth, canvasHeight, boldB64, regB64);
-  return compileOverlaySvg(overlay, canvasWidth, canvasHeight, boldB64, regB64, iconBase64Png);
+  return compileOverlaySvg(overlay, canvasWidth, canvasHeight, boldB64, regB64, iconBase64Png, faceBox);
 }
 
 // x-position expression for ffmpeg's overlay filter. Every overlay SVG is
@@ -542,6 +611,71 @@ export function resolveCanvasSizeForAspect(aspectRatio) {
 // so repeated assemble() calls don't re-read and re-encode a ~360KB font
 // file on every request.
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// Making the Ethiopic font actually reachable by the renderer (22 Aug 2026).
+//
+// The four overlay cards came back from a real assembly with every Amharic
+// glyph drawn as a tofu box carrying its own codepoint, while the Latin words
+// on the same card rendered perfectly. The layout, colours, timing and
+// animation were all correct. Only the script was missing.
+//
+// The cause is a claim in this file's own header: that embedding the font as a
+// base64 @font-face data URL "works identically wherever ffmpeg+librsvg
+// exists". It does not. librsvg ignores @font-face with a data: src entirely.
+// Proved by rendering the same SVG twice, once with fontconfig pointed at an
+// empty directory: with system fonts present both the embedded family and the
+// real family name draw; with none present, neither draws a single pixel. The
+// embedding never worked. It was masked, everywhere it was ever tested, by the
+// machine happening to have Noto Sans Ethiopic installed. The production
+// server does not.
+//
+// So the font is provisioned the way fontconfig expects instead: the two
+// bundled files are copied into a user font directory and fc-cache is run
+// over it, once, at startup. Idempotent, needs no deploy step and no root, and
+// leaves the embedded @font-face in place for any renderer that does honour it.
+const FONT_FILES = ['NotoSansEthiopic-Bold.ttf', 'NotoSansEthiopic-Regular.ttf'];
+export const ETHIOPIC_FAMILY = 'Noto Sans Ethiopic';
+
+let _fontInstall = null;
+export function ensureEthiopicFontsInstalled() {
+  if (_fontInstall) return _fontInstall;
+  _fontInstall = (async () => {
+    const { mkdir, copyFile, readFile: rf } = await import('node:fs/promises');
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const { homedir } = await import('node:os');
+    const { join, dirname } = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const run = promisify(execFile);
+    const srcDir = fileURLToPath(new URL('../../assets/fonts/', import.meta.url));
+    const destDir = process.env.LCOS_FONT_DIR
+      || join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'fonts');
+    try {
+      await mkdir(destDir, { recursive: true });
+      for (const f of FONT_FILES) {
+        // Copy only when the bytes differ, so a restart is not a rewrite.
+        let same = false;
+        try {
+          const [a, b] = await Promise.all([rf(join(srcDir, f)), rf(join(destDir, f))]);
+          same = a.equals(b);
+        } catch { same = false; }
+        if (!same) await copyFile(join(srcDir, f), join(destDir, f));
+      }
+      await run('fc-cache', ['-f', destDir]);
+      const { stdout } = await run('fc-list', [], { maxBuffer: 8 * 1024 * 1024 });
+      const ok = /ethiopic/i.test(stdout);
+      return { ok, destDir,
+        note: ok ? `${ETHIOPIC_FAMILY} is visible to fontconfig`
+                 : `fc-cache ran but fontconfig still cannot see ${ETHIOPIC_FAMILY}; Amharic will render as empty boxes` };
+    } catch (e) {
+      // Never fatal. A card with tofu in it is bad; a server that will not
+      // start because it could not write a font file is worse.
+      return { ok: false, destDir, note: `could not install ${ETHIOPIC_FAMILY}: ${e.message}` };
+    }
+  })();
+  return _fontInstall;
+}
+
 let _fontCache = null;
 export async function loadEthiopicFontsBase64() {
   if (_fontCache) return _fontCache;

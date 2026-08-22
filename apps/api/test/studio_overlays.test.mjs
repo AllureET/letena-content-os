@@ -389,7 +389,12 @@ test('compileOverlaySvg: TITLE_CARD contains the exact hex colors, the text, and
 test('compileOverlaySvg: LABEL with font_family regular selects the embedded regular font data', () => {
   const overlay = { kind: 'LABEL', data: LABEL_DATA };
   const svg = compileOverlaySvg(overlay, 1080, 1920, 'BOLDFONTBASE64', 'REGULARFONTBASE64');
-  assert.ok(svg.includes('font-family="EthiopicRegular"'));
+  // Updated 22 Aug 2026. The family is now a stack rather than a single name:
+  // the embedded family first, for any renderer that honours @font-face, then
+  // the real fontconfig family, which is the only one librsvg can resolve.
+  // Asserting the bare single name is what let production ship cards whose
+  // Amharic was entirely tofu while every test here passed.
+  assert.match(svg, /font-family="EthiopicRegular, 'Noto Sans Ethiopic', sans-serif"/);
   assert.ok(svg.includes('fill="#CD6962"'));
 });
 

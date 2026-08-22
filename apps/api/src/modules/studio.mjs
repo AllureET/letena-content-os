@@ -56,7 +56,8 @@ import { cred } from '../creds.mjs';
 import { invokeAgent } from '../ai/gateway.mjs';
 import { formatOf } from '../formats.mjs';
 import { OVERLAY_KINDS, validateOverlayData, describeOverlayCollision, buildOverlayFilterGraph,
-  compileOverlayLayerSvg, resolveCanvasSizeForAspect, loadEthiopicFontsBase64 } from './studio_overlays.mjs';
+  compileOverlayLayerSvg, resolveCanvasSizeForAspect, loadEthiopicFontsBase64,
+  ensureEthiopicFontsInstalled } from './studio_overlays.mjs';
 
 const execFileP = promisify(execFile);
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -1123,6 +1124,88 @@ async function mixMusicOntoVideo({ workDir, videoPath, musicAsset, hasVoice }) {
   await execFileP('ffmpeg', ['-y', '-i', videoPath, '-stream_loop', '-1', '-i', musicLocalPath,
     '-filter_complex', filter, '-map', '0:v', '-map', '[aout]', '-c:v', 'copy', '-c:a', 'aac', outPath]);
   return outPath;
+}
+
+// ---------------------------------------------------------------------------
+// Where the presenter's head sits in the finished frame (22 Aug 2026).
+//
+// Owner, on the first cut with cards on it: "do you see how it blocks her face
+// in some of them, it should never do that." Overlay placement needed a fact
+// about the picture, not a better default anchor.
+//
+// One vision call per presenter plate, cached on the plate asset, then mapped
+// forward into each shot by arithmetic. Every shot's first frame is a crop of
+// that one plate and the crop is deterministic (see cropToAspect): a centred
+// window of width W*f and height H*f, offset down the frame by
+// (1-f)*HEADROOM. So the head's box in a shot is the head's box in the plate
+// pushed through the same transform, exactly, for free.
+//
+// A shot NOT cut from a plate falls back to detecting on its own first frame.
+// A failure anywhere returns null, and null means placement behaves exactly as
+// it did before: no clearance, no crash.
+function mapBoxThroughCrop(box, shotSize) {
+  const f = SHOT_SIZES[String(shotSize ?? 'WIDE').toUpperCase()] ?? 1;
+  if (f === 1) return box;
+  const x0 = (1 - f) / 2;
+  const y0 = (1 - f) * SHOT_SIZE_HEADROOM;
+  return {
+    x: (box.x - x0) / f,
+    y: (box.y - y0) / f,
+    w: box.w / f,
+    h: box.h / f,
+  };
+}
+
+async function faceBoxForShot(shot, project) {
+  try {
+    const frameId = shot?.generation?.first_frame_asset_id;
+    if (!frameId) return null;
+    const frame = await one(`SELECT * FROM studio.assets WHERE id=$1`, [frameId]);
+    if (!frame) return null;
+
+    // Cut from a plate: detect on the plate once, then map.
+    const plateId = frame.settings?.cut_from_presenter_plate ?? frame.generator?.presenter_plate_asset_id;
+    if (plateId) {
+      const plate = await one(`SELECT * FROM studio.assets WHERE id=$1`, [plateId]);
+      if (!plate) return null;
+      let box = plate.settings?.face_box ?? null;
+      if (!box) {
+        const b64 = (await readFile(storage.localPath(plate.storage_key))).toString('base64');
+        const r = await gemini.detectFaceBox({ imageBase64: b64 });
+        if (!r?.found || !r.box) return null;
+        box = r.box;
+        await q(`UPDATE studio.assets SET settings = settings || $2::jsonb WHERE id=$1`,
+          [plate.id, JSON.stringify({ face_box: box })]);
+        await q(`INSERT INTO studio.events (project_id, note) VALUES ($1,$2)`,
+          [project.id, `found the presenter's head on the plate; overlay cards will keep clear of it`]).catch(() => {});
+      }
+      return mapBoxThroughCrop(box, shot.camera?.shot_size);
+    }
+
+    // Not from a plate: detect on this shot's own frame, cached on that frame.
+    if (frame.settings?.face_box) return frame.settings.face_box;
+    const b64 = (await readFile(storage.localPath(frame.storage_key))).toString('base64');
+    const r = await gemini.detectFaceBox({ imageBase64: b64 });
+    if (!r?.found || !r.box) return null;
+    await q(`UPDATE studio.assets SET settings = settings || $2::jsonb WHERE id=$1`,
+      [frame.id, JSON.stringify({ face_box: r.box })]);
+    return r.box;
+  } catch {
+    return null;
+  }
+}
+
+// The band to keep clear for an overlay that spans a time range: the union of
+// the head boxes of every shot it plays over. A card that moves between shots
+// is worse than one placed where it is safe for all of them.
+function unionBoxes(boxes) {
+  const list = boxes.filter(Boolean);
+  if (!list.length) return null;
+  const x = Math.min(...list.map(b => b.x));
+  const y = Math.min(...list.map(b => b.y));
+  const r = Math.max(...list.map(b => b.x + b.w));
+  const bot = Math.max(...list.map(b => b.y + b.h));
+  return { x, y, w: r - x, h: bot - y };
 }
 
 export default async function routes(app) {
@@ -3702,10 +3785,36 @@ export default async function routes(app) {
       const canvasSize = (probeForOverlay.width && probeForOverlay.height)
         ? { width: probeForOverlay.width, height: probeForOverlay.height }
         : resolveCanvasSizeForAspect(p.aspect_ratio);
+      // Both, and in this order. The install is what librsvg actually reads;
+      // the base64 is for renderers that honour @font-face. Awaited here as
+      // well as at startup because assembly is the moment it matters and a
+      // memoised promise costs nothing to await twice.
+      const fontInstall = await ensureEthiopicFontsInstalled();
+      if (!fontInstall?.ok) {
+        await q(`INSERT INTO studio.events (project_id, note) VALUES ($1,$2)`,
+          [p.id, `Amharic font is not available to the renderer, so any Ethiopic text will burn in as empty boxes: ${fontInstall?.note ?? 'unknown'}`]).catch(() => {});
+      }
       const fonts = await loadEthiopicFontsBase64();
       const graph = buildOverlayFilterGraph(approvedOverlays, probeForOverlay.durationS, canvasSize.width, canvasSize.height);
       if (graph.layers.length) {
         const overlayById = new Map(approvedOverlays.map(o => [o.id, o]));
+
+        // Head boxes, once per shot, so no card lands on the presenter's face.
+        // Built here rather than per layer because a door card's four lines are
+        // four layers off one overlay and would otherwise detect four times.
+        const shotWindows = [];
+        {
+          let t = 0;
+          for (const shot of shots) {
+            const clip = assets.find(a => a.shot_id === shot.id);
+            let dur = Number(shot.duration_target_s ?? 0);
+            if (clip) { try { dur = (await probeClip(storage.localPath(clip.storage_key))).durationS ?? dur; } catch { /* keep target */ } }
+            shotWindows.push({ shot, startS: t, endS: t + dur, faceBox: await faceBoxForShot(shot, p) });
+            t += dur;
+          }
+        }
+        const faceBoxFor = (startS, endS) => unionBoxes(
+          shotWindows.filter(w => startS < w.endS && endS > w.startS).map(w => w.faceBox));
         const inputArgs = [];
         for (let i = 0; i < graph.layers.length; i++) {
           const layer = graph.layers[i];
@@ -3715,7 +3824,9 @@ export default async function routes(app) {
             const iconAsset = await one(`SELECT storage_key FROM lcos.assets WHERE id=$1`, [overlay.data?.asset_id]);
             if (iconAsset) iconBase64 = (await readFile(storage.localPath(iconAsset.storage_key))).toString('base64');
           }
-          const svg = compileOverlayLayerSvg(layer, overlay, canvasSize.width, canvasSize.height, fonts.bold, fonts.regular, iconBase64);
+          const faceBox = faceBoxFor(layer.startS, layer.endS);
+          const svg = compileOverlayLayerSvg(layer, overlay, canvasSize.width, canvasSize.height,
+            fonts.bold, fonts.regular, iconBase64, faceBox);
           const svgPath = join(workDir, `overlay-${i}.svg`);
           await writeFile(svgPath, svg, 'utf8');
           inputArgs.push('-itsoffset', layer.startS.toFixed(3), '-loop', '1',

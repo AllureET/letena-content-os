@@ -668,6 +668,49 @@ x and y are the top-left corner as a fraction of the full image width and height
     return { status: 'SUCCEEDED', panels: Array.isArray(parsed.panels) ? parsed.panels : [], cost_usd: null };
   },
 
+  // Where the presenter's head is (22 Aug 2026). Owner, on the first cut with
+  // cards burned in: "do you see how it blocks her face in some of them, it
+  // should never do that."
+  //
+  // He is right that it is a rule and not a preference, so it needs a fact to
+  // enforce against rather than a nicer default anchor. This returns the box
+  // the face and hair occupy, generously, so overlay placement can treat it as
+  // a no-go band. Deliberately ONE call per presenter plate rather than per
+  // shot: every shot is a known crop of that plate, so the box maps forward
+  // with arithmetic instead of another model call.
+  async detectFaceBox({ imageBase64, mimeType = 'image/png' }) {
+    if (MOCK()) {
+      return { status: 'SUCCEEDED', cost_usd: 0, found: true,
+        box: { x: 0.30, y: 0.18, w: 0.40, h: 0.34 } };
+    }
+    const parts = [
+      { text: `Find the person's head in this image: the whole head, including all of the hair, the forehead, the chin and the ears. Be generous rather than tight; it is better to return a box slightly too big than one that clips the top of the hair or the point of the chin.
+
+Return strict JSON and nothing else:
+{"found": true or false, "box": {"x":0-1,"y":0-1,"w":0-1,"h":0-1}}
+
+x and y are the top-left corner of the box as a fraction of the full image width and height, and w and h are its width and height as fractions. If there is no person, return {"found": false}.` },
+      { inlineData: { mimeType, data: imageBase64 } },
+    ];
+    const res = await fetch(geminiUrl(geminiTextModel()), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts }] }),
+    });
+    if (!res.ok) throw new Error(`gemini face box ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const d = await res.json();
+    const text = d.candidates?.[0]?.content?.parts?.map(p => p.text).join('') ?? '{}';
+    const jsonText = text.replace(/^```json?\s*/i, '').replace(/```\s*$/, '');
+    let parsed;
+    try { parsed = JSON.parse(jsonText); } catch {
+      throw new Error(`gemini face box returned unparseable JSON: ${text.slice(0, 300)}`);
+    }
+    const b = parsed?.box;
+    const ok = parsed?.found === true && b
+      && ['x', 'y', 'w', 'h'].every(k => Number.isFinite(Number(b[k])));
+    return { status: 'SUCCEEDED', found: !!ok, cost_usd: null,
+      box: ok ? { x: Number(b.x), y: Number(b.y), w: Number(b.w), h: Number(b.h) } : null };
+  },
+
   // Video Studio automated continuity QC (playbook 19.2, phase 1, 18 Aug
   // 2026). This is the honest version of "AI checks continuity": a vision
   // model comparing one candidate frame against the locked reference

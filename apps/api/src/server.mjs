@@ -26,9 +26,25 @@ export async function buildServer() {
   const app = Fastify({ logger: process.env.NODE_ENV !== 'test',
     bodyLimit: 2 * 1024 * 1024 });
 
+  // Put the Ethiopic font where fontconfig can find it before anything asks
+  // for a card (22 Aug 2026). Fire and forget: the promise is memoised inside,
+  // every overlay render awaits the same one, and a failure here degrades a
+  // card rather than stopping the server. See studio_overlays.mjs for why the
+  // embedded @font-face was never enough.
+  import('./modules/studio_overlays.mjs')
+    .then(m => m.ensureEthiopicFontsInstalled())
+    .then(r => { if (!r?.ok) app.log?.warn?.({ font: r }, 'Amharic font not installed'); })
+    .catch(() => {});
+
   app.get('/healthz', async () => {
     await q('SELECT 1');
-    return { ok: true, service: 'lcos-api' };
+    // Whether Amharic can actually be drawn is a health fact. It failed
+    // silently for a whole build otherwise: the cards rendered, they just had
+    // boxes where the words were.
+    let fonts = null;
+    try { fonts = await (await import('./modules/studio_overlays.mjs')).ensureEthiopicFontsInstalled(); }
+    catch (e) { fonts = { ok: false, note: e.message }; }
+    return { ok: true, service: 'lcos-api', amharic_font: fonts };
   });
 
   // DB-backed provider credentials (Settings screen). Env stays the fallback.

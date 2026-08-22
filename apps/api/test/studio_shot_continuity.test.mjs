@@ -127,3 +127,33 @@ test('source_shot_id must resolve to a shot in the same project', async () => {
   const r = await call('POST', `/studio/shots/${shotCId}/continue-from-previous`, { source_shot_id: otherProj.id });
   assert.equal(r.statusCode, 404);
 });
+
+// Composing a fresh first frame ends the continuity link (22 Aug 2026).
+// Leaving the pointer behind made the system believe a link that no longer
+// existed: rejecting an earlier shot's video was refused because "the next
+// shot continues from it", when that shot had been recomposed and did not.
+// The refusal's own advice -- regenerate the later shot's first frame first
+// -- only works if doing so actually clears the link.
+test('recomposing a shot\'s first frame clears the link to the shot it continued from', async () => {
+  const before = await one(`SELECT generation FROM studio.shots WHERE id=$1`, [shotBId]);
+  assert.ok(before.generation.continued_from_shot_id, 'SH-B is continuing from SH-A at this point');
+  // compose-first-frame needs an approved character and environment lock,
+  // which this file's shots do not otherwise have.
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+  for (const [type, code] of [['CHARACTER', 'CHR-CONT'], ['ENVIRONMENT', 'ENV-CONT']]) {
+    const lock = (await call('POST', `/studio/projects/${projectId}/locks`,
+      { level: 'L1_ENTITY', entity_type: type, entity_code: code, data: { name: code } })).json();
+    await call('POST', `/studio/locks/${lock.id}/reference/upload`, { image_base64: PNG });
+    await call('POST', `/studio/locks/${lock.id}/approve`, {});
+  }
+  await call('PATCH', `/studio/shots/${shotBId}`,
+    { continuity: { characters: ['CHR-CONT'], environment: 'ENV-CONT' } });
+  const r = await call('POST', `/studio/shots/${shotBId}/compose-first-frame`, {});
+  assert.equal(r.statusCode, 200, r.body);
+  const after = await one(`SELECT generation FROM studio.shots WHERE id=$1`, [shotBId]);
+  assert.equal(after.generation.continued_from_shot_id, undefined,
+    'a freshly composed frame does not continue from anything');
+  assert.equal(after.generation.first_frame_asset_id, r.json().asset.id);
+  assert.equal(after.generation.mode_preference, 'image_to_video',
+    'the rest of the generation block is still merged, not replaced');
+});

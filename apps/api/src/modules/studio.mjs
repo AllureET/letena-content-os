@@ -698,6 +698,16 @@ async function spendBudget(projectId, amount) {
 function classifyGenerationError(message) {
   const m = String(message ?? '').toLowerCase();
   if (/polic|moderat|safety|blocked content/.test(m)) return 'POLICY';
+  // Runway's own output-quality rejection (22 Aug 2026). It reads like a
+  // hard failure -- "An unexpected error occurred" -- and it is not. Six
+  // shots off the same two locks, the same prompt, the same settings and
+  // near-identical frames: the first two passed, the third failed twice,
+  // once from a composed frame and once from a continuity frame. It is a
+  // coin flip on their side, so the answer is to try again rather than to
+  // hunt for a cause that is not there. Classified before PROVIDER_DOWN
+  // because "unexpected error" would otherwise fall through to the default
+  // and get exactly one attempt.
+  if (/bad_output/.test(m)) return 'FLAKY';
   if (/unavailable|\bdown\b/.test(m)) return 'PROVIDER_DOWN';
   if (/timeout|econnreset|rate limit|429|5\d\d/.test(m)) return 'TRANSIENT';
   return 'PROVIDER_DOWN';
@@ -755,7 +765,14 @@ async function runGenerationLadder({ project, actorId, engine, engineName, mode,
   failedAttempts.push({ engine: engineName, attempt_number: n, error_class: r.errorClass, message: r.message });
   if (r.errorClass === 'POLICY') return { success: false, attempts: failedAttempts };
 
-  if (r.errorClass === 'TRANSIENT') {
+  // TRANSIENT gets one same-engine retry. FLAKY gets three, because that is
+  // what it is: the provider's output check rejecting a generation it made
+  // itself, on input that succeeded moments earlier. One retry leaves a
+  // roughly even chance of losing a shot that would render fine on the next
+  // try, and a failed Runway task is not billed, so the only cost of trying
+  // again is the wait.
+  const sameEngineRetries = r.errorClass === 'FLAKY' ? 3 : r.errorClass === 'TRANSIENT' ? 1 : 0;
+  for (let attempt = 0; attempt < sameEngineRetries; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));
     n += 1;
     r = await attemptGenerationOnce({ project, actorId, engineObj: engine, engineLabel: engineName, mode, callArgs, attemptNumber: n });
@@ -2190,7 +2207,19 @@ export default async function routes(app) {
     // field-merge discipline as PATCH /studio/shots/:shotId, applied
     // directly here since that route also re-flips status to DRAFT, which
     // this step should not do.
-    await q(`UPDATE studio.shots SET generation = generation || $2::jsonb, updated_at=now() WHERE id=$1`,
+    //
+    // continued_from_shot_id is the one key that must NOT be preserved
+    // (22 Aug 2026). Composing a fresh frame is precisely the act of no
+    // longer continuing from the previous shot, and leaving the pointer
+    // behind made the system believe a link that no longer existed: the
+    // reject guard refused to let an earlier shot's video be rejected
+    // because "SH-02 continues from it", when SH-02 had been recomposed
+    // and did not. The advice that guard gives -- regenerate the later
+    // shot's first frame first -- only works if doing so actually clears
+    // the link.
+    await q(`UPDATE studio.shots
+             SET generation = (generation - 'continued_from_shot_id') || $2::jsonb, updated_at=now()
+             WHERE id=$1`,
       [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: 'image_to_video' })]);
 
     await bridgeAssetToLibrary({ asset, kindHint: null,

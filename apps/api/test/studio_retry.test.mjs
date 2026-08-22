@@ -224,3 +224,57 @@ test('a RUNWAY failure exhausts without rerouting onto an unimplemented engine',
   assert.equal(body.attempts[0].engine, 'RUNWAY');
   assert.equal(body.attempts[0].error_class, 'PROVIDER_DOWN');
 });
+
+// Runway's output-quality rejection is a coin flip, not a verdict
+// (22 Aug 2026). Six shots off the same two locks, the same prompt, the
+// same settings and near-identical frames: the first two passed, the third
+// failed twice, once from a composed frame and once from a continuity
+// frame. It reads like a hard failure -- "An unexpected error occurred" --
+// and classifying it as one meant a single attempt and a lost shot. A
+// failed Runway task is not billed, so the only cost of trying again is
+// the wait.
+test('a BAD_OUTPUT failure retries the same engine and can succeed on a later attempt', async (t) => {
+  let calls = 0;
+  t.mock.method(runway, 'textToVideo', async ({ assetId }) => {
+    calls += 1;
+    if (calls < 3) throw new Error('runway FAILED (task abc): An unexpected error occurred. / INTERNAL.BAD_OUTPUT.CODE01');
+    return { status: 'SUCCEEDED', storage_key: `assets/generated/${assetId}/broll-runway.mp4`,
+      provider_job_id: `flaky-${assetId.slice(0, 8)}`, cost_usd: 0 };
+  });
+
+  const project = await newProject('Retry BAD_OUTPUT case');
+  const shot = await newShot(project.id, 'SH-R6', 'RUNWAY');
+  const r = await call('POST', `/studio/shots/${shot.id}/generate`, {});
+  assert.equal(r.statusCode, 200, r.body);
+  assert.equal(calls, 3, 'two failures then a success, all on the same engine');
+  assert.equal(r.json().asset.generator.attempt_count, 3);
+  assert.equal(r.json().asset.generator.fallback_used, false);
+});
+
+test('BAD_OUTPUT is retried more than a plain transient failure, and still bounded', async (t) => {
+  let calls = 0;
+  t.mock.method(runway, 'textToVideo', async () => {
+    calls += 1;
+    throw new Error('runway FAILED (task abc): An unexpected error occurred. / INTERNAL.BAD_OUTPUT.CODE01');
+  });
+  const project = await newProject('Retry BAD_OUTPUT exhausted');
+  const shot = await newShot(project.id, 'SH-R7', 'RUNWAY');
+  const r = await call('POST', `/studio/shots/${shot.id}/generate`, {});
+  assert.equal(r.statusCode, 502, r.body);
+  assert.equal(calls, 4, 'one attempt plus three same-engine retries, then it stops');
+  assert.equal(r.json().attempts.length, 4);
+  assert.equal(r.json().attempts[0].error_class, 'FLAKY');
+});
+
+test('a policy rejection is still never retried, however it is worded', async (t) => {
+  let calls = 0;
+  t.mock.method(runway, 'textToVideo', async () => {
+    calls += 1;
+    throw new Error('runway FAILED: rejected by content moderation');
+  });
+  const project = await newProject('Retry POLICY still hard');
+  const shot = await newShot(project.id, 'SH-R8', 'RUNWAY');
+  const r = await call('POST', `/studio/shots/${shot.id}/generate`, {});
+  assert.equal(r.statusCode, 502);
+  assert.equal(calls, 1, 'widening the retry rules must not soften the policy gate');
+});

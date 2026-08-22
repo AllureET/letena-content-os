@@ -13,6 +13,7 @@
 // genuinely different picture still works.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 
 process.env.NODE_ENV = 'test';
 process.env.LCOS_AI_PROVIDER = 'MOCK';
@@ -193,4 +194,42 @@ test('a lock id that is not on this project is refused rather than ignored', asy
     { environment_lock_id: '00000000-0000-0000-0000-000000000000' });
   assert.equal(r.statusCode, 422);
   assert.match(r.json().detail, /does not match an active ENVIRONMENT lock/);
+});
+
+// 22 Aug 2026, owner on plate attempt three: "why is she reandomly sitting in
+// front of her desk". The consulting-room lock put her behind her desk. The
+// plate kept lifting her out of it onto a chair in open floor, because shot
+// framing overrides the lock's composition and PLATE_FRAMING described a
+// seated presenter with no furniture at all. The room has to decide where she
+// sits; the framing note only decides how tightly she is framed.
+test('the framing note defers to the room on where she sits', async () => {
+  const src = await readFile(new URL('../src/modules/studio.mjs', import.meta.url), 'utf8');
+  const block = src.slice(src.indexOf('const PLATE_FRAMING'), src.indexOf("].join(' ')", src.indexOf('const PLATE_FRAMING')));
+  assert.match(block, /seated exactly where the room description places her/);
+  assert.match(block, /do not seat her in open floor/i);
+  assert.doesNotMatch(block, /\bdesk\b/i,
+    'naming a desk here would break every future room that has no desk; the room describes its own furniture');
+});
+
+test('framing_notes overrides the default for one call', async () => {
+  const r = await call('POST', `/studio/projects/${projectId}/presenter-plate`,
+    { environment_lock_id: (await q(`SELECT id FROM studio.locks
+        WHERE project_id=$1 AND entity_type='ENVIRONMENT' AND entity_code='ENV-PL-2' AND is_active`,
+        [projectId])).rows[0].id,
+      framing_notes: 'She stands at a lectern in a lecture theatre, framed from the waist up.' });
+  assert.equal(r.statusCode, 200, r.body);
+  const prompt = r.json().asset.settings.prompt;
+  assert.match(prompt, /stands at a lectern/, 'the override reaches the model');
+  assert.doesNotMatch(prompt, /seated exactly where the room description places her/,
+    'the override replaces the default rather than being appended to it');
+});
+
+test('an empty framing_notes falls back to the default rather than sending nothing', async () => {
+  const r = await call('POST', `/studio/projects/${projectId}/presenter-plate`,
+    { environment_lock_id: (await q(`SELECT id FROM studio.locks
+        WHERE project_id=$1 AND entity_type='ENVIRONMENT' AND entity_code='ENV-PL-2' AND is_active`,
+        [projectId])).rows[0].id,
+      framing_notes: '   ' });
+  assert.equal(r.statusCode, 200, r.body);
+  assert.match(r.json().asset.settings.prompt, /seated exactly where the room description places her/);
 });

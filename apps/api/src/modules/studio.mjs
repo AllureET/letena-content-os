@@ -490,8 +490,19 @@ async function bestPanelKey(lockId, entityType) {
 // The plate must be composed loose enough that a CLOSE crop still has a
 // head in it. SHOT_SIZES.CLOSE takes 48% of the frame, so the plate is
 // framed as a medium-wide with real air around her.
+// The seat line (22 Aug 2026) is load-bearing and was missing on the first
+// three attempts. Shot framing overrides the lock's own composition inside
+// compileComposePrompt, so a framing note that describes a seated presenter
+// and says nothing about furniture quietly deletes the room's staging: the
+// consulting-room lock put her behind her desk, and the plate kept lifting
+// her out of it onto a chair in open floor, twice, with the desk pushed off
+// to one side. The fix is not to describe a desk here, because the next
+// project's room may not have one. It is to say that the room decides where
+// she sits and this note only decides how she is framed.
 const PLATE_FRAMING = [
   'Framing: she is seated square-on to the lens, centred in frame, facing the camera directly.',
+  'She is seated exactly where the room description places her, in the seat and at the furniture that description gives her.',
+  'Do not move her out of that position, do not seat her in open floor, and do not push the furniture she sits at off to one side.',
   'Medium-wide: her head, shoulders and upper body are all visible, with clear space above her head and to both sides.',
   'The camera is at her eye level, straight on, not above or below and not off to one side.',
   'She is looking into the lens as though speaking to one person.',
@@ -2314,8 +2325,15 @@ export default async function routes(app) {
     ]);
 
     const assetId = crypto.randomUUID();
+    // framing_notes overrides PLATE_FRAMING for this one call. Getting a plate
+    // right is iterative and each attempt is a real image-model call, so the
+    // framing has to be tunable from the request rather than only by shipping
+    // a new build.
+    const framing = typeof req.body?.framing_notes === 'string' && req.body.framing_notes.trim()
+      ? req.body.framing_notes.trim()
+      : PLATE_FRAMING;
     const prompt = compileComposePrompt(characterLock, environmentLock, styleLock,
-      project.aspect_ratio, PLATE_FRAMING);
+      project.aspect_ratio, framing);
     const [charPanel, envPanel] = await Promise.all([
       bestPanelKey(characterLock.id, 'CHARACTER'),
       bestPanelKey(environmentLock.id, 'ENVIRONMENT'),

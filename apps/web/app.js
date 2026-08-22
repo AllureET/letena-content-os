@@ -545,7 +545,7 @@ const SECTIONS = [
   ['insights',   'Insights',   [['analytics', 'Performance'], ['experiments', 'Experiments'],
                                 ['costs', 'Costs']]],
   ['admin',      'Admin',      [['users', 'Users & roles'], ['settings', 'Settings'],
-                                ['audit', 'Audit log']]],
+                                ['brand', 'Brand'], ['audit', 'Audit log']]],
 ];
 
 // Detail screens are not tabs, but still belong to a section so the sidebar
@@ -2727,6 +2727,75 @@ const screens = {
   // full count is always stated and "Show all" is one click, one hash
   // query param, no data loss, per the Phase 1 finding that a 239-row
   // unbroken table was the real problem on this screen.
+  // The brand page (22 Aug 2026). Owner, after I invented three hex codes for
+  // overlay cards: "you have the real letena values in this project and in the
+  // brand kit in the github and many other places.. Make sure its somewhere
+  // easily findable in the OS, and it may even need a page so you dont forget."
+  //
+  // The values existed in at least four places and none of them were reachable
+  // from the code or the person who needed them. Four sources of truth and no
+  // source of truth are the same thing. This page reads the one the running
+  // system now uses, apps/api/src/brand.mjs, so what is on screen is by
+  // construction what gets burned into a video. A brand page that could drift
+  // from the renderer would be worse than none.
+  async brand() {
+    const b = await api('GET', '/brand');
+    const swatch = (name, hex, role) => `<div style="display:flex;gap:10px;align-items:center;padding:8px 0">
+      <div style="width:52px;height:52px;border-radius:8px;background:${esc(hex)};border:1px solid var(--line);flex:none"></div>
+      <div style="min-width:0">
+        <div style="font-size:13px;font-weight:600">${esc(name)}</div>
+        <div class="mono" style="font-size:12px">${esc(hex)}</div>
+        <div class="muted" style="font-size:11px">${esc(role)}</div>
+      </div></div>`;
+    const pairs = Object.entries(b.overlayPairs ?? {}).map(([k, v]) => `<div class="claimrow" style="margin-bottom:8px">
+      <div style="display:flex;gap:10px;align-items:center">
+        <div style="background:${esc(v.background)};color:${esc(v.text)};padding:10px 16px;border-radius:10px;font-weight:600;font-size:14px">${esc(k)}</div>
+        <div class="mono" style="font-size:11px">${esc(v.background)} on ${esc(v.text)}</div>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:6px">${esc(v.use)}</div>
+    </div>`).join('');
+    const logo = b.logo ?? {};
+    return `<h1>Brand</h1>
+      <div class="sub">${esc(b.source ?? '')}. This is what the system actually burns into pictures, read live from
+        <span class="mono">apps/api/src/brand.mjs</span>. Changing a value here means changing it there, once.</div>
+
+      <div class="card"><div class="eyebrow">Primary palette</div>
+        ${Object.entries(b.colors ?? {}).map(([k, v]) => swatch(k, v.hex, v.role)).join('')}
+      </div>
+
+      <div class="card"><div class="eyebrow">Neutrals</div>
+        <div class="sub" style="margin-top:-4px;margin-bottom:6px">Letena is a cream-ground brand. White backgrounds read as off-brand even when every accent is correct.</div>
+        ${Object.entries(b.neutrals ?? {}).map(([k, v]) => swatch(k, v.hex, v.role)).join('')}
+      </div>
+
+      <div class="card"><div class="eyebrow">Burn-in pairings</div>
+        <div class="sub" style="margin-top:-4px;margin-bottom:8px">Pre-checked for contrast at the sizes overlays use, so nothing downstream has to decide which colour goes on which.</div>
+        ${pairs}
+      </div>
+
+      <div class="card"><div class="eyebrow">Type</div>
+        <table>
+          ${Object.entries(b.typography ?? {}).map(([k, v]) =>
+            `<tr><td class="mono" style="width:180px">${esc(k)}</td><td>${esc(String(v))}</td></tr>`).join('')}
+        </table>
+      </div>
+
+      <div class="card"><div class="eyebrow">Logo</div>
+        <div class="claimrow" style="border-left-color:${logo.status && /NOT UPLOADED/.test(logo.status) ? 'var(--risk-high)' : 'var(--risk-routine)'}">
+          <div style="font-size:12px"><b>${esc(logo.rule ?? '')}</b></div>
+          <div class="muted" style="font-size:12px;margin-top:6px">${esc(logo.description ?? '')}</div>
+          ${logo.status ? `<div style="font-size:12px;margin-top:6px">${esc(logo.status)}</div>` : ''}
+          ${logo.howToAdd ? `<div class="muted" style="font-size:11px;margin-top:4px">${esc(logo.howToAdd)}</div>` : ''}
+        </div>
+      </div>
+
+      <div class="card"><div class="eyebrow">Rules</div>
+        <ul style="margin:0;padding-left:18px;font-size:13px;line-height:1.9">
+          ${(b.rules ?? []).map(r => `<li>${esc(r)}</li>`).join('')}
+        </ul>
+      </div>`;
+  },
+
   async audit() {
     const qp = new URLSearchParams((location.hash.split('?')[1] ?? ''));
     const showAll = qp.get('all') === '1';

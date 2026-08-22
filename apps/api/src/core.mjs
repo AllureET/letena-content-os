@@ -150,7 +150,13 @@ export function authPlugin(app) {
     // HMAC-signed EMR token on its own; this hook isn't a second gate for
     // it. Fixed 14 Aug 2026: this hook was rejecting it with "missing
     // token" before the route ever ran, which is the entire SSO 401 bug.
-    if (['/api/v1/auth/login', '/api/v1/auth/sso', '/healthz', '/', '/app.js'].includes(path)) return;
+    // /api/v1/brand joined this list on 22 Aug 2026. A colour is not a secret,
+    // and the reason it is public is practical rather than philosophical: a
+    // burn-in job or a build step that has to authenticate to learn what shade
+    // of blue the brand is will hard-code a shade of blue instead. Which is
+    // exactly the failure the brand kit exists to end.
+    if (['/api/v1/auth/login', '/api/v1/auth/sso', '/api/v1/brand',
+         '/healthz', '/', '/app.js'].includes(path)) return;
     // Media previews load through <img>/<video>/<audio> tags, which cannot
     // send an Authorization header, so the media route verifies its own
     // ?token= JWT (same secret, same expiry) instead of this hook.

@@ -146,8 +146,57 @@ export async function buildServer() {
       mp3: 'audio/mpeg', mpeg: 'audio/mpeg', mpga: 'audio/mpeg', m4a: 'audio/mp4',
       aac: 'audio/aac', wav: 'audio/wav', ogg: 'audio/ogg', json: 'application/json' };
     const ext = full.split('.').pop().toLowerCase();
-    reply.type(types[ext] ?? 'application/octet-stream');
+    const mime = types[ext] ?? 'application/octet-stream';
+    const size = fs.statSync(full).size;
+
+    // Byte ranges (22 Aug 2026). This route streamed whole files and answered
+    // no Range header, so no browser could seek any video it served: setting
+    // currentTime silently did nothing and the element sat at frame zero.
+    // Every video in the app was therefore unscrubbable -- the rough-cut
+    // player included, which is the one place a producer most needs to jump
+    // to 0:18 and look at something. It presented as "the player is broken",
+    // which is why it went unfixed: nothing errored, it just refused to move.
+    //
+    // Accept-Ranges is advertised for every file so a client knows it may ask.
+    // A malformed or unsatisfiable range gets 416 with the real size rather
+    // than a silent full-body reply, because a client that asked for bytes it
+    // cannot have should be told so.
+    reply.header('Accept-Ranges', 'bytes');
+    const range = req.headers.range;
+    if (range) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(String(range).trim());
+      if (!m || (m[1] === '' && m[2] === '')) {
+        return reply.code(416).header('Content-Range', `bytes */${size}`)
+          .send(err(416, 'RANGE_NOT_SATISFIABLE', `could not read the Range header: ${range}`));
+      }
+      // "bytes=-500" means the LAST 500 bytes, not "from 0 to 500". Getting
+      // this backwards serves the wrong part of the file with a 206 on it,
+      // which looks like corruption rather than like a bug.
+      let start, end;
+      if (m[1] === '') { start = Math.max(0, size - Number(m[2])); end = size - 1; }
+      else { start = Number(m[1]); end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1); }
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+        return reply.code(416).header('Content-Range', `bytes */${size}`)
+          .send(err(416, 'RANGE_NOT_SATISFIABLE', `range ${range} does not fit a ${size} byte file`));
+      }
+      reply.code(206)
+        .header('Content-Range', `bytes ${start}-${end}/${size}`)
+        .header('Content-Length', String(end - start + 1))
+        .type(mime);
+      return reply.send(fs.createReadStream(full, { start, end }));
+    }
+    reply.header('Content-Length', String(size)).type(mime);
     return reply.send(fs.createReadStream(full));
+  });
+
+  // The brand kit, served to anything that needs a Letena value (22 Aug 2026).
+  // Deliberately outside the authenticated plugin below and alongside media:
+  // a colour is not a secret, and a burn-in job or a build step that has to
+  // authenticate to learn what shade of blue the brand is will end up with a
+  // hard-coded shade of blue instead. Which is exactly what kept happening.
+  app.get('/api/v1/brand', async () => {
+    const { LETENA_BRAND, BRAND_HEX } = await import('./brand.mjs');
+    return { ...LETENA_BRAND, hex: BRAND_HEX };
   });
 
   app.post('/api/v1/auth/login', async (req, reply) => {

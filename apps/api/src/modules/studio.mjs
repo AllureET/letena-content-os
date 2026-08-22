@@ -332,13 +332,42 @@ export function compileComposePrompt(characterLock, environmentLock, styleLock, 
 // resize that can never stretch or distort.
 const ENGINE_FRAME_SIZE = { '9:16': [720, 1280], '16:9': [1280, 720], '1:1': [960, 960] };
 
-export async function cropToAspect(srcPath, outPath, aspectRatio) {
+// Shot size, as a fraction of the full frame kept (22 Aug 2026, owner:
+// "why cant we crop it to a med close or med shot").
+//
+// Because arguing with an image model about scale does not work. The prompt
+// said waist-up and got a full-length shot; it said it again, louder, in
+// capitals, naming the knees and feet as excluded, and got another
+// full-length shot. Meanwhile the frame is already being cropped to the
+// project's aspect ratio on the way through, so the cheap, exact and free
+// answer was sitting right there: take a smaller rectangle of it.
+//
+// The numbers are the fraction of the aspect-corrected frame kept. They are
+// deliberately conservative -- a 0.48 CLOSE on a 1248px-tall Gemini frame
+// still leaves about 600px of real detail before the scale back up to
+// 1280, which reads clean at phone size.
+const SHOT_SIZES = { WIDE: 1, MEDIUM: 0.78, MEDIUM_CLOSE: 0.62, CLOSE: 0.48 };
+
+// Where the tighter rectangle sits inside the full one, vertically. A
+// seated person's head is near the top of a 9:16 frame, so a centred crop
+// would cut it off; 0.15 keeps a little headroom above and drops the floor.
+const SHOT_SIZE_HEADROOM = 0.15;
+
+export async function cropToAspect(srcPath, outPath, aspectRatio, shotSize = 'WIDE') {
   const ratio = String(aspectRatio ?? '9:16');
   const [w, h] = ratio.split(':').map(Number);
   if (!w || !h) { await copyFile(srcPath, outPath); return; }
+  const f = SHOT_SIZES[String(shotSize ?? 'WIDE').toUpperCase()] ?? 1;
   // ffmpeg picks the largest centred rectangle of the target ratio that
   // fits inside the source, so the crop itself never stretches anything.
-  const crop = `crop='min(iw,ih*${w}/${h})':'min(ih,iw*${h}/${w})'`;
+  // With a shot size below WIDE, a proportionally smaller rectangle of the
+  // same ratio is taken from inside that one -- same shape, tighter on the
+  // subject, and still exactly the project's aspect.
+  const baseW = `min(iw,ih*${w}/${h})`;
+  const baseH = `min(ih,iw*${h}/${w})`;
+  const crop = f === 1
+    ? `crop='${baseW}':'${baseH}'`
+    : `crop='${baseW}*${f}':'${baseH}*${f}':'(iw-${baseW}*${f})/2':'(ih-${baseH})/2+(${baseH}-${baseH}*${f})*${SHOT_SIZE_HEADROOM}'`;
   // Only resize for a ratio the engine actually renders. A project on some
   // other shape still gets the correct crop; forcing it into one of these
   // three boxes would stretch the picture, which is worse than leaving the
@@ -387,6 +416,8 @@ const SHEET_KINDS = ['MASTER', 'TURNAROUND', 'EXPRESSIONS', 'POSES', 'COSTUME_DE
 // gemini.detectSheetPanels). TEXT_BLOCK is in the list on purpose: a
 // heading or a caption strip is recorded as seen and skipped, rather than
 // silently dropped, so a sheet that split badly is obvious on screen.
+export const SHOT_SIZE_NAMES = ['WIDE', 'MEDIUM', 'MEDIUM_CLOSE', 'CLOSE'];
+
 const PANEL_USES = ['FRONT', 'THREE_QUARTER', 'SIDE', 'BACK', 'EXPRESSION', 'POSE', 'COSTUME_DETAIL',
   'SWATCH', 'LOCATION_ANGLE', 'LOCATION_LAYOUT', 'PROP', 'TEXT_BLOCK', 'OTHER'];
 
@@ -2136,7 +2167,10 @@ export default async function routes(app) {
       try {
         const src = storage.localPath(gen.storage_key);
         const cropped = `${src}.crop.png`;
-        await cropToAspect(src, cropped, project.aspect_ratio);
+        // camera.shot_size is the shot's own framing scale (WIDE, MEDIUM,
+        // MEDIUM_CLOSE, CLOSE) and defaults to WIDE, which is exactly the
+        // behaviour every existing shot already had.
+        await cropToAspect(src, cropped, project.aspect_ratio, shot.camera?.shot_size);
         await storage.put(gen.storage_key, await readFile(cropped));
       } catch (e) {
         await q(`INSERT INTO studio.events (project_id, note) VALUES ($1,$2)`,

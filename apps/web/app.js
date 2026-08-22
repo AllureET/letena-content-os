@@ -1985,6 +1985,13 @@ const screens = {
             ${editable && can('studio.write') ? `<div class="claimrow" style="margin-top:8px">
               <label>Duration target (s)</label>
               <input id="stedit-dur-${esc(s.id)}" type="number" min="1" value="${esc(String(s.duration_target_s ?? 5))}">
+              <label>Shot size</label>
+              <select id="stedit-size-${esc(s.id)}">
+                ${[['WIDE', 'wide — the whole frame'], ['MEDIUM', 'medium'],
+                   ['MEDIUM_CLOSE', 'medium close'], ['CLOSE', 'close']]
+                  .map(([v, label]) => `<option value="${v}" ${((s.camera?.shot_size ?? 'WIDE') === v) ? 'selected' : ''}>${esc(label)}</option>`).join('')}
+              </select>
+              <div class="muted" style="font-size:11px;margin-top:2px">Crops the composed first frame tighter on the subject. Exact, unlike asking the image model for a closer shot.</div>
               <label>Story beat</label><textarea id="stedit-beat-${esc(s.id)}">${esc(beat)}</textarea>
               <button style="margin-top:6px" data-stshotedit="${esc(s.id)}">Save changes</button>
             </div>` : ''}
@@ -3920,9 +3927,22 @@ document.addEventListener('click', async (e) => {
       const id = b.dataset.stshotedit;
       const durRaw = elv(`stedit-dur-${id}`);
       b.disabled = true; b.textContent = 'Saving…';
+      // PATCH replaces each block it is given, so the current shot is read
+      // back and merged first. Without this, saving a changed story beat
+      // wiped that shot's narration -- the Amharic line the voiceover is
+      // generated from -- because the form only knows about the beat.
+      // Found 22 Aug 2026 while adding the shot-size control, which has the
+      // same shape of problem: it lives in `camera` alongside the framing
+      // notes, and sending it alone would have thrown those away.
+      const projectId = (location.hash.split('/')[2] ?? '').split('?')[0];
+      let cur = {};
+      try {
+        cur = (await api('GET', `/studio/projects/${projectId}`)).shots?.find(x => x.id === id) ?? {};
+      } catch { cur = {}; }
       await api('PATCH', `/studio/shots/${id}`, {
         ...(durRaw !== '' && durRaw != null ? { duration_target_s: Number(durRaw) } : {}),
-        story: { beat: elv(`stedit-beat-${id}`) ?? '' },
+        story: { ...(cur.story ?? {}), beat: elv(`stedit-beat-${id}`) ?? '' },
+        camera: { ...(cur.camera ?? {}), shot_size: elv(`stedit-size-${id}`) ?? 'WIDE' },
       });
       toast('Shot updated'); return render();
     }

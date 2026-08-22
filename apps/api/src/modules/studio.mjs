@@ -804,6 +804,17 @@ async function spendBudget(projectId, amount) {
 // ===========================================================================
 function classifyGenerationError(message) {
   const m = String(message ?? '').toLowerCase();
+  // An account problem is not a provider problem (22 Aug 2026). The first
+  // real fal call came back "User is locked. Reason: Exhausted balance", the
+  // classifier had no rule for it, it fell through to the catch-all
+  // PROVIDER_DOWN, and the ladder spent 110 seconds re-submitting a request
+  // that could never succeed and then failing over to a different engine
+  // that had not been asked for. Nothing here is retryable by waiting, and
+  // on a metered provider a retry loop against a billing error is exactly
+  // the loop you least want. Classified FIRST so no later rule can claim it.
+  if (/exhausted balance|insufficient (balance|funds|credit)|top up|payment required|402|quota exceeded|billing|user is locked|invalid api key|unauthorized|401|403|forbidden/.test(m)) {
+    return 'ACCOUNT';
+  }
   if (/polic|moderat|safety|blocked content/.test(m)) return 'POLICY';
   // Runway's own output-quality rejection (22 Aug 2026). It reads like a
   // hard failure -- "An unexpected error occurred" -- and it is not. Six
@@ -870,7 +881,7 @@ async function runGenerationLadder({ project, actorId, engine, engineName, mode,
   let r = await attemptGenerationOnce({ project, actorId, engineObj: engine, engineLabel: engineName, mode, callArgs, attemptNumber: n });
   if (r.ok) return { success: true, gen: r.gen, engineLabel: engineName, attemptCount: n, fallbackUsed: false };
   failedAttempts.push({ engine: engineName, attempt_number: n, error_class: r.errorClass, message: r.message });
-  if (r.errorClass === 'POLICY') return { success: false, attempts: failedAttempts };
+  if (['POLICY', 'ACCOUNT'].includes(r.errorClass)) return { success: false, attempts: failedAttempts };
 
   // TRANSIENT gets one same-engine retry. FLAKY gets three, because that is
   // what it is: the provider's output check rejecting a generation it made
@@ -885,7 +896,7 @@ async function runGenerationLadder({ project, actorId, engine, engineName, mode,
     r = await attemptGenerationOnce({ project, actorId, engineObj: engine, engineLabel: engineName, mode, callArgs, attemptNumber: n });
     if (r.ok) return { success: true, gen: r.gen, engineLabel: engineName, attemptCount: n, fallbackUsed: false };
     failedAttempts.push({ engine: engineName, attempt_number: n, error_class: r.errorClass, message: r.message });
-    if (r.errorClass === 'POLICY') return { success: false, attempts: failedAttempts };
+    if (['POLICY', 'ACCOUNT'].includes(r.errorClass)) return { success: false, attempts: failedAttempts };
   }
 
   // Fallback target (21 Aug 2026): RUNWAY is the only engine with a real
@@ -2775,6 +2786,18 @@ export default async function routes(app) {
         await q(`UPDATE studio.shots SET status='DRAFT', updated_at=now() WHERE id=$1`, [shot.id]);
         await q(`INSERT INTO studio.events (project_id, actor_id, note) VALUES ($1,$2,$3)`,
           [project.id, req.actor?.id ?? null, `talking-head generate FAILED: ${e.message}`]);
+        // A billing or key problem is the operator's to fix and nobody else's,
+        // so it gets its own answer rather than a 502 that reads like the
+        // provider fell over. The first real fal call in production was
+        // exactly this -- "User is locked. Reason: Exhausted balance" -- and
+        // a bare GENERATION_FAILED sends a producer hunting for a fault in
+        // the shot when the shot is fine and the account is empty.
+        if (classifyGenerationError(e.message) === 'ACCOUNT') {
+          return reply.code(422).send(err(422, 'PROVIDER_ACCOUNT',
+            `The talking-head provider refused the request for an account reason, not a problem with this shot: ${e.message} `
+            + 'Nothing was charged and nothing was lost. The shot keeps its first frame and its voice line; generate it again once the account is settled.',
+            { guard: 'providerAccount' }));
+        }
         return reply.code(502).send(err(502, 'GENERATION_FAILED', e.message));
       }
       const thAsset = await one(

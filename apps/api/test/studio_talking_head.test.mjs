@@ -15,6 +15,7 @@
 // same sentence plays twice a fraction of a second apart.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 
 process.env.NODE_ENV = 'test';
 process.env.LCOS_AI_PROVIDER = 'MOCK';
@@ -97,4 +98,44 @@ test('the Runway path is untouched by any of this', async () => {
   const r = await call('POST', `/studio/shots/${runwayShot.id}/generate`, {});
   assert.equal(r.statusCode, 200, r.body);
   assert.equal(r.json().asset.generator.provider, 'RUNWAY');
+});
+
+// 22 Aug 2026, the first real fal call in production:
+//   fal submit 403: {"detail":"User is locked. Reason: Exhausted balance."}
+// The classifier had no rule for it, so it fell through to the catch-all
+// PROVIDER_DOWN and the ladder re-submitted a request that could never
+// succeed, then failed over to an engine nobody asked for. Waiting does not
+// fix an empty account, and on a metered provider a retry loop against a
+// billing error is the last loop you want.
+test('a billing or key failure is an account problem, not a flaky provider', async () => {
+  const { classifyGenerationError } = await import('../src/modules/studio.mjs')
+    .then(m => m).catch(() => ({}));
+  const src = await readFile(new URL('../src/modules/studio.mjs', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('function classifyGenerationError'));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  for (const phrase of ['exhausted balance', 'insufficient', 'top up', 'quota exceeded', 'billing', 'user is locked', '403']) {
+    assert.ok(body.toLowerCase().includes(phrase.toLowerCase()),
+      `the classifier should recognise "${phrase}" as an account problem`);
+  }
+  const accountRule = body.indexOf("return 'ACCOUNT'");
+  const policyRule = body.indexOf("return 'POLICY'");
+  assert.ok(accountRule > -1 && accountRule < policyRule,
+    'ACCOUNT is checked first so no looser rule can claim a billing failure');
+});
+
+test('an account failure stops the ladder cold, like a policy failure', async () => {
+  const src = await readFile(new URL('../src/modules/studio.mjs', import.meta.url), 'utf8');
+  const stops = src.match(/\['POLICY', 'ACCOUNT'\]\.includes\(r\.errorClass\)/g) ?? [];
+  assert.equal(stops.length, 2,
+    'both the first-attempt check and the retry-loop check must stop on ACCOUNT');
+  assert.doesNotMatch(src, /if \(r\.errorClass === 'POLICY'\) return \{ success: false/,
+    'no stop-check should still be testing POLICY alone');
+});
+
+test('the talking-head route answers an account failure in its own words', async () => {
+  const src = await readFile(new URL('../src/modules/studio.mjs', import.meta.url), 'utf8');
+  assert.match(src, /PROVIDER_ACCOUNT/);
+  assert.match(src, /guard: 'providerAccount'/);
+  assert.match(src, /Nothing was charged and nothing was lost/,
+    'a producer reading this should know the shot is fine and the account is empty');
 });

@@ -139,3 +139,36 @@ test('the talking-head route answers an account failure in its own words', async
   assert.match(src, /Nothing was charged and nothing was lost/,
     'a producer reading this should know the shot is fine and the account is empty');
 });
+
+// 22 Aug 2026. The first fal call that got past billing died on validation:
+//   fal result 422: url_too_long, body.image_url,
+//   "URL should have at most 2083 characters"
+// fal's docs do say the runner decodes data: URIs, and that is true of the
+// runner. The model's request schema validates first and declares image_url
+// as a URL with the browser 2083-character cap, so a 1.4MB base64 frame never
+// reaches a runner at all. Both inputs go through fal's own storage now.
+test('the adapter uploads real files rather than inlining base64', async () => {
+  const src = await readFile(new URL('../src/adapters/index.mjs', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('export const falTalkingHead'));
+  const body = fn.slice(0, fn.indexOf('\n};'));
+  assert.doesNotMatch(body, /image_url: `data:/,
+    'a base64 data URI on image_url is rejected by the model schema before any runner sees it');
+  assert.doesNotMatch(body, /audio_url: `data:/);
+  assert.match(body, /image_url: imageUrl/);
+  assert.match(body, /audio_url: audioUrl/);
+  assert.match(body, /falUpload\(/);
+});
+
+test('the upload follows fal\'s own two-step presigned flow', async () => {
+  const src = await readFile(new URL('../src/adapters/index.mjs', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('async function falUpload'));
+  const body = fn.slice(0, fn.indexOf('\n}\n'));
+  assert.match(body, /storage\/upload\/initiate\?storage_type=fal-cdn-v3/);
+  assert.match(body, /content_type: contentType, file_name: fileName/);
+  assert.match(body, /upload_url: uploadUrl, file_url: fileUrl/);
+  assert.match(body, /method: 'PUT'/);
+  const putCall = body.slice(body.indexOf("method: 'PUT'"));
+  assert.doesNotMatch(putCall.slice(0, 200), /Authorization/,
+    'the PUT target is presigned; sending a key with it is wrong and some backends reject it');
+  assert.match(src, /const FAL_REST = 'https:\/\/rest\.fal\.ai'/);
+});

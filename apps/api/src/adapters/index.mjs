@@ -335,6 +335,32 @@ async function falPoll(model, requestId, key) {
   throw new Error('fal generation timed out after 10 minutes');
 }
 
+// fal's file upload, two steps, taken from @fal-ai/client's own storage.js
+// rather than guessed: POST the content type and file name to get a presigned
+// PUT target plus the URL the file will live at, PUT the bytes there with no
+// auth header (the signature carries it), then hand the file_url to the model.
+const FAL_REST = 'https://rest.fal.ai';
+
+async function falUpload(bytes, contentType, fileName, apiKey) {
+  const init = await fetch(`${FAL_REST}/storage/upload/initiate?storage_type=fal-cdn-v3`, {
+    method: 'POST',
+    headers: { Authorization: `Key ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content_type: contentType, file_name: fileName }),
+  });
+  if (!init.ok) {
+    throw new Error(`fal upload initiate ${init.status}: ${(await init.text().catch(() => '')).slice(0, 300)}`);
+  }
+  const { upload_url: uploadUrl, file_url: fileUrl } = await init.json();
+  if (!uploadUrl || !fileUrl) throw new Error('fal upload initiate returned no upload_url/file_url');
+  const put = await fetch(uploadUrl, {
+    method: 'PUT', body: bytes, headers: { 'Content-Type': contentType },
+  });
+  if (!put.ok) {
+    throw new Error(`fal upload PUT ${put.status}: ${(await put.text().catch(() => '')).slice(0, 300)}`);
+  }
+  return fileUrl;
+}
+
 export const falTalkingHead = {
   async imageAudioToVideo({ referenceImageKey, audioKey, assetId, resolution, model }) {
     if (MOCK()) {
@@ -344,14 +370,24 @@ export const falTalkingHead = {
     }
     const apiKey = need('FAL_API_KEY');
     const useModel = model || cred('FAL_TALKING_HEAD_MODEL') || FAL_TALKING_HEAD_DEFAULT;
-    const img = readFileSync(storage.localPath(referenceImageKey)).toString('base64');
-    const audio = readFileSync(storage.localPath(audioKey)).toString('base64');
+    // Real files, not data URIs (22 Aug 2026). fal's own docs say the runner
+    // decodes `data:` URIs, and that is true of the runner -- but the model's
+    // request schema validates first, and it declares image_url as a URL with
+    // the 2083-character cap browsers use. A 1.4MB base64 frame fails
+    // validation long before any runner sees it:
+    //   fal result 422: url_too_long, body.image_url,
+    //   "URL should have at most 2083 characters"
+    // So both inputs go through fal's own storage first and travel as URLs.
+    const [imageUrl, audioUrl] = await Promise.all([
+      falUpload(readFileSync(storage.localPath(referenceImageKey)), 'image/png', 'first-frame.png', apiKey),
+      falUpload(readFileSync(storage.localPath(audioKey)), 'audio/mpeg', 'narration.mp3', apiKey),
+    ]);
     const res = await fetch(`${FAL_QUEUE}/${useModel}`, {
       method: 'POST',
       headers: { Authorization: `Key ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        image_url: `data:image/png;base64,${img}`,
-        audio_url: `data:audio/mpeg;base64,${audio}`,
+        image_url: imageUrl,
+        audio_url: audioUrl,
         resolution: resolution || '720p',
       }),
     });

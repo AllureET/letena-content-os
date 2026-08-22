@@ -96,3 +96,60 @@ test('Amharic draws no pixels without the font, and real pixels with it', async 
   assert.ok(after.bytes > before.bytes,
     `a card with glyphs must be a bigger PNG than one with none (before ${before.bytes}, after ${after.bytes})`);
 });
+
+// Round two, 22 Aug 2026. The first fix wrote into the service user's home and
+// production answered:
+//   could not install Noto Sans Ethiopic: EACCES: permission denied,
+//   mkdir '/home/lcossvc/.local'
+// The account has no writable home. healthz reported it rather than the cards
+// failing silently again, which is the only reason this was caught in one pass.
+test('installation falls back through writable locations instead of assuming a home', async () => {
+  const src = await readFile(new URL('../src/modules/studio_overlays.mjs', import.meta.url), 'utf8');
+  const fn = src.slice(src.indexOf('export function ensureEthiopicFontsInstalled'));
+  const body = fn.slice(0, fn.indexOf('\n  return _fontInstall;'));
+  assert.match(body, /LCOS_FONT_DIR/, 'an explicit override has to win');
+  assert.match(body, /LCOS_STORAGE_DIR/, 'the storage dir is somewhere this process demonstrably writes');
+  assert.match(body, /tmpdir\(\)/, 'and temp as the last resort');
+  assert.doesNotMatch(body, /homedir\(\)/,
+    'the service account has no writable home; assuming one is what broke it');
+});
+
+test('the generated config INCLUDES the system one, so Latin does not disappear', async () => {
+  const src = await readFile(new URL('../src/modules/studio_overlays.mjs', import.meta.url), 'utf8');
+  assert.match(src, /include ignore_missing="yes">\/etc\/fonts\/fonts\.conf/,
+    'pointing FONTCONFIG_FILE at a bare config makes ours the only font dir on the machine: '
+    + 'Amharic starts drawing and every Latin glyph stops');
+});
+
+test('the whole font stack renders BOTH scripts under the generated config', async () => {
+  const { mkdtemp, mkdir, writeFile, copyFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const base = await mkdtemp(join(tmpdir(), 'lcos-fc-'));
+  const fontsDir = join(base, 'ttf'), cacheDir = join(base, 'cache');
+  await mkdir(fontsDir, { recursive: true }); await mkdir(cacheDir, { recursive: true });
+  for (const [src, dst] of [['NotoSansEthiopic-Bold.ttf', 'b.ttf'], ['NotoSansEthiopic-Regular.ttf', 'r.ttf']]) {
+    await copyFile(new URL(`../assets/fonts/${src}`, import.meta.url), join(fontsDir, dst));
+  }
+  const conf = join(base, 'fonts.conf');
+  await writeFile(conf, '<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd"><fontconfig>'
+    + '<include ignore_missing="yes">/etc/fonts/fonts.conf</include>'
+    + `<dir>${fontsDir}</dir><cachedir>${cacheDir}</cachedir></fontconfig>`, 'utf8');
+  const env = { ...process.env, FONTCONFIG_FILE: conf };
+  await run('fc-cache', ['-f', fontsDir], { env });
+
+  const svg = join(base, 'both.svg');
+  await writeFile(svg, `<svg xmlns="http://www.w3.org/2000/svg" width="700" height="140">`
+    + `<rect width="700" height="140" fill="#16103F"/>`
+    + `<text x="20" y="60" font-family="'${ETHIOPIC_FAMILY}', sans-serif" font-size="42" fill="#FDF8F0">ጥያቄ አለሽ</text>`
+    + `<text x="20" y="115" font-family="sans-serif" font-size="42" fill="#EBAB20">Letena Ethiopia</text></svg>`, 'utf8');
+  const out = join(base, 'both.png');
+  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', svg, out], { env });
+
+  const { stdout } = await run('fc-list', [], { env, maxBuffer: 8 * 1024 * 1024 });
+  assert.match(stdout, /ethiopic/i, 'our directory must be visible');
+  assert.ok(stdout.split('\n').length > 50,
+    'and the system families must still be visible alongside it, or Latin breaks');
+  const png = await readFile(out);
+  assert.ok(png.length > 2000, 'a frame with two lines of real text should not be a near-empty PNG');
+});

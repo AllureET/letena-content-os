@@ -640,38 +640,68 @@ let _fontInstall = null;
 export function ensureEthiopicFontsInstalled() {
   if (_fontInstall) return _fontInstall;
   _fontInstall = (async () => {
-    const { mkdir, copyFile, readFile: rf } = await import('node:fs/promises');
+    const { mkdir, copyFile, writeFile, readFile: rf } = await import('node:fs/promises');
     const { execFile } = await import('node:child_process');
     const { promisify } = await import('node:util');
-    const { homedir } = await import('node:os');
-    const { join, dirname } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
     const { fileURLToPath } = await import('node:url');
     const run = promisify(execFile);
     const srcDir = fileURLToPath(new URL('../../assets/fonts/', import.meta.url));
-    const destDir = process.env.LCOS_FONT_DIR
-      || join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'fonts');
-    try {
-      await mkdir(destDir, { recursive: true });
-      for (const f of FONT_FILES) {
-        // Copy only when the bytes differ, so a restart is not a rewrite.
-        let same = false;
-        try {
-          const [a, b] = await Promise.all([rf(join(srcDir, f)), rf(join(destDir, f))]);
-          same = a.equals(b);
-        } catch { same = false; }
-        if (!same) await copyFile(join(srcDir, f), join(destDir, f));
-      }
-      await run('fc-cache', ['-f', destDir]);
-      const { stdout } = await run('fc-list', [], { maxBuffer: 8 * 1024 * 1024 });
-      const ok = /ethiopic/i.test(stdout);
-      return { ok, destDir,
-        note: ok ? `${ETHIOPIC_FAMILY} is visible to fontconfig`
-                 : `fc-cache ran but fontconfig still cannot see ${ETHIOPIC_FAMILY}; Amharic will render as empty boxes` };
-    } catch (e) {
-      // Never fatal. A card with tofu in it is bad; a server that will not
-      // start because it could not write a font file is worse.
-      return { ok: false, destDir, note: `could not install ${ETHIOPIC_FAMILY}: ${e.message}` };
+
+    // Where to put them, in order of preference. The first attempt used the
+    // service user's home and failed in production with EACCES on
+    // /home/lcossvc/.local -- the account has no writable home at all. So the
+    // candidates are places this process is already known to write: an
+    // explicit override, the storage directory it saves media into all day,
+    // then the system temp directory. First one that works wins.
+    const candidates = [
+      process.env.LCOS_FONT_DIR,
+      join(process.env.LCOS_STORAGE_DIR || '/tmp/lcos-storage', 'fonts'),
+      join(tmpdir(), 'lcos-fonts'),
+    ].filter(Boolean);
+
+    let lastError = null;
+    for (const base of candidates) {
+      try {
+        const fontsDir = join(base, 'ttf');
+        const cacheDir = join(base, 'cache');
+        await mkdir(fontsDir, { recursive: true });
+        await mkdir(cacheDir, { recursive: true });
+        for (const f of FONT_FILES) {
+          let same = false;
+          try {
+            const [a, b] = await Promise.all([rf(join(srcDir, f)), rf(join(fontsDir, f))]);
+            same = a.equals(b);
+          } catch { same = false; }
+          if (!same) await copyFile(join(srcDir, f), join(fontsDir, f));
+        }
+        // The config INCLUDES the system one rather than replacing it. Pointing
+        // FONTCONFIG_FILE at a bare config would make this the only font
+        // directory on the machine, so Amharic would start drawing and every
+        // Latin glyph would stop.
+        const confPath = join(base, 'fonts.conf');
+        await writeFile(confPath,
+          '<?xml version="1.0"?><!DOCTYPE fontconfig SYSTEM "fonts.dtd"><fontconfig>'
+          + '<include ignore_missing="yes">/etc/fonts/fonts.conf</include>'
+          + `<dir>${fontsDir}</dir><cachedir>${cacheDir}</cachedir></fontconfig>`, 'utf8');
+
+        const env = { ...process.env, FONTCONFIG_FILE: confPath };
+        await run('fc-cache', ['-f', fontsDir], { env });
+        const { stdout } = await run('fc-list', [], { env, maxBuffer: 8 * 1024 * 1024 });
+        if (!/ethiopic/i.test(stdout)) { lastError = `fc-cache ran under ${base} but fontconfig still cannot see the font`; continue; }
+
+        // Every ffmpeg call is a child of this process, so setting it here is
+        // what actually reaches the renderer.
+        process.env.FONTCONFIG_FILE = confPath;
+        return { ok: true, destDir: fontsDir, confPath,
+          note: `${ETHIOPIC_FAMILY} is visible to fontconfig via ${confPath}` };
+      } catch (e) { lastError = `${base}: ${e.message}`; }
     }
+    // Never fatal. A card with tofu in it is bad; a server that will not start
+    // because it could not write a font file is worse.
+    return { ok: false, destDir: null,
+      note: `could not install ${ETHIOPIC_FAMILY} anywhere writable: ${lastError ?? 'no candidate directories'}` };
   })();
   return _fontInstall;
 }

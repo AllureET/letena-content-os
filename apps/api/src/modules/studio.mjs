@@ -51,7 +51,7 @@ import { promisify } from 'node:util';
 import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { q, one, audit, requirePerm, err } from '../core.mjs';
-import { storage, videoEngine, gemini, suno, azureSpeech } from '../adapters/index.mjs';
+import { storage, videoEngine, talkingHeadEngine, gemini, suno, azureSpeech } from '../adapters/index.mjs';
 import { cred } from '../creds.mjs';
 import { invokeAgent } from '../ai/gateway.mjs';
 import { formatOf } from '../formats.mjs';
@@ -102,6 +102,7 @@ const ESTIMATED_COST_USD = {
   AZURE_TTS_PER_CHAR: 0.000016,  // Azure neural TTS, per character of input text
   GEMINI_REMIX_IMAGE: 0.04,      // Gemini image-edit on an existing reference/keyframe, flat per remix
   GEMINI_SHEET_SPLIT: 0.01,      // one vision read of a reference sheet to find its individual pictures
+  TALKING_HEAD_PER_S: 0.08,      // fal talking head, per second of narration (estimate; the adapter reports real cost when it has one)
 };
 
 // ===========================================================================
@@ -921,6 +922,72 @@ function buildCrossfadeAudioGraph(clipCount, transitionDurationS) {
 // precise than a true dynamic duck tied to when dialogue actually speaks,
 // but honest about what this function actually knows, and it never risks
 // drowning out dialogue that exists somewhere in a timeline it cannot see.
+// Lay the per-shot voiceover onto the assembled picture (22 Aug 2026).
+//
+// This did not exist. The studio generated Azure Amharic narration for every
+// shot, stored it, showed it in the asset list, and then assembled a silent
+// video with music over it. The `hasVoice` flag above made it worse by
+// looking right: assembly checked that voice assets existed and ducked the
+// music by 93 percent to make room for a voice it never added, so the
+// finished cut was quiet AND wordless. The owner's verdict on the first real
+// run was exact: "there is no voice over audio but the music is nice".
+//
+// Placement is SEQUENTIAL, not per-shot-offset. Narration is one continuous
+// read broken across shots, and real Amharic lines do not land inside a flat
+// five seconds: on this script they ran from 2.8 to 6.9 seconds against
+// 5-second shots. Anchoring each line to its shot's start makes a long line
+// collide with the next one, and trimming to fit cuts a clinical sentence in
+// half. Playing them back to back keeps every word intact and in order.
+//
+// If the narration outlasts the picture, the picture is extended by holding
+// the last frame rather than the words being cut. That is a normal editorial
+// move and it is the honest one: losing the CTA is a worse outcome than a
+// held frame. The overrun is reported so the producer can lengthen a shot
+// (Runway renders 5 or 10 seconds) instead of living with the hold.
+export async function layVoiceOntoVideo({ workDir, videoPath, voiceTracks }) {
+  if (!voiceTracks.length) return { path: videoPath, voiceEnd: 0, heldS: 0 };
+  const videoInfo = await probeClip(videoPath);
+
+  const starts = [];
+  let cursor = 0;
+  for (const track of voiceTracks) {
+    starts.push(cursor);
+    cursor += track.durationS;
+  }
+  const voiceEnd = cursor;
+  const heldS = Math.max(0, voiceEnd - videoInfo.durationS);
+
+  const inputs = ['-i', videoPath];
+  for (const track of voiceTracks) inputs.push('-i', track.path);
+
+  const filters = [];
+  const labels = [];
+  voiceTracks.forEach((track, i) => {
+    const ms = Math.round(starts[i] * 1000);
+    filters.push(`[${i + 1}:a]adelay=${ms}|${ms}[v${i}]`);
+    labels.push(`[v${i}]`);
+  });
+  // normalize=0 keeps each line at the level Azure produced it. With
+  // normalize on, ffmpeg divides by the input count and six lines of
+  // narration come out at a sixth of their volume, which is the same
+  // inaudible-voice failure by a different route.
+  filters.push(`${labels.join('')}amix=inputs=${labels.length}:normalize=0:duration=longest[voice]`);
+
+  // Hold the last frame when the read outlasts the picture. tpad clones the
+  // final frame, so nothing stutters and no clip is re-encoded twice.
+  const videoChain = heldS > 0.05
+    ? `[0:v]tpad=stop_mode=clone:stop_duration=${heldS.toFixed(3)}[vout]`
+    : null;
+  if (videoChain) filters.push(videoChain);
+
+  const outPath = join(workDir, 'assembled-with-voice.mp4');
+  const args = ['-y', ...inputs, '-filter_complex', filters.join(';'),
+    '-map', videoChain ? '[vout]' : '0:v', '-map', '[voice]',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', outPath];
+  await execFileP('ffmpeg', args);
+  return { path: outPath, voiceEnd, heldS };
+}
+
 async function mixMusicOntoVideo({ workDir, videoPath, musicAsset, hasVoice }) {
   const videoInfo = await probeClip(videoPath);
   const musicVolume = hasVoice ? 0.07 : 0.126;
@@ -1569,6 +1636,7 @@ export default async function routes(app) {
     await bridgeAssetToLibrary({ asset, kindHint: lock.entity_type,
       title: `${lock.entity_code} reference — ${project.title}`, actorId: req.actor?.id });
     await spendBudget(project.id, resolveSpendAmount(gen, estimatedCost));
+
     return { ...asset, ...(budget.warning ? { budget_warning: budget.warning } : {}) };
   });
 
@@ -2217,10 +2285,17 @@ export default async function routes(app) {
     // and did not. The advice that guard gives -- regenerate the later
     // shot's first frame first -- only works if doing so actually clears
     // the link.
+    // mode_preference is only forced to image_to_video for a shot that has no
+    // opinion yet. talking_head ALSO composes a first frame -- the frame is
+    // what gets animated by the narration -- so overwriting it here silently
+    // demoted a lip-synced shot back to a Runway one, and the only symptom
+    // was a shot generating through the wrong engine with no complaint.
+    const nextMode = shot.generation?.mode_preference === 'talking_head'
+      ? 'talking_head' : 'image_to_video';
     await q(`UPDATE studio.shots
              SET generation = (generation - 'continued_from_shot_id') || $2::jsonb, updated_at=now()
              WHERE id=$1`,
-      [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: 'image_to_video' })]);
+      [shot.id, JSON.stringify({ first_frame_asset_id: asset.id, mode_preference: nextMode })]);
 
     await bridgeAssetToLibrary({ asset, kindHint: null,
       title: `${shot.shot_code} first frame — ${project.title}`, actorId: req.actor?.id });
@@ -2364,6 +2439,87 @@ export default async function routes(app) {
     const negative = negativePromptFor(locks);
     const mode = shot.generation?.mode_preference ?? 'text_to_video';
 
+    // The talking-head path: the picture is driven BY the narration, so the
+    // presenter's mouth matches the words (22 Aug 2026). It needs both a
+    // composed first frame and a generated voice line, and it returns a clip
+    // that already carries its own synced audio -- which assembly has to know
+    // about, or it lays the same narration down a second time.
+    if (mode === 'talking_head') {
+      const frame = shot.generation?.first_frame_asset_id
+        ? await one(`SELECT storage_key FROM studio.assets WHERE id=$1`, [shot.generation.first_frame_asset_id])
+        : null;
+      if (!frame) {
+        return reply.code(422).send(err(422, 'VALIDATION',
+          'talking_head needs a composed first frame: run compose-first-frame on this shot first'));
+      }
+      const voice = await one(
+        `SELECT * FROM studio.assets WHERE shot_id=$1 AND kind='VOICE' AND storage_key IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1`, [shot.id]);
+      if (!voice) {
+        return reply.code(422).send(err(422, 'GUARD_FAILED',
+          'talking_head needs this shot\'s narration first -- the whole point of this mode is that the voice drives the picture. Run POST /studio/shots/:shotId/voice, then generate.',
+          { guard: 'talkingHeadNeedsVoice' }));
+      }
+      let narrationS = Number(shot.duration_target_s) || 5;
+      try { narrationS = (await probeClip(storage.localPath(voice.storage_key))).durationS || narrationS; } catch { /* keep the shot's own figure */ }
+
+      const thEstimate = ESTIMATED_COST_USD.TALKING_HEAD_PER_S * narrationS;
+      let thBudget;
+      try {
+        thBudget = await checkAndSpendBudget(project, thEstimate, req.actor, req.body?.override_budget === true);
+      } catch (e) {
+        if (!(e instanceof BudgetExceededError)) throw e;
+        return reply.code(422).send(err(422, 'BUDGET_EXCEEDED', e.message));
+      }
+      await q(`UPDATE studio.shots SET status='GENERATING', updated_at=now() WHERE id=$1`, [shot.id]);
+      const thAssetId = crypto.randomUUID();
+      let gen;
+      try {
+        gen = await talkingHeadEngine(cred('TALKING_HEAD_ENGINE')).imageAudioToVideo({
+          referenceImageKey: frame.storage_key, audioKey: voice.storage_key,
+          assetId: thAssetId, resolution: '720p',
+        });
+      } catch (e) {
+        await q(`UPDATE studio.shots SET status='DRAFT', updated_at=now() WHERE id=$1`, [shot.id]);
+        await q(`INSERT INTO studio.events (project_id, actor_id, note) VALUES ($1,$2,$3)`,
+          [project.id, req.actor?.id ?? null, `talking-head generate FAILED: ${e.message}`]);
+        return reply.code(502).send(err(502, 'GENERATION_FAILED', e.message));
+      }
+      const thAsset = await one(
+        `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, prompt_job_code, settings, cost_usd)
+         VALUES ($1,$2,$3,'VIDEO','GENERATED',$4,$5,$6,$7,$8) RETURNING *`,
+        [thAssetId, project.id, shot.id, gen.storage_key,
+         JSON.stringify({ provider: 'FAL', mode: 'talking_head', provider_job_id: gen.provider_job_id,
+           driven_by_voice_asset_id: voice.id, carries_own_audio: true }),
+         code('JOB'), JSON.stringify({ narration_s: Number(narrationS.toFixed(2)) }),
+         gen.cost_usd ?? null]);
+      await spendBudget(project.id, resolveSpendAmount(gen, thEstimate));
+      // Same QC the Runway path runs, with the shot's duration taken from the
+      // narration rather than from the five-second box it used to sit in.
+      const thLocal = storage.localPath(gen.storage_key);
+      const thTechnical = await technicalQc(thLocal,
+        { kind: 'VIDEO', duration_target_s: Number(narrationS.toFixed(2)), aspect_ratio: project.aspect_ratio });
+      const thRefIds = locks.flatMap(l => l.reference_asset_ids ?? []);
+      const thRefRows = thRefIds.length
+        ? (await q(`SELECT id, storage_key FROM studio.assets WHERE id = ANY($1)`, [thRefIds])).rows : [];
+      const thContinuity = await continuityQc(thLocal, thRefRows, locks.flatMap(l => l.data?.forbidden_drift ?? []));
+      const thDisposition = worseDisposition(thTechnical.disposition, thContinuity.disposition);
+      await q(`INSERT INTO studio.qc_reports (asset_id, disposition, technical, continuity, issues)
+               VALUES ($1,$2,$3,$4,$5)`,
+        [thAsset.id, thDisposition, JSON.stringify(thTechnical.report), JSON.stringify(thContinuity.report),
+         JSON.stringify([...(thTechnical.report.issues ?? []), thContinuity.report.notes].filter(Boolean))]);
+      const thStatus = { PASS: 'QC_PASS', PASS_WITH_NOTES: 'QC_PASS_WITH_NOTES',
+        REWORK: 'QC_REWORK', BLOCKED: 'QC_BLOCKED' }[thDisposition];
+      await q(`UPDATE studio.assets SET status=$2 WHERE id=$1`, [thAsset.id, thStatus]);
+      await q(`UPDATE studio.shots SET status='NEEDS_REVIEW', updated_at=now() WHERE id=$1`, [shot.id]);
+      await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
+        [project.id, req.actor?.id ?? null, `shots/${shot.shot_code}`,
+         `generated ${shot.shot_code} as a talking head driven by its own narration (${narrationS.toFixed(2)}s)`]);
+      return { asset: { ...thAsset, status: thStatus },
+        qc: thTechnical.report, narration_s: Number(narrationS.toFixed(2)),
+        ...(thBudget?.warning ? { budget_warning: thBudget.warning } : {}) };
+    }
+
     let firstFrame = null;
     if (mode === 'image_to_video') {
       firstFrame = shot.generation?.first_frame_asset_id
@@ -2487,7 +2643,28 @@ export default async function routes(app) {
       [assetId, shot.project_id, shot.id, gen.storage_key,
        JSON.stringify({ provider: 'AZURE' }), JSON.stringify({ text })]);
     await spendBudget(project.id, resolveSpendAmount(gen, estimatedCost));
-    return { ...asset, ...(budget.warning ? { budget_warning: budget.warning } : {}) };
+    // The line sets the length of the shot (22 Aug 2026). Shots were five
+    // seconds because that is what Runway sells, and the real Amharic lines
+    // on the first script ran from 2.8 to 6.9 seconds against that box, so
+    // every shot either cut a clinical sentence short or sat in silence. Now
+    // that narration is generated before the picture, the read is the
+    // authority and the picture is cut to it.
+    //
+    // Only while the shot is still open. A shot with accepted work has a
+    // rendered clip at its current length, and quietly changing the number
+    // underneath it would misdescribe a video that already exists.
+    let durationS = null;
+    if (['DRAFT', 'STALE'].includes(shot.status)) {
+      try {
+        durationS = (await probeClip(storage.localPath(gen.storage_key))).durationS;
+        if (durationS > 0) {
+          await q(`UPDATE studio.shots SET duration_target_s=$2, updated_at=now() WHERE id=$1`,
+            [shot.id, Number(durationS.toFixed(2))]);
+        }
+      } catch { durationS = null; }
+    }
+    return { ...asset, narration_s: durationS ? Number(durationS.toFixed(2)) : null,
+      ...(budget.warning ? { budget_warning: budget.warning } : {}) };
   });
 
   // Project-level music bed (playbook 16.2). Not attached to a single
@@ -3018,12 +3195,32 @@ export default async function routes(app) {
 
     const workDir = storage.localPath(`studio/${p.code}/final`);
     await mkdir(workDir, { recursive: true });
-    // Only resolved once, and only when a music layer was actually
-    // requested, since it needs its own studio.assets query.
-    const hasVoice = musicAsset
-      ? (await one(`SELECT 1 AS x FROM studio.assets WHERE project_id=$1 AND kind='VOICE' AND shot_id = ANY($2) LIMIT 1`,
-          [p.id, shots.map(s => s.id)])) != null
-      : false;
+    // The per-shot narration, in shot order. Resolved unconditionally now
+    // that assembly actually lays it onto the picture; the newest VOICE
+    // asset per shot wins, matching the newest-wins rule everywhere else.
+    const voiceTracks = [];
+    for (const shot of shots) {
+      const va = await one(
+        `SELECT * FROM studio.assets WHERE shot_id=$1 AND kind='VOICE' AND storage_key IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1`, [shot.id]);
+      if (!va) continue;
+      const localPath = storage.localPath(va.storage_key);
+      let durationS = 0;
+      try { durationS = (await probeClip(localPath)).durationS; } catch { durationS = 0; }
+      // A talking-head clip already carries its own lip-synced narration, so
+      // laying the same line over it again would play it twice, a fraction of
+      // a second apart. Checked against the picture rather than the shot's
+      // settings: what matters is whether the accepted file has audio in it.
+      const acceptedClip = assets.find(a => a.shot_id === shot.id);
+      let clipHasAudio = false;
+      if (acceptedClip) {
+        try { clipHasAudio = (await probeClip(storage.localPath(acceptedClip.storage_key))).hasAudio === true; }
+        catch { clipHasAudio = false; }
+      }
+      if (clipHasAudio) continue;
+      if (durationS > 0) voiceTracks.push({ shotCode: shot.shot_code, path: localPath, durationS });
+    }
+    const hasVoice = voiceTracks.length > 0;
 
     let outPath;
     if (transition === 'cut') {
@@ -3099,6 +3296,27 @@ export default async function routes(app) {
     }
 
     let finalLocalPath = outPath;
+    // Voice first, music second: the music pass reads the video's existing
+    // audio and ducks under it, so the narration has to be there before it
+    // runs or the ducking has nothing to duck for.
+    let voiceReport = null;
+    if (voiceTracks.length) {
+      try {
+        const laid = await layVoiceOntoVideo({ workDir, videoPath: outPath, voiceTracks });
+        outPath = laid.path;
+        voiceReport = {
+          lines: voiceTracks.length,
+          narration_s: Number(laid.voiceEnd.toFixed(2)),
+          held_last_frame_s: Number(laid.heldS.toFixed(2)),
+        };
+      } catch (e) {
+        // A failed voice pass must not lose the picture. The cut still
+        // assembles, silent, and says so rather than returning a video that
+        // looks finished and is not.
+        voiceReport = { lines: voiceTracks.length, error: String(e.message).slice(0, 300) };
+      }
+    }
+
     if (musicAsset) {
       // Second pass, deliberately kept separate from whichever ffmpeg call
       // produced outPath above, so the no-music invocations above stay
@@ -3159,7 +3377,7 @@ export default async function routes(app) {
       [p.id, finalAsset.id]);
     await q(`INSERT INTO studio.events (project_id, actor_id, artifact, note) VALUES ($1,$2,$3,$4)`,
       [p.id, req.actor?.id ?? null, finalAsset.id,
-       `assembled ${shots.length} shots into final cut (transition=${transition}${musicAsset ? `, music=${musicAsset.id}` : ''}${approvedOverlays.length ? `, overlays=${approvedOverlays.length}` : ''})`]);
-    return finalAsset;
+       `assembled ${shots.length} shots into final cut (transition=${transition}${musicAsset ? `, music=${musicAsset.id}` : ''}${approvedOverlays.length ? `, overlays=${approvedOverlays.length}` : ''}${voiceReport ? `, voice=${voiceReport.error ? 'FAILED' : `${voiceReport.lines} lines / ${voiceReport.narration_s}s`}` : ', voice=none'})`]);
+    return { ...finalAsset, voice: voiceReport };
   });
 }

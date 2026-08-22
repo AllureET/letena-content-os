@@ -282,6 +282,111 @@ export const runway = {
   },
 };
 
+// ---------- talking head: a picture driven BY the narration ----------
+//
+// 22 Aug 2026, owner: "if the audio is made after the video, doesnt that mean
+// there is no chance for lipsyncing? is that possible at all?"
+//
+// It was the sharpest question asked of this pipeline. The answer was no, and
+// the reason was the order: script, then picture, then voice. Runway invents a
+// mouth before the words exist, so the presenter mouths nothing in particular
+// and no amount of prompt tuning can fix it, because the information is not
+// there when the mouth is drawn.
+//
+// This is the other order. Given the shot's composed first frame and the shot's
+// generated narration, the engine animates that face speaking those words. It
+// happens to fix two other things at once: the room cannot drift between shots,
+// because the model animates a fixed frame instead of regenerating the scene,
+// and a shot is no longer forced into Runway's five-or-ten-second box, because
+// the clip is exactly as long as the line.
+//
+// Runway is deliberately not the provider here. Its developer API has no
+// audio-driven endpoint: Act-Two needs a driving performance video of a real
+// person acting, not an audio file, and the Add Dialogue tool is an app feature
+// that the API does not expose. Checked, not assumed.
+//
+// Files go as base64 data URIs, which fal documents as an accepted input
+// alongside public URLs. That matters for more than convenience: the
+// alternative was handing a third party an LCOS media URL with a session token
+// embedded in it.
+const FAL_QUEUE = 'https://queue.fal.run';
+const FAL_TALKING_HEAD_DEFAULT = 'veed/fabric-1.0';
+
+async function falPoll(model, requestId, key) {
+  // Same shape of ceiling as runwayPoll, and for the same reason: a stuck job
+  // should surface as a clear error rather than hang the caller forever.
+  const deadline = Date.now() + 10 * 60 * 1000;
+  let delayMs = 5000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    delayMs = Math.min(delayMs * 1.3, 20000);
+    const res = await fetch(`${FAL_QUEUE}/${model}/requests/${requestId}/status`, {
+      headers: { Authorization: `Key ${key}` },
+    });
+    if (!res.ok) {
+      throw new Error(`fal status ${res.status}: ${(await res.text().catch(() => '')).slice(0, 300)}`);
+    }
+    const s = await res.json();
+    if (s.status === 'COMPLETED') return;
+    if (s.status === 'FAILED' || s.status === 'ERROR') {
+      throw new Error(`fal ${s.status}: ${JSON.stringify(s).slice(0, 300)}`);
+    }
+  }
+  throw new Error('fal generation timed out after 10 minutes');
+}
+
+export const falTalkingHead = {
+  async imageAudioToVideo({ referenceImageKey, audioKey, assetId, resolution, model }) {
+    if (MOCK()) {
+      const key = `assets/generated/${assetId}/talking-head.mp4`;
+      await storage.put(key, Buffer.from(`MOCK-TALKING-HEAD img=${referenceImageKey} audio=${audioKey}`));
+      return { status: 'SUCCEEDED', storage_key: key, provider_job_id: `mock-fal-${assetId.slice(0, 8)}`, cost_usd: 0 };
+    }
+    const apiKey = need('FAL_API_KEY');
+    const useModel = model || cred('FAL_TALKING_HEAD_MODEL') || FAL_TALKING_HEAD_DEFAULT;
+    const img = readFileSync(storage.localPath(referenceImageKey)).toString('base64');
+    const audio = readFileSync(storage.localPath(audioKey)).toString('base64');
+    const res = await fetch(`${FAL_QUEUE}/${useModel}`, {
+      method: 'POST',
+      headers: { Authorization: `Key ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_url: `data:image/png;base64,${img}`,
+        audio_url: `data:audio/mpeg;base64,${audio}`,
+        resolution: resolution || '720p',
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`fal submit ${res.status}: ${(await res.text().catch(() => '')).slice(0, 400)}`);
+    }
+    const { request_id: requestId } = await res.json();
+    if (!requestId) throw new Error('fal accepted the job but returned no request_id');
+    await falPoll(useModel, requestId, apiKey);
+    const out = await fetch(`${FAL_QUEUE}/${useModel}/requests/${requestId}`, {
+      headers: { Authorization: `Key ${apiKey}` },
+    });
+    if (!out.ok) throw new Error(`fal result ${out.status}: ${(await out.text().catch(() => '')).slice(0, 300)}`);
+    const d = await out.json();
+    // The raw queue endpoint returns the model output at the top level; the
+    // JS client wraps it in `data`. Accept either rather than depending on
+    // which shape a given model or client version hands back.
+    const url = d?.video?.url ?? d?.data?.video?.url;
+    if (!url) throw new Error(`fal returned no video url: ${JSON.stringify(d).slice(0, 300)}`);
+    const dl = await fetch(url);
+    if (!dl.ok) throw new Error(`fal output download failed: ${dl.status}`);
+    const storageKey = `assets/generated/${assetId}/talking-head.mp4`;
+    await storage.put(storageKey, Buffer.from(await dl.arrayBuffer()));
+    return { status: 'SUCCEEDED', storage_key: storageKey, provider_job_id: requestId, cost_usd: null };
+  },
+};
+
+// The talking-head slot, same shape as videoEngine below: one configuration
+// read, never a hard-wired import, so a second provider is a setting.
+export function talkingHeadEngine(name) {
+  const n = String(name ?? '').toUpperCase();
+  if (n === 'FAL' || n === '') return falTalkingHead;
+  return falTalkingHead;
+}
+
 // The video engine slot. Everything that generates video asks this, so the
 // vendor is one configuration read, never a hard-wired import. RUNWAY is
 // the default (21 Aug 2026): it is the only one of the three with a real

@@ -4624,8 +4624,31 @@ document.addEventListener('click', async (e) => {
       toast('Overlay created'); return render();
     }
     if (b.dataset.stoverlayeditshow) {
-      const box = document.getElementById('stoveditrow-' + b.dataset.stoverlayeditshow);
-      if (box) box.hidden = !box.hidden;
+      const id = b.dataset.stoverlayeditshow;
+      const box = document.getElementById('stoveditrow-' + id);
+      if (!box) return;
+      box.hidden = !box.hidden;
+      // The icon thumbnail only ever gets filled in by setIconPreview, which
+      // previously ran only inside the "Browse or upload an icon" flow -- so
+      // an overlay that ALREADY had an icon saved just showed an empty box
+      // here until someone clicked Browse once. Resolve it the moment the
+      // edit box opens instead, via the single-asset lookup above, so the
+      // icon that's actually set is what you see, not a blank square.
+      if (!box.hidden) {
+        const suffix = `-${id}`;
+        const assetId = elv(`st-ov-assetid${suffix}`);
+        const preview = document.getElementById(`st-ov-iconpreview${suffix}`);
+        if (assetId && preview && !preview.dataset.resolved) {
+          preview.dataset.resolved = '1';
+          try {
+            const a = await api('GET', `/production/assets/${assetId}`);
+            if (a?.storage_key) setIconPreview(suffix, mediaUrl(a.storage_key));
+          } catch {
+            // asset may have been deleted from the library since this overlay
+            // was set -- leave the box blank rather than erroring the page.
+          }
+        }
+      }
       return;
     }
     if (b.dataset.stoverlaysave) {

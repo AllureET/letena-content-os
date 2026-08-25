@@ -675,6 +675,155 @@ const OVERLAY_KIND_OPTIONS = [
   ['TITLE_CARD', 'Title card'], ['LABEL', 'Label'],
   ['DOOR_CARD', 'Door / CTA card'], ['ICON', 'Icon'],
 ];
+// 'lower-third' and 'bottom' match the two anchors studio_overlays.mjs added
+// 22 Aug 2026 specifically so a card has somewhere to go that clears a
+// vertical talking head's face -- this list had never been updated to
+// actually offer them, so that fix was live on the server but unreachable
+// from this form.
+const OVERLAY_ANCHOR_OPTIONS = [
+  ['upper-third', 'upper third'], ['top', 'top'], ['top-right', 'top right'],
+  ['right-center', 'right centre'], ['center', 'centre'],
+  ['lower-third', 'lower third'], ['bottom', 'bottom'],
+];
+const OVERLAY_ANIM_IN_OPTIONS = [
+  ['fade', 'fade'], ['slide-left', 'slide from left'], ['slide-right', 'slide from right'], ['none', 'none'],
+];
+const OVERLAY_ANIM_OUT_OPTIONS = [['fade', 'fade'], ['none', 'none']];
+
+// The friendly, non-technical half of the overlay form (25 Aug 2026): kind-
+// dependent fillables/dropdowns for text, colours, size, placement and
+// animation, which the click handler below compiles into the overlay's real
+// `data` JSON. Shared by both the "New overlay" card (suffix '', kind
+// defaults to whatever the kind select's own first option is) and each
+// overlay row's "Edit" box (suffix `-<overlayId>`, prefilled from that row's
+// current data) -- one definition, so the two can never drift out of sync
+// the way a copy-pasted second form would. Owner, 21 Aug 2026, about the
+// LOCK form before it got the same treatment: "can the editor be something
+// much simpler which then writes in to the json, its hard to comprehend all
+// that" -- editing overlays deserves the identical fix, not a raw textarea.
+function overlayFormFieldsHtml(suffix, kind, data) {
+  const d = data ?? {};
+  const isDoor = kind === 'DOOR_CARD', isIcon = kind === 'ICON';
+  const firstLine = Array.isArray(d.lines) ? d.lines[0] : null;
+  const doorLines = (Array.isArray(d.lines) ? d.lines.map(l => l?.text ?? '') : []).join('\n');
+  const textColor = d.text_color ?? firstLine?.text_color ?? '#EBAB20';
+  const fontSize = d.font_size_px ?? firstLine?.font_size_px ?? (isDoor ? 64 : kind === 'LABEL' ? 44 : 56);
+  const fontFamily = d.font_family ?? firstLine?.font_family ?? 'bold';
+  const anchor = d.position?.anchor ?? (isIcon ? 'top-right' : 'upper-third');
+  const animIn = d.animation_in?.type ?? 'fade';
+  const animOut = d.animation_out?.type ?? 'fade';
+  return `
+          <div id="st-ov-text-fields${suffix}" ${isDoor || isIcon ? 'hidden' : ''}>
+            <label style="font-size:11px">Text</label>
+            <textarea id="st-ov-text${suffix}" rows="2" placeholder="e.g. የሆርሞን እንክብል ስትወስጂ ደም መፍሰስ?">${esc(d.text ?? '')}</textarea>
+          </div>
+
+          <div id="st-ov-door-fields${suffix}" ${isDoor ? '' : 'hidden'}>
+            <label style="font-size:11px">Door card lines (one per line, biggest first)</label>
+            <textarea id="st-ov-doorlines${suffix}" rows="4" placeholder="DM አርጊን&#10;በነፃ ነው&#10;Link in bio&#10;ለጓደኛሽም ላኪላት">${esc(doorLines)}</textarea>
+            <div class="muted" style="font-size:11px">Each line fades in half a second after the one above it.</div>
+          </div>
+
+          <div id="st-ov-icon-fields${suffix}" ${isIcon ? '' : 'hidden'}>
+            <label style="font-size:11px">Icon asset id</label>
+            <input id="st-ov-assetid${suffix}" value="${esc(d.asset_id ?? '')}" placeholder="paste an ICON asset id from the library">
+            <div class="muted" style="font-size:11px">Upload the icon to the asset library first, as kind ICON.</div>
+          </div>
+
+          <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-style-fields${suffix}" ${isIcon ? 'hidden' : ''}>
+            <div><label style="font-size:11px">Text colour</label><br>
+              <input type="color" id="st-ov-textcolor${suffix}" value="${esc(textColor)}" style="width:56px;height:30px;padding:2px"></div>
+            <div><label style="font-size:11px">Background</label><br>
+              <input type="color" id="st-ov-bgcolor${suffix}" value="${esc(d.background_color ?? '#16103F')}" style="width:56px;height:30px;padding:2px"></div>
+            <div><label style="font-size:11px">Background opacity</label><br>
+              <input type="range" id="st-ov-bgopacity${suffix}" min="0" max="1" step="0.05" value="${esc(String(d.background_opacity ?? 0.9))}" style="width:110px"></div>
+            <div><label style="font-size:11px">Text size (px)</label><br>
+              <input type="number" id="st-ov-fontsize${suffix}" value="${esc(String(fontSize))}" min="12" max="140" style="width:80px"></div>
+            <div><label style="font-size:11px">Weight</label><br>
+              <select id="st-ov-fontfamily${suffix}" style="width:100px">
+                <option value="bold" ${fontFamily === 'bold' ? 'selected' : ''}>bold</option>
+                <option value="regular" ${fontFamily === 'regular' ? 'selected' : ''}>regular</option>
+              </select></div>
+          </div>
+
+          <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-place-fields${suffix}" ${isDoor ? 'hidden' : ''}>
+            <div><label style="font-size:11px">Where on screen</label><br>
+              <select id="st-ov-anchor${suffix}" style="width:140px">
+                ${OVERLAY_ANCHOR_OPTIONS.map(([v, label]) => `<option value="${v}" ${anchor === v ? 'selected' : ''}>${label}</option>`).join('')}
+              </select></div>
+            <div><label style="font-size:11px">Fade in</label><br>
+              <select id="st-ov-animin${suffix}" style="width:120px">
+                ${OVERLAY_ANIM_IN_OPTIONS.map(([v, label]) => `<option value="${v}" ${animIn === v ? 'selected' : ''}>${label}</option>`).join('')}
+              </select></div>
+            <div><label style="font-size:11px">Fade out</label><br>
+              <select id="st-ov-animout${suffix}" style="width:100px">
+                ${OVERLAY_ANIM_OUT_OPTIONS.map(([v, label]) => `<option value="${v}" ${animOut === v ? 'selected' : ''}>${label}</option>`).join('')}
+              </select></div>
+          </div>
+
+          <details style="margin-top:10px">
+            <summary style="font-size:12px;cursor:pointer">Advanced: edit the raw JSON instead</summary>
+            <div class="muted" style="font-size:11px;margin:4px 0">Anything typed here wins over the fields above. Leave it empty to use the fields.</div>
+            <textarea id="st-overlay-data${suffix}" rows="4" placeholder="leave empty unless you need a field the form does not cover"></textarea>
+          </details>`;
+}
+
+// Compiles the friendly fields above (for the given kind/id-suffix) into the
+// overlay's `data` JSON, or the advanced raw-JSON box when it has anything
+// typed into it -- exactly the create form's original "raw JSON wins when
+// non-empty" rule, now shared by both Create and Save so the two can't drift
+// apart. Returns { data } on success or { error } with a message to toast,
+// never throws, so callers just need `if (built.error) return toast(...)`.
+function buildOverlayDataFromFields(kind, suffix) {
+  const rawJson = (elv(`st-overlay-data${suffix}`) || '').trim();
+  if (rawJson) {
+    try { return { data: JSON.parse(rawJson) }; }
+    catch { return { error: 'Invalid JSON in the advanced box' }; }
+  }
+  const num = (id, fallback) => { const v = Number(elv(id + suffix)); return Number.isFinite(v) ? v : fallback; };
+  if (kind === 'DOOR_CARD') {
+    const lines = (elv(`st-ov-doorlines${suffix}`) || '').split('\n').map(s => s.trim()).filter(Boolean);
+    if (!lines.length) return { error: 'Write at least one door card line.' };
+    const base = num('st-ov-fontsize', 56);
+    return { data: {
+      background_color: elv(`st-ov-bgcolor${suffix}`) || '#16103F',
+      // Each line a step smaller and half a second later than the one
+      // above, which is the shape every real Letena door card uses.
+      lines: lines.map((text, i) => ({
+        text,
+        font_family: i === 0 ? 'bold' : 'regular',
+        font_size_px: Math.max(22, Math.round(base * [1, 0.62, 0.52, 0.46][i] ?? base * 0.46)),
+        text_color: i === 0 ? (elv(`st-ov-textcolor${suffix}`) || '#EBAB20') : '#FFFFFF',
+        delay_s: i * 0.5,
+      })),
+    } };
+  }
+  if (kind === 'ICON') {
+    const assetId = (elv(`st-ov-assetid${suffix}`) || '').trim();
+    if (!assetId) return { error: 'Paste the ICON asset id first.' };
+    return { data: {
+      asset_id: assetId,
+      width_px: 120,
+      position: { anchor: elv(`st-ov-anchor${suffix}`) || 'top', inset_px: 40 },
+      animation_in: { type: elv(`st-ov-animin${suffix}`) || 'fade', duration_s: 0.3 },
+      animation_out: { type: elv(`st-ov-animout${suffix}`) || 'fade', duration_s: 0.2 },
+    } };
+  }
+  const text = (elv(`st-ov-text${suffix}`) || '').trim();
+  if (!text) return { error: 'Write the overlay text first.' };
+  return { data: {
+    text,
+    font_family: elv(`st-ov-fontfamily${suffix}`) || 'bold',
+    font_size_px: num('st-ov-fontsize', 56),
+    text_color: elv(`st-ov-textcolor${suffix}`) || '#EBAB20',
+    background_color: elv(`st-ov-bgcolor${suffix}`) || '#16103F',
+    background_opacity: num('st-ov-bgopacity', 0.9),
+    corner_radius_px: 16,
+    position: { anchor: elv(`st-ov-anchor${suffix}`) || 'upper-third', inset_px: 40 },
+    animation_in: { type: elv(`st-ov-animin${suffix}`) || 'fade', duration_s: 0.3 },
+    animation_out: { type: elv(`st-ov-animout${suffix}`) || 'fade', duration_s: 0.2 },
+  } };
+}
 const LOCK_LEVELS = [
   { value: 'L1_ENTITY', label: 'Entity (a character, place, or object)', desc: 'The one you’ll use almost every time: a specific character, environment, or prop that needs to look the same in every shot it’s in.' },
   { value: 'L0_PROJECT', label: 'Project-wide style', desc: 'Rules for the whole project at once: overall look, medium, palette. Usually just one of these per project (Entity type: STYLE).' },
@@ -2181,25 +2330,36 @@ const screens = {
     // Approve, and Delete, so the only way to change a card's timing or
     // position was delete-then-recreate. Same toggle-a-hidden-box pattern
     // shots already use for their "Add voice" box (see stshotvoiceshow /
-    // #stvoice-<id> above), reusing the raw-JSON textarea the create form
-    // already treats as the source of truth when non-empty, so this needs no
-    // separate per-kind friendly fields to stay in sync.
-    const overlayEditRow = (o) => `<tr id="stoveditrow-${esc(o.id)}" hidden><td colspan="4">
+    // #stvoice-<id> above). First cut of this box used a raw JSON textarea
+    // as the only editing surface -- Nate, looking at it: "isnt presented in
+    // a way where a non technical person can make the changes... cant we
+    // just have them edit the info like anchor, animation type etc in a
+    // series of dropdowns or fillables." So this now reuses the exact same
+    // friendly fields the "New overlay" form already has (overlayFormFieldsHtml),
+    // prefilled from this row's current data, with the raw JSON still there
+    // as an escape hatch but empty by default -- what you see in the form is
+    // what gets saved, same rule the create form already uses.
+    const overlayEditRow = (o) => { const suffix = `-${o.id}`; return `<tr id="stoveditrow-${esc(o.id)}" hidden><td colspan="4">
       <div class="claimrow">
-        <label>Kind</label><select id="stovedit-kind-${esc(o.id)}">
-          ${OVERLAY_KIND_OPTIONS.map(([v, label]) => `<option value="${v}" ${o.kind === v ? 'selected' : ''}>${label}</option>`).join('')}
-        </select>
         <div class="grid2">
-          <div><label>Start (s)</label><input id="stovedit-start-${esc(o.id)}" type="number" min="0" step="0.1" value="${esc(String(o.start_s))}"></div>
-          <div><label>End (s)</label><input id="stovedit-end-${esc(o.id)}" type="number" min="0" step="0.1" value="${esc(String(o.end_s))}"></div>
-          <div><label>Order index</label><input id="stovedit-order-${esc(o.id)}" type="number" min="0" value="${esc(String(o.order_index ?? 0))}"></div>
+          <div>
+            <label>Kind</label><select id="st-overlay-kind${suffix}">
+              ${OVERLAY_KIND_OPTIONS.map(([v, label]) => `<option value="${v}" ${o.kind === v ? 'selected' : ''}>${label}</option>`).join('')}
+            </select>
+            <label>Start (s)</label><input id="st-overlay-start${suffix}" type="number" min="0" step="0.1" value="${esc(String(o.start_s))}">
+            <label>End (s)</label><input id="st-overlay-end${suffix}" type="number" min="0" step="0.1" value="${esc(String(o.end_s))}">
+            <label>Order index</label><input id="st-overlay-order${suffix}" type="number" min="0" value="${esc(String(o.order_index ?? 0))}">
+          </div>
+          <div>
+            <label>What it says and how it looks</label>
+            <div class="muted" style="font-size:12px;margin-bottom:6px">Fill these in and the JSON underneath writes itself. Colours use Letena's palette by default.</div>
+            ${overlayFormFieldsHtml(suffix, o.kind, o.data)}
+          </div>
         </div>
-        <label>Data (JSON)</label>
-        <textarea id="stovedit-data-${esc(o.id)}" rows="6">${esc(JSON.stringify(o.data ?? {}, null, 2))}</textarea>
-        <div class="muted" style="font-size:11px;margin:4px 0">Saving un-approves this overlay -- approve it again, then re-run Assemble rough cut below, for the change to actually show up in the video. The last assembled cut is a rendered file; it does not update itself.</div>
-        <button style="margin-top:6px" data-stoverlaysave="${esc(o.id)}">Save changes</button>
+        <div class="muted" style="font-size:11px;margin:8px 0">Saving un-approves this overlay -- approve it again, then re-run Assemble rough cut below, for the change to actually show up in the video. The last assembled cut is a rendered file; it does not update itself.</div>
+        <button data-stoverlaysave="${esc(o.id)}">Save changes</button>
       </div>
-    </td></tr>`;
+    </td></tr>`; };
 
     const overlaysHtml = overlays.length ? `<div class="card"><table>
       <tr><th>Kind</th><th>Time range</th><th>Status</th><th></th></tr>
@@ -2231,56 +2391,7 @@ const screens = {
         <div>
           <label>What it says and how it looks</label>
           <div class="muted" style="font-size:12px;margin-bottom:6px">Fill these in and the JSON underneath writes itself. Colours use Letena's palette by default.</div>
-
-          <div id="st-ov-text-fields">
-            <label style="font-size:11px">Text</label>
-            <textarea id="st-ov-text" rows="2" placeholder="e.g. የሆርሞን እንክብል ስትወስጂ ደም መፍሰስ?"></textarea>
-          </div>
-
-          <div id="st-ov-door-fields" hidden>
-            <label style="font-size:11px">Door card lines (one per line, biggest first)</label>
-            <textarea id="st-ov-doorlines" rows="4" placeholder="DM አርጊን&#10;በነፃ ነው&#10;Link in bio&#10;ለጓደኛሽም ላኪላት"></textarea>
-            <div class="muted" style="font-size:11px">Each line fades in half a second after the one above it.</div>
-          </div>
-
-          <div id="st-ov-icon-fields" hidden>
-            <label style="font-size:11px">Icon asset id</label>
-            <input id="st-ov-assetid" placeholder="paste an ICON asset id from the library">
-            <div class="muted" style="font-size:11px">Upload the icon to the asset library first, as kind ICON.</div>
-          </div>
-
-          <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-style-fields">
-            <div><label style="font-size:11px">Text colour</label><br>
-              <input type="color" id="st-ov-textcolor" value="#EBAB20" style="width:56px;height:30px;padding:2px"></div>
-            <div><label style="font-size:11px">Background</label><br>
-              <input type="color" id="st-ov-bgcolor" value="#16103F" style="width:56px;height:30px;padding:2px"></div>
-            <div><label style="font-size:11px">Background opacity</label><br>
-              <input type="range" id="st-ov-bgopacity" min="0" max="1" step="0.05" value="0.9" style="width:110px"></div>
-            <div><label style="font-size:11px">Text size (px)</label><br>
-              <input type="number" id="st-ov-fontsize" value="56" min="12" max="140" style="width:80px"></div>
-            <div><label style="font-size:11px">Weight</label><br>
-              <select id="st-ov-fontfamily" style="width:100px"><option value="bold">bold</option><option value="regular">regular</option></select></div>
-          </div>
-
-          <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-place-fields">
-            <div><label style="font-size:11px">Where on screen</label><br>
-              <select id="st-ov-anchor" style="width:140px">
-                <option value="upper-third">upper third</option><option value="top">top</option>
-                <option value="top-right">top right</option><option value="right-center">right centre</option>
-                <option value="center">centre</option></select></div>
-            <div><label style="font-size:11px">Fade in</label><br>
-              <select id="st-ov-animin" style="width:120px">
-                <option value="fade">fade</option><option value="slide-left">slide from left</option>
-                <option value="slide-right">slide from right</option><option value="none">none</option></select></div>
-            <div><label style="font-size:11px">Fade out</label><br>
-              <select id="st-ov-animout" style="width:100px"><option value="fade">fade</option><option value="none">none</option></select></div>
-          </div>
-
-          <details style="margin-top:10px">
-            <summary style="font-size:12px;cursor:pointer">Advanced: edit the raw JSON instead</summary>
-            <div class="muted" style="font-size:11px;margin:4px 0">Anything typed here wins over the fields above. Leave it empty to use the fields.</div>
-            <textarea id="st-overlay-data" rows="4" placeholder="leave empty unless you need a field the form does not cover"></textarea>
-          </details>
+          ${overlayFormFieldsHtml('', 'TITLE_CARD', {})}
         </div>
       </div>
       <div style="margin-top:12px"><button class="primary" data-stoverlaycreate="${esc(id)}">Create overlay</button></div>
@@ -3568,9 +3679,15 @@ document.addEventListener('change', (e) => {
   // Overlay form: show only the fields the chosen kind actually has, so a
   // door card never asks for a single "text" and an icon never asks for a
   // text colour. Same in-place discipline as the two blocks around it --
-  // re-rendering here would wipe what the user already typed.
-  if (t.id === 'st-overlay-kind') {
-    const show = (id, on) => { const el = document.getElementById(id); if (el) el.hidden = !on; };
+  // re-rendering here would wipe what the user already typed. Matches both
+  // the "New overlay" kind select (id exactly "st-overlay-kind") and every
+  // per-row "Edit" box's kind select (id "st-overlay-kind-<overlayId>"),
+  // since both render from the same overlayFormFieldsHtml and need the same
+  // show/hide behavior -- the suffix (everything after the base id) is
+  // reused to find that same instance's fields.
+  if (t.id === 'st-overlay-kind' || t.id.startsWith('st-overlay-kind-')) {
+    const suffix = t.id.slice('st-overlay-kind'.length);
+    const show = (id, on) => { const el = document.getElementById(id + suffix); if (el) el.hidden = !on; };
     const isDoor = t.value === 'DOOR_CARD', isIcon = t.value === 'ICON';
     show('st-ov-text-fields', !isDoor && !isIcon);
     show('st-ov-door-fields', isDoor);
@@ -3580,7 +3697,7 @@ document.addEventListener('change', (e) => {
     // no position or animation of its own -- its lines carry their own
     // timing via delay_s instead.
     show('st-ov-place-fields', !isDoor);
-    const size = document.getElementById('st-ov-fontsize');
+    const size = document.getElementById('st-ov-fontsize' + suffix);
     if (size) size.value = isDoor ? 64 : t.value === 'LABEL' ? 44 : 56;
     return;
   }
@@ -4469,63 +4586,18 @@ document.addEventListener('click', async (e) => {
       // something much simpler which then writes in to the json, its hard to
       // comprehend all that"). Raw JSON still wins when someone types it, so
       // nothing that was possible before this form existed became impossible.
-      let data;
-      const rawJson = (elv('st-overlay-data') || '').trim();
-      if (rawJson) {
-        try { data = JSON.parse(rawJson); }
-        catch { return toast('Invalid JSON in the advanced box', true); }
-      } else {
-        const num = (id, fallback) => { const v = Number(elv(id)); return Number.isFinite(v) ? v : fallback; };
-        if (kind === 'DOOR_CARD') {
-          const lines = (elv('st-ov-doorlines') || '').split('\n').map(s => s.trim()).filter(Boolean);
-          if (!lines.length) return toast('Write at least one door card line.', 'warn');
-          const base = num('st-ov-fontsize', 56);
-          data = {
-            background_color: elv('st-ov-bgcolor') || '#16103F',
-            // Each line a step smaller and half a second later than the one
-            // above, which is the shape every real Letena door card uses.
-            lines: lines.map((text, i) => ({
-              text,
-              font_family: i === 0 ? 'bold' : 'regular',
-              font_size_px: Math.max(22, Math.round(base * [1, 0.62, 0.52, 0.46][i] ?? base * 0.46)),
-              text_color: i === 0 ? (elv('st-ov-textcolor') || '#EBAB20') : '#FFFFFF',
-              delay_s: i * 0.5,
-            })),
-          };
-        } else if (kind === 'ICON') {
-          const assetId = (elv('st-ov-assetid') || '').trim();
-          if (!assetId) return toast('Paste the ICON asset id first.', 'warn');
-          data = {
-            asset_id: assetId,
-            width_px: 120,
-            position: { anchor: elv('st-ov-anchor') || 'top', inset_px: 40 },
-            animation_in: { type: elv('st-ov-animin') || 'fade', duration_s: 0.3 },
-            animation_out: { type: elv('st-ov-animout') || 'fade', duration_s: 0.2 },
-          };
-        } else {
-          const text = (elv('st-ov-text') || '').trim();
-          if (!text) return toast('Write the overlay text first.', 'warn');
-          data = {
-            text,
-            font_family: elv('st-ov-fontfamily') || 'bold',
-            font_size_px: num('st-ov-fontsize', 56),
-            text_color: elv('st-ov-textcolor') || '#EBAB20',
-            background_color: elv('st-ov-bgcolor') || '#16103F',
-            background_opacity: num('st-ov-bgopacity', 0.9),
-            corner_radius_px: 16,
-            position: { anchor: elv('st-ov-anchor') || 'upper-third', inset_px: 40 },
-            animation_in: { type: elv('st-ov-animin') || 'fade', duration_s: 0.3 },
-            animation_out: { type: elv('st-ov-animout') || 'fade', duration_s: 0.2 },
-          };
-        }
-      }
+      // buildOverlayDataFromFields is shared with the Save handler below (and
+      // with the per-row Edit box), so Create and Edit compile the exact same
+      // way instead of two copies of this logic drifting apart.
+      const built = buildOverlayDataFromFields(kind, '');
+      if (built.error) return toast(built.error, 'warn');
       b.disabled = true; b.textContent = 'Creating…';
       await api('POST', `/studio/projects/${projectId}/overlays`, {
         kind,
         start_s: Number(startRaw),
         end_s: Number(endRaw),
         order_index: Number(elv('st-overlay-order')) || 0,
-        data,
+        data: built.data,
       });
       toast('Overlay created'); return render();
     }
@@ -4536,19 +4608,19 @@ document.addEventListener('click', async (e) => {
     }
     if (b.dataset.stoverlaysave) {
       const overlayId = b.dataset.stoverlaysave;
-      const startRaw = elv(`stovedit-start-${overlayId}`), endRaw = elv(`stovedit-end-${overlayId}`);
+      const suffix = `-${overlayId}`;
+      const startRaw = elv(`st-overlay-start${suffix}`), endRaw = elv(`st-overlay-end${suffix}`);
       if (startRaw === '' || endRaw === '') return toast('Give the overlay a start and end time first.', 'warn');
-      const rawJson = (elv(`stovedit-data-${overlayId}`) || '').trim();
-      let data;
-      try { data = rawJson ? JSON.parse(rawJson) : {}; }
-      catch { return toast('Invalid JSON in the data box', true); }
+      const kind = elv(`st-overlay-kind${suffix}`);
+      const built = buildOverlayDataFromFields(kind, suffix);
+      if (built.error) return toast(built.error, 'warn');
       b.disabled = true; b.textContent = 'Saving…';
       await api('PATCH', `/studio/overlays/${overlayId}`, {
-        kind: elv(`stovedit-kind-${overlayId}`),
+        kind,
         start_s: Number(startRaw),
         end_s: Number(endRaw),
-        order_index: Number(elv(`stovedit-order-${overlayId}`)) || 0,
-        data,
+        order_index: Number(elv(`st-overlay-order${suffix}`)) || 0,
+        data: built.data,
       });
       toast('Overlay updated -- it needs approving again, then Assemble rough cut re-run, before the video reflects it.');
       return render();

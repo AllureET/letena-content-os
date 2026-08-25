@@ -58,6 +58,7 @@ import { formatOf } from '../formats.mjs';
 import { OVERLAY_KINDS, validateOverlayData, describeOverlayCollision, buildOverlayFilterGraph,
   compileOverlayLayerSvg, resolveCanvasSizeForAspect, loadEthiopicFontsBase64,
   ensureEthiopicFontsInstalled } from './studio_overlays.mjs';
+import { captionTimingsForNarration, defaultCaptionData } from './studio_captions.mjs';
 
 const execFileP = promisify(execFile);
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -821,17 +822,6 @@ function classifyGenerationError(message) {
   if (/exhausted balance|insufficient (balance|funds|credit)|top up|payment required|402|quota exceeded|billing|user is locked|invalid api key|unauthorized|401|403|forbidden/.test(m)) {
     return 'ACCOUNT';
   }
-  // Runway's daily task limit (22 Aug 2026, hit for real generating the
-  // myth-buster illustrated shots): "Your daily task limit has been
-  // reached", a 429. The generic rate-limit rule below reads this as
-  // TRANSIENT and burns the same-engine retry plus a fallback-engine
-  // attempt on a quota that cannot clear inside that window -- a wasted
-  // ~429 round trip is cheap, but the ladder still ends on a bare 502 with
-  // no signal that this is a daily cap rather than a blip. Classified
-  // ahead of the rate-limit rule so it stops immediately with a message
-  // that says what actually happened and when to try again, the same
-  // reasoning as the ACCOUNT class above.
-  if (/daily (task |generation |)limit/.test(m)) return 'ACCOUNT';
   if (/polic|moderat|safety|blocked content/.test(m)) return 'POLICY';
   // Runway's own output-quality rejection (22 Aug 2026). It reads like a
   // hard failure -- "An unexpected error occurred" -- and it is not. Six
@@ -3537,6 +3527,121 @@ export default async function routes(app) {
     if (!overlay) return reply.code(404).send(err(404, 'NOT_FOUND', 'overlay not found'));
     await q(`DELETE FROM studio.overlays WHERE id=$1`, [overlay.id]);
     return { ok: true };
+  });
+
+  // -------------------------------------------------------------------
+  // Auto-generate CAPTION overlays from each shot's own narration text (25
+  // Aug 2026, Nate: "if we had like subtitles, can we make it so they match
+  // the timing of her mouth somehow?"). See studio_captions.mjs's header
+  // for what this actually does and does not do: pause-anchored phrase
+  // timing from real detected silences in the narration audio, not
+  // phoneme-level lip sync -- no voice engine this system uses hands back
+  // per-word timing, and no forced-alignment model is installed here.
+  // Every caption inserted here is UNAPPROVED, same as any other overlay --
+  // a producer reviews, edits, or deletes them before assemble() will burn
+  // anything in, the same gate every other overlay already goes through.
+  //
+  // Mirrors assemble()'s own two timing cursors exactly, because a caption
+  // riding a different cursor than the real mux would silently drift off
+  // the words the moment narration and picture length disagree (see
+  // layVoiceOntoVideo's header for why those two lengths differ at all):
+  //   - a shot whose ACCEPTED clip already carries audio (a talking-head
+  //     render, lip-synced) places its captions on the PICTURE cursor --
+  //     the sum of every earlier shot's own real clip duration;
+  //   - a shot with a separate VOICE asset (the b-roll case, narration
+  //     layered on afterward) places its captions on the VOICE cursor --
+  //     the sum of only the voice-track durations laid on so far, back to
+  //     back, exactly as layVoiceOntoVideo computes its own `starts[]`.
+  // Kept as two passes over `shots` (cursor bookkeeping, then generation),
+  // matching how assemble() itself keeps shotWindows and voiceTracks as two
+  // separate loops -- interleaving cursor math with per-shot work that can
+  // be skipped (no text, no audio yet) is exactly how a cursor quietly
+  // drifts off the real mux.
+  // -------------------------------------------------------------------
+  app.post('/studio/projects/:id/captions/generate', { preHandler: requirePerm('studio.write') }, async (req, reply) => {
+    const p = await one(`SELECT * FROM studio.projects WHERE id=$1`, [req.params.id]);
+    if (!p) return reply.code(404).send(err(404, 'NOT_FOUND', 'project not found'));
+    const shots = (await q(`SELECT * FROM studio.shots WHERE project_id=$1 ORDER BY order_index`, [p.id])).rows;
+    if (!shots.length) return reply.code(422).send(err(422, 'VALIDATION', 'project has no shots'));
+
+    const shotPlans = [];
+    let pictureCursor = 0;
+    let voiceCursor = 0;
+    for (const shot of shots) {
+      const accepted = shot.accepted_asset_id
+        ? await one(`SELECT * FROM studio.assets WHERE id=$1`, [shot.accepted_asset_id]) : null;
+      const voiceAsset = await one(
+        `SELECT * FROM studio.assets WHERE shot_id=$1 AND kind='VOICE' AND storage_key IS NOT NULL
+         ORDER BY created_at DESC LIMIT 1`, [shot.id]);
+
+      let pictureDurS = Number(shot.duration_target_s ?? 0);
+      let clipHasAudio = false;
+      if (accepted?.storage_key) {
+        try {
+          const info = await probeClip(storage.localPath(accepted.storage_key));
+          pictureDurS = info.durationS ?? pictureDurS;
+          clipHasAudio = info.hasAudio === true;
+        } catch { /* keep target duration, assume no embedded audio */ }
+      }
+
+      let voiceDurS = 0;
+      if (voiceAsset?.storage_key && !clipHasAudio) {
+        try { voiceDurS = (await probeClip(storage.localPath(voiceAsset.storage_key))).durationS ?? 0; } catch { voiceDurS = 0; }
+      }
+
+      const audioPath = clipHasAudio
+        ? (accepted?.storage_key ? storage.localPath(accepted.storage_key) : null)
+        : (voiceAsset?.storage_key ? storage.localPath(voiceAsset.storage_key) : null);
+      const audioDurS = clipHasAudio ? pictureDurS : voiceDurS;
+      const cursorStart = clipHasAudio ? pictureCursor : voiceCursor;
+
+      shotPlans.push({ shot, audioPath, audioDurS, cursorStart });
+      pictureCursor += pictureDurS;
+      if (!clipHasAudio) voiceCursor += voiceDurS;
+    }
+
+    const created = [];
+    const skipped = [];
+    for (const plan of shotPlans) {
+      const { shot } = plan;
+      const text = shot.audio?.dialogue ?? shot.story?.narration ?? null;
+      if (!text || !String(text).trim()) {
+        skipped.push({ shot_code: shot.shot_code, reason: 'no narration text on this shot' });
+        continue;
+      }
+      if (!plan.audioPath || !(plan.audioDurS > 0)) {
+        skipped.push({ shot_code: shot.shot_code,
+          reason: 'no generated narration audio found for this shot yet (run voice generation, or accept a clip with embedded audio, first)' });
+        continue;
+      }
+      let localTimings;
+      try {
+        localTimings = await captionTimingsForNarration(text, plan.audioPath, plan.audioDurS);
+      } catch (e) {
+        skipped.push({ shot_code: shot.shot_code, reason: `timing analysis failed: ${e.message}` });
+        continue;
+      }
+      for (const t of localTimings) {
+        const startS = Math.round((plan.cursorStart + t.start_s) * 100) / 100;
+        const endS = Math.round((plan.cursorStart + t.end_s) * 100) / 100;
+        const overlay = await one(
+          `INSERT INTO studio.overlays (project_id, kind, start_s, end_s, order_index, data, created_by)
+           VALUES ($1,'CAPTION',$2,$3,$4,$5,$6) RETURNING *`,
+          [p.id, startS, endS, 0, JSON.stringify(defaultCaptionData(t.text)), req.actor?.id ?? null]);
+        created.push(overlay);
+      }
+    }
+
+    await q(`INSERT INTO studio.events (project_id, actor_id, note) VALUES ($1,$2,$3)`,
+      [p.id, req.actor?.id ?? null,
+       `generated ${created.length} caption overlay(s) from narration text${skipped.length ? `; skipped ${skipped.length} shot(s)` : ''}`]);
+
+    return reply.code(201).send({
+      created: created.length,
+      overlays: created,
+      skipped,
+      note: 'Captions are timed to real detected pauses in the narration audio and each phrase\'s length, not true word-by-word lip sync -- no voice engine this system uses hands back per-word timing. Watch them against the real cut and adjust before approving; every caption still needs approval, same as any other overlay, before Assemble will use it.',
+    });
   });
 
   // -------------------------------------------------------------------

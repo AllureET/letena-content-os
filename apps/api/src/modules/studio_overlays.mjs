@@ -34,7 +34,16 @@ import { readFile } from 'node:fs/promises';
 // Constants shared by validation (studio.mjs's overlay routes) and
 // compilation (this file).
 // ===========================================================================
-export const OVERLAY_KINDS = ['TITLE_CARD', 'LABEL', 'DOOR_CARD', 'ICON'];
+// 'CAPTION' added 25 Aug 2026 (Nate: "if we had like subtitles, can we make
+// it so they match the timing of her mouth somehow?"). It rides the exact
+// same TITLE_CARD/LABEL validation and compiler (compileCardSvg) -- a
+// caption is just a small, bottom-anchored LABEL-shaped card with its own
+// kind name, so it can be told apart from a hand-authored label in the
+// Overlays list, bulk-generated/cleared as a group, and so its own
+// collision rule can stay the same as LABEL's (below, deliberately not
+// collision-checked). See studio_captions.mjs for how its start_s/end_s get
+// decided; migration 0040 for the matching DB CHECK.
+export const OVERLAY_KINDS = ['TITLE_CARD', 'LABEL', 'DOOR_CARD', 'ICON', 'CAPTION'];
 // 'lower-third' and 'bottom' added 22 Aug 2026. Until then every anchor this
 // system had put a card in the top or the middle of the frame, which for a
 // vertical talking head is precisely where the head is. There was no way to
@@ -111,7 +120,7 @@ function validateAnimation(anim, path, allowedTypes, errors) {
 export function validateOverlayData(kind, data) {
   const errors = [];
   const d = data ?? {};
-  if (kind === 'TITLE_CARD' || kind === 'LABEL') {
+  if (kind === 'TITLE_CARD' || kind === 'LABEL' || kind === 'CAPTION') {
     if (!d.text || !String(d.text).trim()) errors.push('data.text is required');
     if (d.font_family != null && !FONT_FAMILIES.includes(d.font_family)) {
       errors.push(`data.font_family must be one of ${FONT_FAMILIES.join(', ')}`);
@@ -512,7 +521,7 @@ function compileIconSvg(data, canvasW, canvasH, iconBase64, iconMime = 'image/pn
 export function compileOverlaySvg(overlay, canvasWidth, canvasHeight, ethiopicFontBase64Bold, ethiopicFontBase64Regular, iconBase64Png, faceBox) {
   const kind = overlay.kind;
   const data = overlay.data ?? {};
-  if (kind === 'TITLE_CARD' || kind === 'LABEL') {
+  if (kind === 'TITLE_CARD' || kind === 'LABEL' || kind === 'CAPTION') {
     return compileCardSvg(data, canvasWidth, canvasHeight, ethiopicFontBase64Bold, ethiopicFontBase64Regular, faceBox);
   }
   if (kind === 'DOOR_CARD') {

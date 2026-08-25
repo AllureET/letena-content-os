@@ -1,6 +1,6 @@
 # Amharic voice generation: Gemini TTS source guide
 
-**Status: experimental, under evaluation (24 Aug 2026).** This is not yet the default. It is a second Amharic narration option, tried alongside the existing Azure Speech path, not a replacement for it. Update this status line once a real sample has been reviewed and a decision made either way.
+**Status: adopted as the default Amharic voice, 25 Aug 2026.** A real side-by-side test on a live shot (project STU-77959F61, shot SH-010, the exact same Amharic line run through both Azure and Gemini) was reviewed and Gemini sounded meaningfully more native. Amharic projects in Video Studio now use Gemini by default; Azure is still available with an explicit `provider: "AZURE"` on the voice call, and English projects are unaffected -- Gemini has only been evaluated against Amharic.
 
 ## Why this exists
 
@@ -10,7 +10,7 @@ This document is the style guide for getting good results out of that prompt-dir
 
 ## How this is wired into LCOS
 
-- `POST /studio/shots/:shotId/voice` accepts an optional `provider` field. Omitted or `"AZURE"` behaves exactly as before. `"GEMINI"` routes to `gemini.tts()` instead.
+- `POST /studio/shots/:shotId/voice` accepts an optional `provider` field. Omitted on an Amharic project now routes to `gemini.tts()` by default; omitted on an English project still routes to Azure, unchanged. Either language can force the other with an explicit `"AZURE"` or `"GEMINI"`.
 - `gemini.tts()` prepends a condensed version of the master voice direction below (`AMHARIC_VOICE_DIRECTION` in the adapter) to whatever line it's given, calls `gemini-3.1-flash-tts-preview` (Settings key `GEMINI_TTS_MODEL`, blank uses that default), and asks for the `Sulafat` voice (Settings key `GEMINI_TTS_VOICE`) unless a different voice is passed.
 - Gemini returns headerless 24kHz mono 16-bit PCM. The adapter wraps it in a proper WAV container before storing it, so it plays and probes the same as any other VOICE asset.
 - Cost is computed from the real returned audio length (Gemini's TTS pricing: $20 per 1M audio tokens, 25 tokens/second, roughly $0.03/minute) rather than estimated from character count, the same pattern already used for Runway's real per-call cost.

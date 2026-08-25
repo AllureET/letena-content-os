@@ -3623,6 +3623,7 @@ export default async function routes(app) {
 
     const created = [];
     const skipped = [];
+    const asrErrors = [];
     const methodCounts = { asr_word_timing: 0, pause_heuristic: 0 };
     for (const plan of shotPlans) {
       const { shot } = plan;
@@ -3640,9 +3641,25 @@ export default async function routes(app) {
       // 60s-per-request ceiling is per-clip, not per-project -- a long shot
       // simply falls back to the heuristic while a short one right after it
       // in the same run still gets real ASR timing.
-      const getWordTimings = (localAudioPath) => azureSTT.wordTimings({
-        localAudioPath, language: asrLanguage, durationS: plan.audioDurS,
-      });
+      //
+      // captionTimingsForNarrationASR (by design) swallows ANY throw from
+      // getWordTimings and falls back to the pause heuristic -- that's the
+      // right behavior for the caption result itself (never let a flaky
+      // Azure call block captions), but it means a real problem (bad key,
+      // wrong region, ffmpeg missing on the box, a 403) reads identically
+      // to "no key configured at all," with zero signal for a non-developer
+      // to act on. Catch it here too, before it's swallowed, purely to
+      // report the real reason back (25 Aug 2026 -- found live on
+      // STU-77959F61 that every shot fell back with Azure creds already
+      // saved in Settings, and there was no way to tell why without this).
+      const getWordTimings = async (localAudioPath) => {
+        try {
+          return await azureSTT.wordTimings({ localAudioPath, language: asrLanguage, durationS: plan.audioDurS });
+        } catch (e) {
+          asrErrors.push({ shot_code: shot.shot_code, error: e.message });
+          return null;
+        }
+      };
       let localTimings;
       let method;
       try {
@@ -3668,7 +3685,8 @@ export default async function routes(app) {
     await q(`INSERT INTO studio.events (project_id, actor_id, note) VALUES ($1,$2,$3)`,
       [p.id, req.actor?.id ?? null,
        `generated ${created.length} caption overlay(s) from narration text${skipped.length ? `; skipped ${skipped.length} shot(s)` : ''}`
-       + ` (${methodCounts.asr_word_timing} shot(s) via real Azure word timing, ${methodCounts.pause_heuristic} via the pause-anchored fallback)`]);
+       + ` (${methodCounts.asr_word_timing} shot(s) via real Azure word timing, ${methodCounts.pause_heuristic} via the pause-anchored fallback)`
+       + (asrErrors.length ? `; azure stt errors: ${asrErrors.map(e => `${e.shot_code}: ${e.error}`).join(' | ')}` : '')]);
 
     return reply.code(201).send({
       created: created.length,
@@ -3676,6 +3694,7 @@ export default async function routes(app) {
       skipped,
       shots_via_asr: methodCounts.asr_word_timing,
       shots_via_pause_heuristic: methodCounts.pause_heuristic,
+      ...(asrErrors.length ? { asr_errors: asrErrors } : {}),
       note: methodCounts.asr_word_timing > 0
         ? 'Captions are timed using real Azure speech-to-text word timing where available, falling back to pause-anchored phrase timing for any shot Azure could not process (no key, over the 60s limit, or a transient failure). Watch them against the real cut and adjust before approving; every caption still needs approval, same as any other overlay, before Assemble will use it.'
         : 'Captions are timed to real detected pauses in the narration audio and each phrase\'s length, not true word-by-word lip sync -- Azure word timing was not available for this run (no AZURE_SPEECH_KEY configured, or every shot failed/exceeded the 60s limit). Watch them against the real cut and adjust before approving; every caption still needs approval, same as any other overlay, before Assemble will use it.',

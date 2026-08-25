@@ -4923,7 +4923,14 @@ document.addEventListener('click', async (e) => {
       const skippedNote = res.skipped?.length
         ? ` ${res.skipped.length} shot(s) skipped: ${res.skipped.map(s => `${s.shot_code} (${s.reason})`).join('; ')}`
         : '';
-      toast(`${res.created} caption(s) created, unapproved.${skippedNote} Review them against the audio, then approve each one before Assemble.`);
+      // shots_via_asr/shots_via_pause_heuristic (25 Aug 2026): which shots
+      // got real Azure word-level timing vs. the pause-anchored fallback,
+      // so Rudy can tell at a glance whether this run used the more
+      // accurate path without opening every overlay to check.
+      const methodNote = res.shots_via_asr
+        ? ` (${res.shots_via_asr} shot(s) timed from real speech-to-text word timing${res.shots_via_pause_heuristic ? `, ${res.shots_via_pause_heuristic} from the pause-based fallback` : ''}.)`
+        : '';
+      toast(`${res.created} caption(s) created, unapproved.${methodNote}${skippedNote} Review them against the audio, then approve each one before Assemble.`);
       return render();
     }
     if (b.dataset.stoverlaycreate) {

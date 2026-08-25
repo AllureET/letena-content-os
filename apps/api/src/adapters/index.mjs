@@ -7,10 +7,14 @@
 //   ELEVENLABS/AZURE  TTS, Amharic-capable                  GEMINI  images
 //   CANVA       carousels + statics
 //   TELEGRAM/META/YOUTUBE/TIKTOK                     publishing
-import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { cred } from '../creds.mjs';
+
+const execFileP = promisify(execFile);
 
 const MOCK = () => (cred('LCOS_ADAPTER_MODE') || 'MOCK').toUpperCase() === 'MOCK';
 const STORE = process.env.LCOS_STORAGE_DIR || '/tmp/lcos-storage';
@@ -461,6 +465,67 @@ export const azureSpeech = {
     const key = `voice/generated/${assetId}.mp3`;
     await storage.put(key, Buffer.from(await res.arrayBuffer()));
     return { status: 'SUCCEEDED', storage_key: key, provider: 'AZURE' };
+  },
+};
+
+// ---------- speech-to-text: Azure (real word-level caption timing) ----------
+// Added 25 Aug 2026 after Nate asked how Veed.io times its captions to a
+// speaker's mouth: Veed runs real ASR (Gladia) on the video's own audio,
+// which hands back genuine word-level timestamps as a normal side effect of
+// speech recognition -- a fundamentally more accurate source than guessing
+// word boundaries from detected pauses (studio_captions.mjs's original
+// heuristic). Our case is actually easier than Veed's: we already know the
+// exact narration text (it is what was sent to the TTS call), so this is
+// used for its TIMING only -- the words Azure itself thinks it heard are
+// discarded entirely (see studio_captions.mjs's alignWordsToChunks). Reuses
+// the same AZURE_SPEECH_KEY/AZURE_SPEECH_REGION credentials already wired up
+// for azureSpeech.tts above; no new vendor, no new account.
+//
+// Azure's short-audio REST endpoint (the only STT surface this needs) is
+// narrower than the TTS one: WAV/PCM or OGG/OPUS only, never mp3 (our TTS
+// output), so the narration file is transcoded with ffmpeg first; and a hard
+// 60-second-per-request ceiling that is Azure's limit, not this app's --
+// callers should treat anything longer as unusable and fall back to the
+// pause-anchored heuristic rather than silently truncating a shot's words.
+// Confirmed via Microsoft Learn (25 Aug 2026): am-ET (Amharic) is supported
+// for speech-to-text, same locale code already used for Amharic TTS.
+export const azureSTT = {
+  async wordTimings({ localAudioPath, language = 'am-ET', durationS }) {
+    // No live Azure call in mock/demo mode -- callers fall back to the
+    // pause-anchored heuristic, same as a real network failure would.
+    if (MOCK() || !cred('AZURE_SPEECH_KEY')) return null;
+    if (durationS != null && durationS > 59) {
+      throw new Error(`azure stt: ${durationS}s narration exceeds Azure's 60s short-audio limit`);
+    }
+    const k = need('AZURE_SPEECH_KEY'); const region = need('AZURE_SPEECH_REGION');
+    const wavPath = `${localAudioPath}.stt16k.wav`;
+    await execFileP('ffmpeg', ['-y', '-i', localAudioPath, '-ac', '1', '-ar', '16000', '-f', 'wav', wavPath]);
+    try {
+      const audio = readFileSync(wavPath);
+      const url = `https://${region}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1`
+        + `?language=${encodeURIComponent(language)}&format=detailed`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Ocp-Apim-Subscription-Key': k,
+          'Content-Type': 'audio/wav; codecs=audio/pcm; samplerate=16000',
+          Accept: 'application/json',
+        },
+        body: audio,
+      });
+      if (!res.ok) throw new Error(`azure stt ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const data = await res.json();
+      const best = data?.NBest?.[0];
+      if (!best?.Words?.length) return null;
+      // Offset/Duration are in 100-nanosecond ticks (Azure's unit, not ours).
+      return best.Words.map(w => ({
+        word: w.Word,
+        start_s: w.Offset / 1e7,
+        end_s: (w.Offset + w.Duration) / 1e7,
+      }));
+    } finally {
+      try { unlinkSync(wavPath); } catch { /* best-effort cleanup */ }
+    }
   },
 };
 

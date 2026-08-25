@@ -3594,8 +3594,24 @@ export default async function routes(app) {
         : (voiceAsset?.storage_key ? storage.localPath(voiceAsset.storage_key) : null);
       const audioDurS = clipHasAudio ? pictureDurS : voiceDurS;
       const cursorStart = clipHasAudio ? pictureCursor : voiceCursor;
+      // The actual narration line, straight from the VOICE asset's own
+      // settings (25 Aug 2026 fix). /studio/shots/:shotId/voice takes its
+      // text from req.body.text -- typed once into the "Voice line" box --
+      // and never wrote it onto shot.audio.dialogue or shot.story.narration;
+      // it only ever landed in this asset's own `settings.text` (see the
+      // INSERT into studio.assets a few hundred lines up). shot.story.narration
+      // is a field name that nothing in this codebase ever sets; captions
+      // generation was reading it (and shot.audio.dialogue) as if voice
+      // generation wrote back to the shot, which it never did -- confirmed
+      // live on STU-77959F61, where every shot skipped with "no narration
+      // text" despite narration audio existing and already driving a
+      // talking-head render for those same shots. This is present regardless
+      // of clipHasAudio: talking_head shots still require a VOICE asset
+      // first (see the talkingHeadNeedsVoice guard above), so its
+      // settings.text is the ground truth there too, not just for b-roll.
+      const voiceText = voiceAsset?.settings?.text ?? null;
 
-      shotPlans.push({ shot, audioPath, audioDurS, cursorStart });
+      shotPlans.push({ shot, audioPath, audioDurS, cursorStart, voiceText });
       pictureCursor += pictureDurS;
       if (!clipHasAudio) voiceCursor += voiceDurS;
     }
@@ -3610,7 +3626,7 @@ export default async function routes(app) {
     const methodCounts = { asr_word_timing: 0, pause_heuristic: 0 };
     for (const plan of shotPlans) {
       const { shot } = plan;
-      const text = shot.audio?.dialogue ?? shot.story?.narration ?? null;
+      const text = plan.voiceText ?? shot.audio?.dialogue ?? shot.story?.narration ?? null;
       if (!text || !String(text).trim()) {
         skipped.push({ shot_code: shot.shot_code, reason: 'no narration text on this shot' });
         continue;

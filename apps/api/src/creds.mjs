@@ -50,7 +50,7 @@ export const CRED_REGISTRY = [
   { key: 'GEMINI_TEXT_MODEL', label: 'Gemini vision and text model', group: 'Production services', secret: false,
     hint: 'Blank uses gemini-3.6-flash. Used for reading reference sheets, continuity QC and Amharic transcription. Google retired gemini-2.5-flash for new callers on 21 Aug 2026, which is why this is a setting and not baked into the code.' },
   { key: 'GEMINI_TTS_MODEL', label: 'Gemini TTS model', group: 'Production services', secret: false,
-    hint: 'Blank uses gemini-3.1-flash-tts-preview. Experimental Amharic narration option (24 Aug 2026), tried alongside Azure Speech -- selected per call with provider: "GEMINI" on POST /studio/shots/:shotId/voice, not routed to automatically. Roughly $0.03 per minute of generated audio.' },
+    hint: 'Blank uses gemini-3.1-flash-tts-preview. Since 25 Aug 2026 this is the DEFAULT Amharic narration voice on POST /studio/shots/:shotId/voice -- a real side-by-side against Azure Speech confirmed it sounds more native. English projects still default to Azure. Either language can override with provider: "AZURE" or "GEMINI". Roughly $0.03 per minute of generated audio.' },
   { key: 'GEMINI_TTS_VOICE', label: 'Gemini TTS voice', group: 'Production services', secret: false,
     hint: 'Blank uses Sulafat, Google\'s "warm" preset voice. Gemini has no Ethiopian-accent voice preset -- the accent comes from the style direction sent with every line (see AMHARIC_VOICE_DIRECTION in adapters/index.mjs), not from voice choice.' },
   { key: 'CANVA_ACCESS_TOKEN', label: 'Canva access token', group: 'Production services', secret: true,

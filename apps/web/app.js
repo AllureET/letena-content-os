@@ -415,12 +415,16 @@ function ovCanvasSize(aspectRatio) {
 function ovAnchorCss(anchor) {
   const map = {
     'top': 'top:4%;left:50%;transform:translateX(-50%)',
-    'upper-third': 'top:20%;left:50%;transform:translateX(-50%)',
+    'top-left': 'top:4%;left:4%',
     'top-right': 'top:4%;right:4%',
+    'upper-third': 'top:20%;left:50%;transform:translateX(-50%)',
+    'left-center': 'top:50%;left:4%;transform:translateY(-50%)',
     'right-center': 'top:50%;right:4%;transform:translateY(-50%)',
     'center': 'top:50%;left:50%;transform:translate(-50%,-50%)',
     'lower-third': 'bottom:20%;left:50%;transform:translateX(-50%)',
+    'bottom-left': 'bottom:4%;left:4%',
     'bottom': 'bottom:4%;left:50%;transform:translateX(-50%)',
+    'bottom-right': 'bottom:4%;right:4%',
   };
   return map[anchor] ?? map['upper-third'];
 }
@@ -432,6 +436,17 @@ function ovHexToRgba(hex, opacity) {
   const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
   const a = Number.isFinite(opacity) ? Math.max(0, Math.min(1, opacity)) : 1;
   return `rgba(${r},${g},${b},${a})`;
+}
+
+// Mirrors outlineColorFor in apps/api/src/modules/studio_overlays.mjs so the
+// preview's auto-picked outline colour always matches what actually renders.
+function ovOutlineColorFor(hex) {
+  const m = /^#([0-9a-fA-F]{6})$/.exec(hex || '');
+  if (!m) return '#000000';
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? '#000000' : '#FFFFFF';
 }
 
 // Pure: given the overlay's current field values (whatever kind it is) plus
@@ -469,9 +484,20 @@ function ovPreviewParts(canvasW, p, previewPx = OV_PREVIEW_PX) {
   // real width in advance.
   const radiusCss = p.cornerRadius >= 200 ? '999px' : `${Math.round(p.cornerRadius * scale)}px`;
   const fs = Math.max(7, Math.round(p.fontSize * scale));
+  // Outline/shadow (25 Aug 2026) mirror compileCardSvg's own maths exactly
+  // (same 0.05/0.06/0.18-of-fontSize ratios, same auto-contrast outline
+  // colour) and use a hard 0-blur offset rather than CSS's easy blur, so the
+  // preview doesn't promise a softer shadow than the real burn-in actually
+  // draws.
+  const outlineCss = p.textOutline
+    ? `-webkit-text-stroke:${Math.max(1, Math.round(fs * 0.05))}px ${ovOutlineColorFor(p.textColor)};paint-order:stroke fill;` : '';
+  const textShadowCss = p.textShadow
+    ? `text-shadow:${Math.max(1, Math.round(fs * 0.06))}px ${Math.max(1, Math.round(fs * 0.06))}px 0 rgba(0,0,0,0.45);` : '';
+  const boxShadowCss = p.boxShadow
+    ? `box-shadow:${Math.max(1, Math.round(fs * 0.18))}px ${Math.max(1, Math.round(fs * 0.18))}px 0 0 rgba(0,0,0,0.35);` : '';
   const boxCss = `position:absolute;${ovAnchorCss(p.anchor)};max-width:82%;padding:${Math.round(fs * 0.55)}px ${Math.round(fs * 0.9)}px;` +
     `background:${ovHexToRgba(p.bgColor, p.bgOpacity)};color:${p.textColor};font-weight:${p.fontFamily === 'bold' ? 700 : 400};` +
-    `font-size:${fs}px;border-radius:${radiusCss};text-align:center;white-space:pre-line;line-height:1.25`;
+    `font-size:${fs}px;border-radius:${radiusCss};text-align:center;white-space:pre-line;line-height:1.25;${outlineCss}${textShadowCss}${boxShadowCss}`;
   return { canvasBg: OV_PREVIEW_BG, boxCss, html: esc(p.text || 'overlay text…') };
 }
 
@@ -495,6 +521,9 @@ function ovParamsFromData(kind, data) {
     fontFamily: d.font_family ?? firstLine?.font_family ?? 'bold',
     anchor: d.position?.anchor ?? (isIcon ? 'top-right' : 'upper-third'),
     cornerRadius: d.corner_radius_px ?? 16,
+    textOutline: d.text_outline === true,
+    textShadow: d.text_shadow === true,
+    boxShadow: d.box_shadow === true,
   };
 }
 
@@ -553,6 +582,9 @@ function updateOverlayPreview(suffix) {
     fontFamily: elv(`st-ov-fontfamily${suffix}`) || 'bold',
     anchor: elv(`st-ov-anchor${suffix}`) || (isIcon ? 'top-right' : 'upper-third'),
     cornerRadius: num(`st-ov-shape${suffix}`, 16),
+    textOutline: !!document.getElementById(`st-ov-outline${suffix}`)?.checked,
+    textShadow: !!document.getElementById(`st-ov-textshadow${suffix}`)?.checked,
+    boxShadow: !!document.getElementById(`st-ov-boxshadow${suffix}`)?.checked,
     iconUrl,
   });
   canvas.style.background = parts.canvasBg;
@@ -870,10 +902,17 @@ const OVERLAY_KIND_OPTIONS = [
 // vertical talking head's face -- this list had never been updated to
 // actually offer them, so that fix was live on the server but unreachable
 // from this form.
+// 'top-left', 'left-center', 'bottom-left', 'bottom-right' added 25 Aug 2026
+// (Nate: "how come theres a right centre but not a left centre or a top
+// left or a lower right or a lower left?") -- 'right-center'/'top-right' had
+// no mirror on the other side of the frame for no real reason. Matches the
+// full ANCHORS list studio_overlays.mjs now supports.
 const OVERLAY_ANCHOR_OPTIONS = [
-  ['upper-third', 'upper third'], ['top', 'top'], ['top-right', 'top right'],
-  ['right-center', 'right centre'], ['center', 'centre'],
-  ['lower-third', 'lower third'], ['bottom', 'bottom'],
+  ['top', 'top'], ['top-left', 'top left'], ['top-right', 'top right'],
+  ['upper-third', 'upper third'],
+  ['left-center', 'left centre'], ['right-center', 'right centre'], ['center', 'centre'],
+  ['lower-third', 'lower third'],
+  ['bottom-left', 'bottom left'], ['bottom', 'bottom'], ['bottom-right', 'bottom right'],
 ];
 const OVERLAY_ANIM_IN_OPTIONS = [
   ['fade', 'fade'], ['slide-left', 'slide from left'], ['slide-right', 'slide from right'], ['none', 'none'],
@@ -960,6 +999,12 @@ function overlayFormFieldsHtml(suffix, kind, data, idToken, aspectRatio) {
                 <option value="16" ${shapeBucket === 16 ? 'selected' : ''}>Rounded corners</option>
                 <option value="999" ${shapeBucket === 999 ? 'selected' : ''}>Pill / oval</option>
               </select></div>
+            <div><label style="font-size:11px">&nbsp;</label><br><label style="font-size:12px;font-weight:normal">
+              <input type="checkbox" id="st-ov-outline${suffix}" data-ovfield="${suffix}" ${d.text_outline === true ? 'checked' : ''}> Outline the text</label></div>
+            <div><label style="font-size:11px">&nbsp;</label><br><label style="font-size:12px;font-weight:normal">
+              <input type="checkbox" id="st-ov-textshadow${suffix}" data-ovfield="${suffix}" ${d.text_shadow === true ? 'checked' : ''}> Shadow behind the text</label></div>
+            <div><label style="font-size:11px">&nbsp;</label><br><label style="font-size:12px;font-weight:normal">
+              <input type="checkbox" id="st-ov-boxshadow${suffix}" data-ovfield="${suffix}" ${d.box_shadow === true ? 'checked' : ''}> Shadow behind the box</label></div>
           </div>
 
           <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-place-fields${suffix}" ${isDoor ? 'hidden' : ''}>
@@ -1040,6 +1085,9 @@ function buildOverlayDataFromFields(kind, suffix) {
     background_color: elv(`st-ov-bgcolor${suffix}`) || '#16103F',
     background_opacity: num('st-ov-bgopacity', 0.9),
     corner_radius_px: num('st-ov-shape', 16),
+    text_outline: !!document.getElementById(`st-ov-outline${suffix}`)?.checked,
+    text_shadow: !!document.getElementById(`st-ov-textshadow${suffix}`)?.checked,
+    box_shadow: !!document.getElementById(`st-ov-boxshadow${suffix}`)?.checked,
     position: { anchor: elv(`st-ov-anchor${suffix}`) || 'upper-third', inset_px: 40 },
     animation_in: { type: elv(`st-ov-animin${suffix}`) || 'fade', duration_s: 0.3 },
     animation_out: { type: elv(`st-ov-animout${suffix}`) || 'fade', duration_s: 0.2 },

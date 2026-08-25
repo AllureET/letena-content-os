@@ -3081,12 +3081,16 @@ export default async function routes(app) {
     if (!text) return reply.code(422).send(err(422, 'VALIDATION',
       'no text to voice: pass body.text, or set shot.audio.dialogue or shot.story.narration'));
     const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [shot.project_id]);
-    // provider (24 Aug 2026): 'AZURE' (default, unchanged behavior) or
-    // 'GEMINI', an experimental Amharic option under evaluation -- see
-    // gemini.tts() in adapters/index.mjs. Opt-in per call via body.provider
-    // only; nothing routes to it automatically, so every existing caller
-    // (including the generic tts() dispatcher elsewhere) is unaffected.
-    const provider = String(req.body?.provider ?? 'AZURE').toUpperCase();
+    // provider (24 Aug 2026, promoted to the Amharic default 25 Aug 2026):
+    // 'AZURE' or 'GEMINI'. A real side-by-side on this exact route (shot
+    // SH-010, project STU-77959F61) confirmed Gemini's prompt-directed
+    // accent control (gemini.tts() / AMHARIC_VOICE_DIRECTION in
+    // adapters/index.mjs) sounds meaningfully more native than Azure's
+    // am-ET voices, so Amharic projects now default to it. English
+    // projects still default to Azure -- Gemini was only evaluated
+    // against Amharic, so nothing changes for the English path. Either
+    // language can still override with an explicit body.provider.
+    const provider = String(req.body?.provider ?? (project.language === 'am' ? 'GEMINI' : 'AZURE')).toUpperCase();
     const estimatedCost = provider === 'GEMINI'
       ? ESTIMATED_COST_USD.GEMINI_TTS_PER_CHAR * text.length
       : ESTIMATED_COST_USD.AZURE_TTS_PER_CHAR * text.length;

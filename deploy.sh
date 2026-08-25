@@ -74,6 +74,28 @@ if git diff --cached --quiet; then
 else
   git commit -m "$MSG" || { echo "✗ commit failed"; exit 1; }
 fi
+
+# --- sync with origin before pushing ---------------------------------------
+# Cowork has no git CLI push access in its own sandbox, so it sometimes lands
+# commits on GitHub main via the web-upload editor instead of through this
+# clone. That leaves this local clone behind: a plain `git push` then fails
+# with "! [rejected] main -> main (fetch first)", and if this clone ALSO has
+# its own new local commit (e.g. from a previous deploy attempt), a bare
+# `git pull` can itself fail with "Need to specify how to reconcile divergent
+# branches" -- both hit for real on 25 Aug 2026 and needed manual
+# `git pull --no-rebase --no-edit` to fix. Doing that merge here, automatically,
+# right before we push (and after our own change is already committed above,
+# so there's nothing uncommitted for the merge to collide with), means this
+# script converges on its own instead of needing that by-hand fix every time.
+echo "• syncing with origin (in case something landed there outside this clone)"
+git fetch origin
+if ! git pull --no-rebase --no-edit origin main; then
+  echo "✗ Automatic merge with origin/main hit a real conflict (not just divergence)."
+  echo "  Resolve it by hand in $REPO -- git status will show the conflicted file(s) --"
+  echo "  then re-run this deploy."
+  exit 1
+fi
+
 git push || { echo "✗ push failed"; exit 1; }
 PUSHED_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 echo "  ✓ pushed $PUSHED_SHA to origin/main"

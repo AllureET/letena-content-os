@@ -517,9 +517,10 @@ function ovParamsFromData(kind, data) {
     textColor: d.text_color ?? firstLine?.text_color ?? '#EBAB20',
     bgColor: d.background_color ?? '#16103F',
     bgOpacity: d.background_opacity ?? 0.9,
-    fontSize: d.font_size_px ?? firstLine?.font_size_px ?? (isDoor ? 64 : kind === 'LABEL' ? 44 : 56),
+    fontSize: d.font_size_px ?? firstLine?.font_size_px
+      ?? (isDoor ? 64 : kind === 'CAPTION' ? 34 : kind === 'LABEL' ? 44 : 56),
     fontFamily: d.font_family ?? firstLine?.font_family ?? 'bold',
-    anchor: d.position?.anchor ?? (isIcon ? 'top-right' : 'upper-third'),
+    anchor: d.position?.anchor ?? (isIcon ? 'top-right' : kind === 'CAPTION' ? 'bottom' : 'upper-third'),
     cornerRadius: d.corner_radius_px ?? 16,
     textOutline: d.text_outline === true,
     textShadow: d.text_shadow === true,
@@ -893,9 +894,16 @@ const STUDIO_FORMATS = [
 // (see newOverlayHtml); pulled out to a shared constant so the per-row edit
 // box (added 25 Aug 2026, alongside the "Edit" button) can render an
 // identical dropdown without the two copies drifting apart.
+// 'CAPTION' added 25 Aug 2026 (Nate: "if we had like subtitles, can we make
+// it so they match the timing of her mouth somehow?"). It is the exact same
+// friendly fields as Title card/Label -- text, colour, size, position,
+// shape, outline/shadow -- with its own name so it's easy to tell a
+// generated subtitle line apart from a hand-authored label in this list,
+// and so a whole set of them can be bulk-generated at once (see the
+// "Generate captions" button below newOverlayHtml).
 const OVERLAY_KIND_OPTIONS = [
   ['TITLE_CARD', 'Title card'], ['LABEL', 'Label'],
-  ['DOOR_CARD', 'Door / CTA card'], ['ICON', 'Icon'],
+  ['DOOR_CARD', 'Door / CTA card'], ['ICON', 'Icon'], ['CAPTION', 'Caption / subtitle'],
 ];
 // 'lower-third' and 'bottom' match the two anchors studio_overlays.mjs added
 // 22 Aug 2026 specifically so a card has somewhere to go that clears a
@@ -941,9 +949,10 @@ function overlayFormFieldsHtml(suffix, kind, data, idToken, aspectRatio) {
   const firstLine = Array.isArray(d.lines) ? d.lines[0] : null;
   const doorLines = (Array.isArray(d.lines) ? d.lines.map(l => l?.text ?? '') : []).join('\n');
   const textColor = d.text_color ?? firstLine?.text_color ?? '#EBAB20';
-  const fontSize = d.font_size_px ?? firstLine?.font_size_px ?? (isDoor ? 64 : kind === 'LABEL' ? 44 : 56);
+  const fontSize = d.font_size_px ?? firstLine?.font_size_px
+    ?? (isDoor ? 64 : kind === 'CAPTION' ? 34 : kind === 'LABEL' ? 44 : 56);
   const fontFamily = d.font_family ?? firstLine?.font_family ?? 'bold';
-  const anchor = d.position?.anchor ?? (isIcon ? 'top-right' : 'upper-third');
+  const anchor = d.position?.anchor ?? (isIcon ? 'top-right' : kind === 'CAPTION' ? 'bottom' : 'upper-third');
   const animIn = d.animation_in?.type ?? 'fade';
   const animOut = d.animation_out?.type ?? 'fade';
   // Square (0) / rounded (the 16px this form has always silently saved) /
@@ -2664,6 +2673,27 @@ const screens = {
       </tr>${can('studio.write') ? overlayEditRow(o) : ''}`).join('')}
       </table></div>` : '<div class="card empty">No overlays yet. Nothing extra burns into the rough cut until one is added and approved below.</div>';
 
+    // Auto-generate captions (25 Aug 2026, Nate: "if we had like subtitles,
+    // can we make it so they match the timing of her mouth somehow?").
+    // Reads each shot's own narration text and its generated voice audio,
+    // finds the real pauses in that audio, and inserts one CAPTION overlay
+    // per phrase, timed to those pauses -- not true word-by-word lip sync
+    // (nothing in this pipeline hands back per-word timing), but anchored
+    // to real speech rather than one flat rate across the whole clip. Every
+    // caption lands here UNAPPROVED, same as any hand-made overlay, so
+    // nothing burns into a real cut before someone has actually looked at
+    // it against the audio.
+    const generateCaptionsHtml = can('studio.write') ? `<div class="card">
+      <div class="eyebrow">Captions</div>
+      <div class="sub" style="margin-top:-4px;margin-bottom:10px">
+        Generates one caption per phrase from each shot's own narration text, timed to the real pauses in
+        that shot's voice audio. This is phrase timing anchored to detected pauses, not word-by-word lip
+        sync -- watch the captions against the real cut and adjust before approving. Every shot needs its
+        voice generated first (or an accepted clip with its own embedded audio).
+      </div>
+      <button data-stcaptionsgenerate="${esc(id)}">Generate captions from narration</button>
+    </div>` : '';
+
     const newOverlayHtml = can('studio.write') ? `<div class="card"><div class="eyebrow">New overlay</div>
       <div class="sub" style="margin-top:-4px;margin-bottom:10px">A burned-in graphic over the footage -- a title card, an on-screen label, the closing door/CTA card, or an icon. Must be approved before it burns into assembly.</div>
       <div class="grid2">
@@ -2712,6 +2742,7 @@ const screens = {
       ${newShotHtml}
       <div class="eyebrow" style="margin-top:20px">Overlays</div>
       ${overlaysHtml}
+      ${generateCaptionsHtml}
       ${newOverlayHtml}
       ${musicHtml}
       ${assembleHtml}
@@ -4308,7 +4339,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stbudget],[data-stbudgetclear],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stoverlayeditshow],[data-stoverlaysave],[data-stovicon],[data-stoviconpick],[data-stoviconupload],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stbudget],[data-stbudgetclear],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stcaptionsgenerate],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stoverlayeditshow],[data-stoverlaysave],[data-stovicon],[data-stoviconpick],[data-stoviconupload],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -4879,6 +4910,21 @@ document.addEventListener('click', async (e) => {
       b.disabled = true; b.textContent = 'Unarchiving…';
       await api('POST', `/studio/projects/${projectId}/unarchive`);
       toast('Project unarchived'); return render();
+    }
+    if (b.dataset.stcaptionsgenerate) {
+      const projectId = b.dataset.stcaptionsgenerate;
+      b.disabled = true; b.textContent = 'Generating…';
+      let res;
+      try {
+        res = await api('POST', `/studio/projects/${projectId}/captions/generate`, {});
+      } finally {
+        b.disabled = false; b.textContent = 'Generate captions from narration';
+      }
+      const skippedNote = res.skipped?.length
+        ? ` ${res.skipped.length} shot(s) skipped: ${res.skipped.map(s => `${s.shot_code} (${s.reason})`).join('; ')}`
+        : '';
+      toast(`${res.created} caption(s) created, unapproved.${skippedNote} Review them against the audio, then approve each one before Assemble.`);
+      return render();
     }
     if (b.dataset.stoverlaycreate) {
       const projectId = b.dataset.stoverlaycreate;

@@ -51,14 +51,14 @@ import { promisify } from 'node:util';
 import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { q, one, audit, requirePerm, err } from '../core.mjs';
-import { storage, videoEngine, talkingHeadEngine, gemini, suno, azureSpeech } from '../adapters/index.mjs';
+import { storage, videoEngine, talkingHeadEngine, gemini, suno, azureSpeech, azureSTT } from '../adapters/index.mjs';
 import { cred } from '../creds.mjs';
 import { invokeAgent } from '../ai/gateway.mjs';
 import { formatOf } from '../formats.mjs';
 import { OVERLAY_KINDS, validateOverlayData, describeOverlayCollision, buildOverlayFilterGraph,
   compileOverlayLayerSvg, resolveCanvasSizeForAspect, loadEthiopicFontsBase64,
   ensureEthiopicFontsInstalled } from './studio_overlays.mjs';
-import { captionTimingsForNarration, defaultCaptionData } from './studio_captions.mjs';
+import { captionTimingsForNarrationASR, defaultCaptionData } from './studio_captions.mjs';
 
 const execFileP = promisify(execFile);
 const code = (p) => `${p}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
@@ -3600,8 +3600,14 @@ export default async function routes(app) {
       if (!clipHasAudio) voiceCursor += voiceDurS;
     }
 
+    // ASR language: same 'am'/other -> locale mapping voice generation
+    // already uses (line ~3108's azureSpeech.tts call) so this asks Azure
+    // STT for the same language its own TTS voices speak.
+    const asrLanguage = String(p.language ?? '').toLowerCase() === 'am' ? 'am-ET' : 'en-US';
+
     const created = [];
     const skipped = [];
+    const methodCounts = { asr_word_timing: 0, pause_heuristic: 0 };
     for (const plan of shotPlans) {
       const { shot } = plan;
       const text = shot.audio?.dialogue ?? shot.story?.narration ?? null;
@@ -3614,13 +3620,24 @@ export default async function routes(app) {
           reason: 'no generated narration audio found for this shot yet (run voice generation, or accept a clip with embedded audio, first)' });
         continue;
       }
+      // Closure captures THIS shot's own audio duration, since Azure's
+      // 60s-per-request ceiling is per-clip, not per-project -- a long shot
+      // simply falls back to the heuristic while a short one right after it
+      // in the same run still gets real ASR timing.
+      const getWordTimings = (localAudioPath) => azureSTT.wordTimings({
+        localAudioPath, language: asrLanguage, durationS: plan.audioDurS,
+      });
       let localTimings;
+      let method;
       try {
-        localTimings = await captionTimingsForNarration(text, plan.audioPath, plan.audioDurS);
+        const result = await captionTimingsForNarrationASR(text, plan.audioPath, plan.audioDurS, getWordTimings);
+        localTimings = result.timings;
+        method = result.method;
       } catch (e) {
         skipped.push({ shot_code: shot.shot_code, reason: `timing analysis failed: ${e.message}` });
         continue;
       }
+      if (method === 'asr_word_timing' || method === 'pause_heuristic') methodCounts[method]++;
       for (const t of localTimings) {
         const startS = Math.round((plan.cursorStart + t.start_s) * 100) / 100;
         const endS = Math.round((plan.cursorStart + t.end_s) * 100) / 100;
@@ -3634,13 +3651,18 @@ export default async function routes(app) {
 
     await q(`INSERT INTO studio.events (project_id, actor_id, note) VALUES ($1,$2,$3)`,
       [p.id, req.actor?.id ?? null,
-       `generated ${created.length} caption overlay(s) from narration text${skipped.length ? `; skipped ${skipped.length} shot(s)` : ''}`]);
+       `generated ${created.length} caption overlay(s) from narration text${skipped.length ? `; skipped ${skipped.length} shot(s)` : ''}`
+       + ` (${methodCounts.asr_word_timing} shot(s) via real Azure word timing, ${methodCounts.pause_heuristic} via the pause-anchored fallback)`]);
 
     return reply.code(201).send({
       created: created.length,
       overlays: created,
       skipped,
-      note: 'Captions are timed to real detected pauses in the narration audio and each phrase\'s length, not true word-by-word lip sync -- no voice engine this system uses hands back per-word timing. Watch them against the real cut and adjust before approving; every caption still needs approval, same as any other overlay, before Assemble will use it.',
+      shots_via_asr: methodCounts.asr_word_timing,
+      shots_via_pause_heuristic: methodCounts.pause_heuristic,
+      note: methodCounts.asr_word_timing > 0
+        ? 'Captions are timed using real Azure speech-to-text word timing where available, falling back to pause-anchored phrase timing for any shot Azure could not process (no key, over the 60s limit, or a transient failure). Watch them against the real cut and adjust before approving; every caption still needs approval, same as any other overlay, before Assemble will use it.'
+        : 'Captions are timed to real detected pauses in the narration audio and each phrase\'s length, not true word-by-word lip sync -- Azure word timing was not available for this run (no AZURE_SPEECH_KEY configured, or every shot failed/exceeded the 60s limit). Watch them against the real cut and adjust before approving; every caption still needs approval, same as any other overlay, before Assemble will use it.',
     });
   });
 

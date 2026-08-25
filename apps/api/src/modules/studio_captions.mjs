@@ -190,6 +190,83 @@ export function assignChunkTimings(chunks, speechSegments, totalDurationS) {
   return timings;
 }
 
+// Positional alignment of REAL ASR word timings (e.g. from Azure Speech-to-
+// Text, see adapters/index.mjs's azureSTT.wordTimings) onto OUR
+// already-known-correct caption chunks. The ASR's own recognized TEXT is
+// never trusted or used here -- Amharic ASR mis-hears plenty of words, and
+// our script is already correct (it is what was fed to the TTS call). Only
+// the ASR's per-word TIMING is used, matched onto our chunks by word
+// POSITION rather than by text match. If the ASR heard a different number of
+// words than our script has (a missed word, a number read as digits, a
+// filler sound), matching position 1-to-1 would start out right and drift
+// further wrong with every later word, so each of our word positions is
+// instead linearly resampled onto the ASR's word index range -- keeps the
+// two streams roughly in step across the whole clip instead of accurate
+// only near the start. Returns null (never throws) when there is no usable
+// ASR data, so callers can fall straight through to the pause-anchored
+// heuristic below with one `?? await captionTimingsForNarration(...)`-style
+// fallback.
+export function alignWordsToChunks(chunks, asrWords, totalDurationS) {
+  if (!chunks.length) return null;
+  if (!asrWords || !asrWords.length) return null;
+  const chunkWordCounts = chunks.map(c => Math.max(1, wordCount(c)));
+  const totalWords = chunkWordCounts.reduce((a, b) => a + b, 0) || 1;
+  const scale = asrWords.length > 1 ? (asrWords.length - 1) / Math.max(1, totalWords - 1) : 0;
+  const asrIndexFor = (wordPos) => Math.min(asrWords.length - 1, Math.max(0, Math.round(wordPos * scale)));
+
+  const timings = [];
+  let wordCursor = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const n = chunkWordCounts[i];
+    const firstIdx = asrIndexFor(wordCursor);
+    const lastIdx = Math.max(firstIdx, asrIndexFor(wordCursor + n - 1));
+    const start = asrWords[firstIdx].start_s;
+    let end = asrWords[lastIdx].end_s;
+    if (end - start < MIN_CAPTION_DUR_S) end = Math.min(totalDurationS, start + MIN_CAPTION_DUR_S);
+    timings.push({
+      text: chunks[i],
+      start_s: Math.round(Math.max(0, start) * 100) / 100,
+      end_s: Math.round(Math.min(totalDurationS, end) * 100) / 100,
+    });
+    wordCursor += n;
+  }
+  // Same forward-clamp-then-re-floor as assignChunkTimings, for the same
+  // reason: two ASR words with an odd overlap (or the MIN_CAPTION_DUR_S
+  // floor above) must never leave two captions asking to show at once.
+  for (let i = 1; i < timings.length; i++) {
+    if (timings[i].start_s < timings[i - 1].end_s) timings[i].start_s = timings[i - 1].end_s;
+    const minEnd = Math.min(totalDurationS, timings[i].start_s + MIN_CAPTION_DUR_S);
+    if (timings[i].end_s < minEnd) timings[i].end_s = minEnd;
+  }
+  return timings;
+}
+
+// End-to-end with a real ASR word-timing source layered in front of the
+// pause-anchored heuristic. getWordTimings is INJECTED, not imported --
+// keeps this module needing zero vendor credentials to unit test, same
+// discipline as detectSpeechSegments shelling out to ffmpeg directly rather
+// than going through a mockable adapter layer would have broken. Pass a
+// function `(localAudioPath) => Promise<[{word,start_s,end_s}]|null>` (Azure
+// STT already shaped that way); its result feeding alignWordsToChunks. Any
+// failure -- Azure down, no credentials, clip over the 60s REST limit, no
+// usable words back -- falls through to captionTimingsForNarration, exactly
+// as if this function had never been called. Returns both the timings and
+// which method actually produced them, since that is worth surfacing to
+// whoever reviews the captions afterward.
+export async function captionTimingsForNarrationASR(text, localAudioPath, durationS, getWordTimings, opts = {}) {
+  const chunks = chunkNarrationText(text, opts);
+  if (!chunks.length || !(durationS > 0)) return { timings: [], method: 'none' };
+  if (typeof getWordTimings === 'function') {
+    try {
+      const words = await getWordTimings(localAudioPath);
+      const aligned = alignWordsToChunks(chunks, words, durationS);
+      if (aligned) return { timings: aligned, method: 'asr_word_timing' };
+    } catch { /* Azure unavailable/failed -- fall through to the heuristic */ }
+  }
+  const timings = await captionTimingsForNarration(text, localAudioPath, durationS, opts);
+  return { timings, method: 'pause_heuristic' };
+}
+
 // Runs ffmpeg's silencedetect over a local audio/video file and returns the
 // speech segments (the complement of detected silence) within
 // [0, totalDurationS]. noiseDb/minSilenceS are tuned for a clean TTS

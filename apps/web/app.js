@@ -658,6 +658,20 @@ const STUDIO_FORMATS = [
   { value: 'promo', label: 'Promo', desc: 'Announces or launches something -- a service, an event, a new offering.' },
 ];
 
+// Shot video style (22 Aug 2026). generation.mode_preference has always
+// driven three genuinely different render paths -- plain text-to-video,
+// image-to-video from a composed first frame, or the fal.ai talking-head
+// path that lip-syncs a presenter to this shot's own voice line -- but no
+// screen ever let a person choose it. It could only be set by editing the
+// shot's JSON directly, which is exactly the kind of step Rudy cannot take.
+// This list backs a plain dropdown on New shot and on the inline shot
+// editor; the value is written straight into generation.mode_preference.
+const SHOT_MODES = [
+  { value: 'text_to_video', label: 'Text to video (default)', desc: 'Generates straight from the shot’s description. No locked first frame, no voice sync -- the plain Runway path.' },
+  { value: 'image_to_video', label: 'Image to video', desc: 'Animates a composed first frame (from Step 3 below, or the presenter plate). Use for a locked character/environment shot with no lip sync needed.' },
+  { value: 'talking_head', label: 'Talking head (lip-synced to voice)', desc: 'The AI Story doctor-presenter format: animates the composed first frame so the presenter’s mouth matches this shot’s voice line, through fal.ai. Needs a voice line (Add voice, below) and a composed first frame before Generate.' },
+];
+
 // Continuity lock catalog (18 Aug 2026). A "lock" is Video Studio's term
 // for a reusable, versioned description of something that has to look the
 // same across every shot it appears in -- a character's face and outfit, a
@@ -2085,6 +2099,11 @@ const screens = {
                   .map(([v, label]) => `<option value="${v}" ${((s.camera?.shot_size ?? 'WIDE') === v) ? 'selected' : ''}>${esc(label)}</option>`).join('')}
               </select>
               <div class="muted" style="font-size:11px;margin-top:2px">Crops the composed first frame tighter on the subject. Exact, unlike asking the image model for a closer shot.</div>
+              <label>Video style</label>
+              <select id="stedit-mode-${esc(s.id)}">
+                ${SHOT_MODES.map(m => `<option value="${esc(m.value)}" ${((s.generation?.mode_preference ?? 'text_to_video') === m.value) ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}
+              </select>
+              <div class="muted" id="stedit-mode-desc-${esc(s.id)}" style="font-size:11px;margin-top:2px">${esc(SHOT_MODES.find(m => m.value === (s.generation?.mode_preference ?? 'text_to_video'))?.desc ?? '')}</div>
               <label>Story beat</label><textarea id="stedit-beat-${esc(s.id)}">${esc(beat)}</textarea>
               <button style="margin-top:6px" data-stshotedit="${esc(s.id)}">Save changes</button>
             </div>` : ''}
@@ -2110,8 +2129,16 @@ const screens = {
           <label>Story beat</label><textarea id="st-shot-beat" placeholder="What happens in this shot"></textarea>
           <label>Continuity characters (comma separated entity codes)</label>
           <input id="st-shot-chars" placeholder="e.g. CHR-MAYA, CHR-SAM">
+          <label>Environment (entity code, optional)</label>
+          <input id="st-shot-env" placeholder="e.g. ENV-CONSULT-ROOM-2">
+          <div class="muted" style="font-size:11px;margin-top:2px">Needed for Step 3 &middot; Compose first frame below, even when a presenter plate is already accepted -- that step still checks that a CHARACTER and an ENVIRONMENT lock are both attached to the shot before it will cut the crop.</div>
           <label>Camera movement (optional)</label><input id="st-shot-camera" placeholder="e.g. slow push in">
           <label>Action subject (optional)</label><input id="st-shot-action" placeholder="e.g. Maya opens the door">
+          <label>Video style</label>
+          <select id="st-shot-mode">
+            ${SHOT_MODES.map(m => `<option value="${esc(m.value)}"${m.value === 'text_to_video' ? ' selected' : ''}>${esc(m.label)}</option>`).join('')}
+          </select>
+          <div class="muted" id="st-shot-mode-desc" style="font-size:12px;margin-top:2px">${esc(SHOT_MODES.find(m => m.value === 'text_to_video').desc)}</div>
         </div>
       </div>
       <div style="margin-top:12px"><button class="primary" data-stshotcreate="${esc(id)}">Add shot</button></div>
@@ -3533,6 +3560,20 @@ document.addEventListener('change', (e) => {
     if (desc) desc.textContent = STUDIO_FORMATS.find(f => f.value === t.value)?.desc ?? '';
     return;
   }
+  // New shot's video style description, same in-place pattern: updates the
+  // helper text only, never triggers a render, so nothing else typed into
+  // the New shot form is lost.
+  if (t.id === 'st-shot-mode') {
+    const desc = document.getElementById('st-shot-mode-desc');
+    if (desc) desc.textContent = SHOT_MODES.find(m => m.value === t.value)?.desc ?? '';
+    return;
+  }
+  if (t.id?.startsWith('stedit-mode-')) {
+    const shotId = t.id.slice('stedit-mode-'.length);
+    const desc = document.getElementById(`stedit-mode-desc-${shotId}`);
+    if (desc) desc.textContent = SHOT_MODES.find(m => m.value === t.value)?.desc ?? '';
+    return;
+  }
   // Overlay form: show only the fields the chosen kind actually has, so a
   // door card never asks for a single "text" and an icon never asks for a
   // text colour. Same in-place discipline as the two blocks around it --
@@ -4096,17 +4137,20 @@ document.addEventListener('click', async (e) => {
       const shotCode = elv('st-shot-code')?.trim();
       if (!shotCode) return toast('Give the shot a code first.', 'warn');
       const chars = (elv('st-shot-chars') ?? '').split(',').map(x => x.trim()).filter(Boolean);
+      const env = elv('st-shot-env')?.trim();
       const camera = elv('st-shot-camera')?.trim();
       const action = elv('st-shot-action')?.trim();
+      const mode = elv('st-shot-mode') || 'text_to_video';
       b.disabled = true; b.textContent = 'Adding…';
       await api('POST', `/studio/projects/${projectId}/shots`, {
         shot_code: shotCode,
         order_index: Number(elv('st-shot-order')) || 0,
         duration_target_s: Number(elv('st-shot-dur')) || 5,
-        continuity: { characters: chars },
+        continuity: { characters: chars, ...(env ? { environment: env } : {}) },
         story: { beat: elv('st-shot-beat') ?? '' },
         ...(camera ? { camera: { movement: camera } } : {}),
         ...(action ? { action: { subject: action } } : {}),
+        generation: { mode_preference: mode },
       });
       toast('Shot added'); return render();
     }
@@ -4130,6 +4174,7 @@ document.addEventListener('click', async (e) => {
         ...(durRaw !== '' && durRaw != null ? { duration_target_s: Number(durRaw) } : {}),
         story: { ...(cur.story ?? {}), beat: elv(`stedit-beat-${id}`) ?? '' },
         camera: { ...(cur.camera ?? {}), shot_size: elv(`stedit-size-${id}`) ?? 'WIDE' },
+        generation: { ...(cur.generation ?? {}), mode_preference: elv(`stedit-mode-${id}`) ?? 'text_to_video' },
       });
       toast('Shot updated'); return render();
     }

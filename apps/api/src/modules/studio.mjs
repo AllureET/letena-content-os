@@ -816,6 +816,17 @@ function classifyGenerationError(message) {
   if (/exhausted balance|insufficient (balance|funds|credit)|top up|payment required|402|quota exceeded|billing|user is locked|invalid api key|unauthorized|401|403|forbidden/.test(m)) {
     return 'ACCOUNT';
   }
+  // Runway's daily task limit (22 Aug 2026, hit for real generating the
+  // myth-buster illustrated shots): "Your daily task limit has been
+  // reached", a 429. The generic rate-limit rule below reads this as
+  // TRANSIENT and burns the same-engine retry plus a fallback-engine
+  // attempt on a quota that cannot clear inside that window -- a wasted
+  // ~429 round trip is cheap, but the ladder still ends on a bare 502 with
+  // no signal that this is a daily cap rather than a blip. Classified
+  // ahead of the rate-limit rule so it stops immediately with a message
+  // that says what actually happened and when to try again, the same
+  // reasoning as the ACCOUNT class above.
+  if (/daily (task |generation |)limit/.test(m)) return 'ACCOUNT';
   if (/polic|moderat|safety|blocked content/.test(m)) return 'POLICY';
   // Runway's own output-quality rejection (22 Aug 2026). It reads like a
   // hard failure -- "An unexpected error occurred" -- and it is not. Six

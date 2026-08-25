@@ -440,8 +440,8 @@ function ovHexToRgba(hex, opacity) {
 // render (overlayPreviewHtml, using the overlay's saved data) and the live
 // runtime update (updateOverlayPreview, reading the form's current values) --
 // one definition so the two can never show something different.
-function ovPreviewParts(canvasW, p) {
-  const scale = OV_PREVIEW_PX / canvasW;
+function ovPreviewParts(canvasW, p, previewPx = OV_PREVIEW_PX) {
+  const scale = previewPx / canvasW;
   if (p.kind === 'ICON') {
     const boxCss = `position:absolute;${ovAnchorCss(p.anchor)};width:22%;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center`;
     const html = p.iconUrl
@@ -475,16 +475,16 @@ function ovPreviewParts(canvasW, p) {
   return { canvasBg: OV_PREVIEW_BG, boxCss, html: esc(p.text || 'overlay text…') };
 }
 
-// The preview block embedded directly in the server-rendered HTML (so it's
-// already correct the instant the New-overlay form or an Edit box appears,
-// same "no JS needed until something changes" discipline as the rest of this
-// form) -- see overlayFormFieldsHtml below for where this is called.
-function overlayPreviewHtml(suffix, kind, data, aspectRatio, iconUrl) {
+// Reads an overlay's saved `data` (whatever kind it is) into the plain
+// params object ovPreviewParts wants. Split out of overlayPreviewHtml (26
+// Aug 2026) so the same read-the-saved-data logic can also feed the table
+// row's small static thumbnail (overlayTableThumbHtml) without copying it a
+// third time.
+function ovParamsFromData(kind, data) {
   const d = data ?? {};
   const isDoor = kind === 'DOOR_CARD', isIcon = kind === 'ICON';
   const firstLine = Array.isArray(d.lines) ? d.lines[0] : null;
-  const { w: canvasW, h: canvasH } = ovCanvasSize(aspectRatio);
-  const parts = ovPreviewParts(canvasW, {
+  return {
     kind,
     text: d.text ?? '',
     doorLines: Array.isArray(d.lines) ? d.lines.map(l => l?.text ?? '') : [],
@@ -495,12 +495,37 @@ function overlayPreviewHtml(suffix, kind, data, aspectRatio, iconUrl) {
     fontFamily: d.font_family ?? firstLine?.font_family ?? 'bold',
     anchor: d.position?.anchor ?? (isIcon ? 'top-right' : 'upper-third'),
     cornerRadius: d.corner_radius_px ?? 16,
-    iconUrl,
-  });
+  };
+}
+
+// The preview block embedded directly in the server-rendered HTML (so it's
+// already correct the instant the New-overlay form or an Edit box appears,
+// same "no JS needed until something changes" discipline as the rest of this
+// form) -- see overlayFormFieldsHtml below for where this is called.
+function overlayPreviewHtml(suffix, kind, data, aspectRatio, iconUrl) {
+  const { w: canvasW, h: canvasH } = ovCanvasSize(aspectRatio);
+  const parts = ovPreviewParts(canvasW, { ...ovParamsFromData(kind, data), iconUrl });
   return `<div id="st-ov-preview${suffix}" data-canvasw="${canvasW}" style="position:relative;width:${OV_PREVIEW_PX}px;aspect-ratio:${canvasW}/${canvasH};background:${parts.canvasBg};border:1px solid var(--surface-3);border-radius:6px;overflow:hidden;margin-top:6px">
     <div id="st-ov-preview-box${suffix}" style="${parts.boxCss}">${parts.html}</div>
   </div>
   <div class="muted" style="font-size:10px;margin-top:3px">Rough preview -- exact wrapping and spacing happen when this actually renders.</div>`;
+}
+
+// A bare, non-interactive version of the same thumbnail (26 Aug 2026, Nate
+// looking at the Overlays table with the Edit box closed: "wouldnt it make
+// sense if we can see the preview box here too instead of having to go to
+// edit to see it?") -- same math, smaller, no label/caption, meant for one
+// table cell per overlay row rather than a form. iconUrl is resolved by the
+// caller (the table build below fetches every ICON overlay's asset once per
+// render, in parallel, the same pattern assetsByShot already uses for
+// per-shot asset fetches a little further down this file).
+const OV_TABLE_THUMB_PX = 84;
+function overlayTableThumbHtml(kind, data, aspectRatio, iconUrl) {
+  const { w: canvasW, h: canvasH } = ovCanvasSize(aspectRatio);
+  const parts = ovPreviewParts(canvasW, { ...ovParamsFromData(kind, data), iconUrl }, OV_TABLE_THUMB_PX);
+  return `<div style="position:relative;width:${OV_TABLE_THUMB_PX}px;aspect-ratio:${canvasW}/${canvasH};background:${parts.canvasBg};border:1px solid var(--surface-3);border-radius:4px;overflow:hidden;flex-shrink:0">
+    <div style="${parts.boxCss}">${parts.html}</div>
+  </div>`;
 }
 
 // Runtime counterpart to overlayPreviewHtml: reads whatever is currently in
@@ -2030,6 +2055,23 @@ const screens = {
     let overlays = [];
     try { overlays = (await api('GET', `/studio/projects/${id}/overlays`)).items ?? []; } catch { overlays = []; }
 
+    // Resolves each ICON overlay's asset_id to a real image URL once per
+    // render (26 Aug 2026, for the Overlays table's new preview thumbnail
+    // column below), using the single-asset lookup added for the Edit box's
+    // icon preview. Only for overlays that are actually ICON kind with an
+    // asset_id set -- most overlays are TITLE_CARD/LABEL/DOOR_CARD and need
+    // no fetch at all, and a deleted asset just leaves that one thumbnail
+    // showing the "icon" placeholder rather than failing the whole render.
+    const iconUrlByOverlay = new Map();
+    await Promise.all(overlays
+      .filter(o => o.kind === 'ICON' && o.data?.asset_id)
+      .map(async (o) => {
+        try {
+          const a = await api('GET', `/production/assets/${o.data.asset_id}`);
+          if (a?.storage_key) iconUrlByOverlay.set(o.id, mediaUrl(a.storage_key));
+        } catch { /* asset may have been deleted from the library -- leave the thumbnail blank */ }
+      }));
+
     // Per-shot assets for the inline review box (21 Aug 2026, owner looking
     // at a shot sitting in NEEDS_REVIEW: "this says needs review but doesnt
     // offer me a viewer to view it or a place to approve, reject, make
@@ -2535,7 +2577,7 @@ const screens = {
     // prefilled from this row's current data, with the raw JSON still there
     // as an escape hatch but empty by default -- what you see in the form is
     // what gets saved, same rule the create form already uses.
-    const overlayEditRow = (o) => { const suffix = `-${o.id}`; return `<tr id="stoveditrow-${esc(o.id)}" hidden><td colspan="4">
+    const overlayEditRow = (o) => { const suffix = `-${o.id}`; return `<tr id="stoveditrow-${esc(o.id)}" hidden><td colspan="5">
       <div class="claimrow">
         <div class="grid2">
           <div>
@@ -2558,8 +2600,9 @@ const screens = {
     </td></tr>`; };
 
     const overlaysHtml = overlays.length ? `<div class="card"><table>
-      <tr><th>Kind</th><th>Time range</th><th>Status</th><th></th></tr>
+      <tr><th>Preview</th><th>Kind</th><th>Time range</th><th>Status</th><th></th></tr>
       ${overlays.map(o => `<tr>
+        <td>${overlayTableThumbHtml(o.kind, o.data, p.aspect_ratio, iconUrlByOverlay.get(o.id))}</td>
         <td class="mono">${esc(o.kind)}</td>
         <td class="mono">${esc(String(o.start_s))}s &ndash; ${esc(String(o.end_s))}s</td>
         <td>${o.approved_at

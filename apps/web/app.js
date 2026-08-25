@@ -658,20 +658,6 @@ const STUDIO_FORMATS = [
   { value: 'promo', label: 'Promo', desc: 'Announces or launches something -- a service, an event, a new offering.' },
 ];
 
-// Shot video style (22 Aug 2026). generation.mode_preference has always
-// driven three genuinely different render paths -- plain text-to-video,
-// image-to-video from a composed first frame, or the fal.ai talking-head
-// path that lip-syncs a presenter to this shot's own voice line -- but no
-// screen ever let a person choose it. It could only be set by editing the
-// shot's JSON directly, which is exactly the kind of step Rudy cannot take.
-// This list backs a plain dropdown on New shot and on the inline shot
-// editor; the value is written straight into generation.mode_preference.
-const SHOT_MODES = [
-  { value: 'text_to_video', label: 'Text to video (default)', desc: 'Generates straight from the shot’s description. No locked first frame, no voice sync -- the plain Runway path.' },
-  { value: 'image_to_video', label: 'Image to video', desc: 'Animates a composed first frame (from Step 3 below, or the presenter plate). Use for a locked character/environment shot with no lip sync needed.' },
-  { value: 'talking_head', label: 'Talking head (lip-synced to voice)', desc: 'The AI Story doctor-presenter format: animates the composed first frame so the presenter’s mouth matches this shot’s voice line, through fal.ai. Needs a voice line (Add voice, below) and a composed first frame before Generate.' },
-];
-
 // Continuity lock catalog (18 Aug 2026). A "lock" is Video Studio's term
 // for a reusable, versioned description of something that has to look the
 // same across every shot it appears in -- a character's face and outfit, a
@@ -681,6 +667,14 @@ const SHOT_MODES = [
 // text: they match what that function actually reads for each entity
 // type. Getting them right in the JSON is what makes the generated
 // reference image match.
+// Same four kinds/labels the "New overlay" kind select has always offered
+// (see newOverlayHtml); pulled out to a shared constant so the per-row edit
+// box (added 25 Aug 2026, alongside the "Edit" button) can render an
+// identical dropdown without the two copies drifting apart.
+const OVERLAY_KIND_OPTIONS = [
+  ['TITLE_CARD', 'Title card'], ['LABEL', 'Label'],
+  ['DOOR_CARD', 'Door / CTA card'], ['ICON', 'Icon'],
+];
 const LOCK_LEVELS = [
   { value: 'L1_ENTITY', label: 'Entity (a character, place, or object)', desc: 'The one you’ll use almost every time: a specific character, environment, or prop that needs to look the same in every shot it’s in.' },
   { value: 'L0_PROJECT', label: 'Project-wide style', desc: 'Rules for the whole project at once: overall look, medium, palette. Usually just one of these per project (Entity type: STYLE).' },
@@ -2099,11 +2093,6 @@ const screens = {
                   .map(([v, label]) => `<option value="${v}" ${((s.camera?.shot_size ?? 'WIDE') === v) ? 'selected' : ''}>${esc(label)}</option>`).join('')}
               </select>
               <div class="muted" style="font-size:11px;margin-top:2px">Crops the composed first frame tighter on the subject. Exact, unlike asking the image model for a closer shot.</div>
-              <label>Video style</label>
-              <select id="stedit-mode-${esc(s.id)}">
-                ${SHOT_MODES.map(m => `<option value="${esc(m.value)}" ${((s.generation?.mode_preference ?? 'text_to_video') === m.value) ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}
-              </select>
-              <div class="muted" id="stedit-mode-desc-${esc(s.id)}" style="font-size:11px;margin-top:2px">${esc(SHOT_MODES.find(m => m.value === (s.generation?.mode_preference ?? 'text_to_video'))?.desc ?? '')}</div>
               <label>Story beat</label><textarea id="stedit-beat-${esc(s.id)}">${esc(beat)}</textarea>
               <button style="margin-top:6px" data-stshotedit="${esc(s.id)}">Save changes</button>
             </div>` : ''}
@@ -2129,16 +2118,8 @@ const screens = {
           <label>Story beat</label><textarea id="st-shot-beat" placeholder="What happens in this shot"></textarea>
           <label>Continuity characters (comma separated entity codes)</label>
           <input id="st-shot-chars" placeholder="e.g. CHR-MAYA, CHR-SAM">
-          <label>Environment (entity code, optional)</label>
-          <input id="st-shot-env" placeholder="e.g. ENV-CONSULT-ROOM-2">
-          <div class="muted" style="font-size:11px;margin-top:2px">Needed for Step 3 &middot; Compose first frame below, even when a presenter plate is already accepted -- that step still checks that a CHARACTER and an ENVIRONMENT lock are both attached to the shot before it will cut the crop.</div>
           <label>Camera movement (optional)</label><input id="st-shot-camera" placeholder="e.g. slow push in">
           <label>Action subject (optional)</label><input id="st-shot-action" placeholder="e.g. Maya opens the door">
-          <label>Video style</label>
-          <select id="st-shot-mode">
-            ${SHOT_MODES.map(m => `<option value="${esc(m.value)}"${m.value === 'text_to_video' ? ' selected' : ''}>${esc(m.label)}</option>`).join('')}
-          </select>
-          <div class="muted" id="st-shot-mode-desc" style="font-size:12px;margin-top:2px">${esc(SHOT_MODES.find(m => m.value === 'text_to_video').desc)}</div>
         </div>
       </div>
       <div style="margin-top:12px"><button class="primary" data-stshotcreate="${esc(id)}">Add shot</button></div>
@@ -2194,6 +2175,32 @@ const screens = {
     // selector plus one JSON textarea for `data` -- the pre-AI-assist shape
     // the lock form used before tonight's lock-drafter feature -- since an
     // AI-drafting UI for overlays is separate follow-up work, not this pass.
+    // Per-row inline edit box (25 Aug 2026): the API has always supported
+    // PATCH /studio/overlays/:overlayId -- editing an overlay un-approves it,
+    // same as a lock revision does -- but the UI only ever wired up Create,
+    // Approve, and Delete, so the only way to change a card's timing or
+    // position was delete-then-recreate. Same toggle-a-hidden-box pattern
+    // shots already use for their "Add voice" box (see stshotvoiceshow /
+    // #stvoice-<id> above), reusing the raw-JSON textarea the create form
+    // already treats as the source of truth when non-empty, so this needs no
+    // separate per-kind friendly fields to stay in sync.
+    const overlayEditRow = (o) => `<tr id="stoveditrow-${esc(o.id)}" hidden><td colspan="4">
+      <div class="claimrow">
+        <label>Kind</label><select id="stovedit-kind-${esc(o.id)}">
+          ${OVERLAY_KIND_OPTIONS.map(([v, label]) => `<option value="${v}" ${o.kind === v ? 'selected' : ''}>${label}</option>`).join('')}
+        </select>
+        <div class="grid2">
+          <div><label>Start (s)</label><input id="stovedit-start-${esc(o.id)}" type="number" min="0" step="0.1" value="${esc(String(o.start_s))}"></div>
+          <div><label>End (s)</label><input id="stovedit-end-${esc(o.id)}" type="number" min="0" step="0.1" value="${esc(String(o.end_s))}"></div>
+          <div><label>Order index</label><input id="stovedit-order-${esc(o.id)}" type="number" min="0" value="${esc(String(o.order_index ?? 0))}"></div>
+        </div>
+        <label>Data (JSON)</label>
+        <textarea id="stovedit-data-${esc(o.id)}" rows="6">${esc(JSON.stringify(o.data ?? {}, null, 2))}</textarea>
+        <div class="muted" style="font-size:11px;margin:4px 0">Saving un-approves this overlay -- approve it again, then re-run Assemble rough cut below, for the change to actually show up in the video. The last assembled cut is a rendered file; it does not update itself.</div>
+        <button style="margin-top:6px" data-stoverlaysave="${esc(o.id)}">Save changes</button>
+      </div>
+    </td></tr>`;
+
     const overlaysHtml = overlays.length ? `<div class="card"><table>
       <tr><th>Kind</th><th>Time range</th><th>Status</th><th></th></tr>
       ${overlays.map(o => `<tr>
@@ -2204,9 +2211,10 @@ const screens = {
           : `<span class="pill p-PENDING"><span class="d"></span>pending approval</span>`}</td>
         <td class="flex" style="flex-wrap:wrap">
           ${can('studio.approve') && !o.approved_at ? `<button class="approve" data-stoverlayapprove="${esc(o.id)}">Approve</button>` : ''}
+          ${can('studio.write') ? `<button data-stoverlayeditshow="${esc(o.id)}">Edit</button>` : ''}
           ${can('studio.write') ? `<button data-stoverlaydelete="${esc(o.id)}" style="color:var(--risk-high)">Delete</button>` : ''}
         </td>
-      </tr>`).join('')}
+      </tr>${can('studio.write') ? overlayEditRow(o) : ''}`).join('')}
       </table></div>` : '<div class="card empty">No overlays yet. Nothing extra burns into the rough cut until one is added and approved below.</div>';
 
     const newOverlayHtml = can('studio.write') ? `<div class="card"><div class="eyebrow">New overlay</div>
@@ -2214,10 +2222,7 @@ const screens = {
       <div class="grid2">
         <div>
           <label>Kind</label><select id="st-overlay-kind">
-            <option value="TITLE_CARD">Title card</option>
-            <option value="LABEL">Label</option>
-            <option value="DOOR_CARD">Door / CTA card</option>
-            <option value="ICON">Icon</option>
+            ${OVERLAY_KIND_OPTIONS.map(([v, label]) => `<option value="${v}">${label}</option>`).join('')}
           </select>
           <label>Start (s)</label><input id="st-overlay-start" type="number" min="0" step="0.1" placeholder="e.g. 0">
           <label>End (s)</label><input id="st-overlay-end" type="number" min="0" step="0.1" placeholder="e.g. 2">
@@ -3560,20 +3565,6 @@ document.addEventListener('change', (e) => {
     if (desc) desc.textContent = STUDIO_FORMATS.find(f => f.value === t.value)?.desc ?? '';
     return;
   }
-  // New shot's video style description, same in-place pattern: updates the
-  // helper text only, never triggers a render, so nothing else typed into
-  // the New shot form is lost.
-  if (t.id === 'st-shot-mode') {
-    const desc = document.getElementById('st-shot-mode-desc');
-    if (desc) desc.textContent = SHOT_MODES.find(m => m.value === t.value)?.desc ?? '';
-    return;
-  }
-  if (t.id?.startsWith('stedit-mode-')) {
-    const shotId = t.id.slice('stedit-mode-'.length);
-    const desc = document.getElementById(`stedit-mode-desc-${shotId}`);
-    if (desc) desc.textContent = SHOT_MODES.find(m => m.value === t.value)?.desc ?? '';
-    return;
-  }
   // Overlay form: show only the fields the chosen kind actually has, so a
   // door card never asks for a single "text" and an icon never asks for a
   // text colour. Same in-place discipline as the two blocks around it --
@@ -3897,7 +3888,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stbudget],[data-stbudgetclear],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stbudget],[data-stbudgetclear],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stoverlayeditshow],[data-stoverlaysave],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -4137,20 +4128,17 @@ document.addEventListener('click', async (e) => {
       const shotCode = elv('st-shot-code')?.trim();
       if (!shotCode) return toast('Give the shot a code first.', 'warn');
       const chars = (elv('st-shot-chars') ?? '').split(',').map(x => x.trim()).filter(Boolean);
-      const env = elv('st-shot-env')?.trim();
       const camera = elv('st-shot-camera')?.trim();
       const action = elv('st-shot-action')?.trim();
-      const mode = elv('st-shot-mode') || 'text_to_video';
       b.disabled = true; b.textContent = 'Adding…';
       await api('POST', `/studio/projects/${projectId}/shots`, {
         shot_code: shotCode,
         order_index: Number(elv('st-shot-order')) || 0,
         duration_target_s: Number(elv('st-shot-dur')) || 5,
-        continuity: { characters: chars, ...(env ? { environment: env } : {}) },
+        continuity: { characters: chars },
         story: { beat: elv('st-shot-beat') ?? '' },
         ...(camera ? { camera: { movement: camera } } : {}),
         ...(action ? { action: { subject: action } } : {}),
-        generation: { mode_preference: mode },
       });
       toast('Shot added'); return render();
     }
@@ -4174,7 +4162,6 @@ document.addEventListener('click', async (e) => {
         ...(durRaw !== '' && durRaw != null ? { duration_target_s: Number(durRaw) } : {}),
         story: { ...(cur.story ?? {}), beat: elv(`stedit-beat-${id}`) ?? '' },
         camera: { ...(cur.camera ?? {}), shot_size: elv(`stedit-size-${id}`) ?? 'WIDE' },
-        generation: { ...(cur.generation ?? {}), mode_preference: elv(`stedit-mode-${id}`) ?? 'text_to_video' },
       });
       toast('Shot updated'); return render();
     }
@@ -4541,6 +4528,30 @@ document.addEventListener('click', async (e) => {
         data,
       });
       toast('Overlay created'); return render();
+    }
+    if (b.dataset.stoverlayeditshow) {
+      const box = document.getElementById('stoveditrow-' + b.dataset.stoverlayeditshow);
+      if (box) box.hidden = !box.hidden;
+      return;
+    }
+    if (b.dataset.stoverlaysave) {
+      const overlayId = b.dataset.stoverlaysave;
+      const startRaw = elv(`stovedit-start-${overlayId}`), endRaw = elv(`stovedit-end-${overlayId}`);
+      if (startRaw === '' || endRaw === '') return toast('Give the overlay a start and end time first.', 'warn');
+      const rawJson = (elv(`stovedit-data-${overlayId}`) || '').trim();
+      let data;
+      try { data = rawJson ? JSON.parse(rawJson) : {}; }
+      catch { return toast('Invalid JSON in the data box', true); }
+      b.disabled = true; b.textContent = 'Saving…';
+      await api('PATCH', `/studio/overlays/${overlayId}`, {
+        kind: elv(`stovedit-kind-${overlayId}`),
+        start_s: Number(startRaw),
+        end_s: Number(endRaw),
+        order_index: Number(elv(`stovedit-order-${overlayId}`)) || 0,
+        data,
+      });
+      toast('Overlay updated -- it needs approving again, then Assemble rough cut re-run, before the video reflects it.');
+      return render();
     }
     if (b.dataset.stoverlayapprove) {
       b.disabled = true; b.textContent = 'Approving…';

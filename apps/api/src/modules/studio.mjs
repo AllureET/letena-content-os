@@ -101,6 +101,11 @@ const ESTIMATED_COST_USD = {
   GEMINI_COMPOSE_IMAGE: 0.04,    // Gemini character+environment composite still, flat per image
   SUNO_MUSIC_TRACK: 0.20,        // Suno music bed, flat per generated track
   AZURE_TTS_PER_CHAR: 0.000016,  // Azure neural TTS, per character of input text
+  // Pre-generation gate only -- gemini.tts() reports its own real cost_usd
+  // from actual audio length afterward (resolveSpendAmount prefers that).
+  // Rough estimate assuming ~12 characters/second of Amharic speech at
+  // Gemini's $0.0005/second of audio output (24 Aug 2026 pricing).
+  GEMINI_TTS_PER_CHAR: 0.00004,
   GEMINI_REMIX_IMAGE: 0.04,      // Gemini image-edit on an existing reference/keyframe, flat per remix
   GEMINI_SHEET_SPLIT: 0.01,      // one vision read of a reference sheet to find its individual pictures
   TALKING_HEAD_PER_S: 0.08,      // fal talking head, per second of narration (estimate; the adapter reports real cost when it has one)
@@ -3087,7 +3092,19 @@ export default async function routes(app) {
     if (!text) return reply.code(422).send(err(422, 'VALIDATION',
       'no text to voice: pass body.text, or set shot.audio.dialogue or shot.story.narration'));
     const project = await one(`SELECT * FROM studio.projects WHERE id=$1`, [shot.project_id]);
-    const estimatedCost = ESTIMATED_COST_USD.AZURE_TTS_PER_CHAR * text.length;
+    // provider (24 Aug 2026, promoted to the Amharic default 25 Aug 2026):
+    // 'AZURE' or 'GEMINI'. A real side-by-side on this exact route (shot
+    // SH-010, project STU-77959F61) confirmed Gemini's prompt-directed
+    // accent control (gemini.tts() / AMHARIC_VOICE_DIRECTION in
+    // adapters/index.mjs) sounds meaningfully more native than Azure's
+    // am-ET voices, so Amharic projects now default to it. English
+    // projects still default to Azure -- Gemini was only evaluated
+    // against Amharic, so nothing changes for the English path. Either
+    // language can still override with an explicit body.provider.
+    const provider = String(req.body?.provider ?? (project.language === 'am' ? 'GEMINI' : 'AZURE')).toUpperCase();
+    const estimatedCost = provider === 'GEMINI'
+      ? ESTIMATED_COST_USD.GEMINI_TTS_PER_CHAR * text.length
+      : ESTIMATED_COST_USD.AZURE_TTS_PER_CHAR * text.length;
     let budget;
     try {
       budget = await checkAndSpendBudget(project, estimatedCost, req.actor, req.body?.override_budget === true);
@@ -3096,12 +3113,16 @@ export default async function routes(app) {
       return reply.code(422).send(err(422, 'BUDGET_EXCEEDED', e.message));
     }
     const assetId = crypto.randomUUID();
-    const gen = await azureSpeech.tts({ text, language: project.language === 'am' ? 'am-ET' : 'en-US', assetId });
+    const gen = provider === 'GEMINI'
+      ? await gemini.tts({ text, assetId, voice: req.body?.voice })
+      : await azureSpeech.tts({ text, language: project.language === 'am' ? 'am-ET' : 'en-US', assetId });
     const asset = await one(
       `INSERT INTO studio.assets (id, project_id, shot_id, kind, status, storage_key, generator, settings)
        VALUES ($1,$2,$3,'VOICE','GENERATED',$4,$5,$6) RETURNING *`,
       [assetId, shot.project_id, shot.id, gen.storage_key,
-       JSON.stringify({ provider: 'AZURE' }), JSON.stringify({ text })]);
+       JSON.stringify({ provider: gen.provider ?? provider, ...(gen.model ? { model: gen.model } : {}),
+         ...(gen.voice ? { voice: gen.voice } : {}) }),
+       JSON.stringify({ text })]);
     await spendBudget(project.id, resolveSpendAmount(gen, estimatedCost));
     // The line sets the length of the shot (22 Aug 2026). Shots were five
     // seconds because that is what Runway sells, and the real Amharic lines

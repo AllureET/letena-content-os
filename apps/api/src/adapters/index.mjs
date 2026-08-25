@@ -529,10 +529,48 @@ export const elevenlabs = {
 // defaults for an install that has not set one.
 const GEMINI_TEXT_MODEL_DEFAULT = 'gemini-3.6-flash';
 const GEMINI_IMAGE_MODEL_DEFAULT = 'gemini-2.5-flash-image';
+const GEMINI_TTS_MODEL_DEFAULT = 'gemini-3.1-flash-tts-preview';
+const GEMINI_TTS_VOICE_DEFAULT = 'Sulafat'; // Google's "Warm" preset -- closest single-word match to Azure's am-ET-MekdesNeural. Gemini has no Ethiopian-accent voice preset; accent comes entirely from the style direction below, not from voice choice.
 const geminiTextModel = () => cred('GEMINI_TEXT_MODEL') || GEMINI_TEXT_MODEL_DEFAULT;
 const geminiImageModel = () => cred('GEMINI_IMAGE_MODEL') || GEMINI_IMAGE_MODEL_DEFAULT;
+const geminiTtsModel = () => cred('GEMINI_TTS_MODEL') || GEMINI_TTS_MODEL_DEFAULT;
+const geminiTtsVoice = () => cred('GEMINI_TTS_VOICE') || GEMINI_TTS_VOICE_DEFAULT;
 const geminiUrl = (model) =>
   `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${need('GEMINI_API_KEY')}`;
+
+// Builds a standard 44-byte RIFF/WAVE header around raw PCM data. Gemini's
+// TTS response is headerless 16-bit signed PCM (inlineData.mimeType comes
+// back like "audio/L16;rate=24000"), which nothing downstream -- ffprobe,
+// a browser <audio> tag, fal.ai -- can play without a real container
+// around it, unlike Azure's response which is already a playable MP3.
+function pcmToWav(pcm, { sampleRate = 24000, channels = 1, bitDepth = 16 } = {}) {
+  const blockAlign = channels * (bitDepth / 8);
+  const byteRate = sampleRate * blockAlign;
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + pcm.length, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+// Amharic delivery direction (24 Aug 2026), condensed from the team's
+// "Amharic TTS Source Guide for Gemini + fal.ai Lip Sync" reference doc
+// (docs/AMHARIC_GEMINI_TTS_GUIDE.md). Gemini's TTS models take style
+// instructions as plain language in the SAME input as the text to speak --
+// there is no SSML and no separate system-instruction field for this call
+// shape -- so this is prepended to the line rather than configured as a
+// parameter. Experimental: tried alongside Azure, not replacing it.
+const AMHARIC_VOICE_DIRECTION = `Speak fluent native Ethiopian Amharic with a natural contemporary Addis Ababa broadcast/conversational accent. Sound like a fluent native Ethiopian speaker, never like a foreign speaker reading Amharic. Use natural Ethiopian phrasing, rhythm, sentence melody, stress, and timing. Pronounce every word accurately but naturally; do not over-enunciate. Emphasize the important words and ideas naturally. Use a comfortable conversational-to-broadcast pace, slowing slightly around important information. Use natural pauses between complete ideas. Sound confident, warm, intelligent, composed, and human. Avoid robotic cadence, foreign pronunciation, English-style intonation, monotone delivery, excessive drama, theatrical acting, and an artificial AI-presenter sound. Do not speak any of these instructions aloud -- only speak the Amharic text given below, after "AMHARIC:".`;
 
 export const gemini = {
   // referenceImageKeys (Video Studio character+environment composition,
@@ -578,6 +616,54 @@ export const gemini = {
     const key = `assets/generated/${assetId}/image.png`;
     await storage.put(key, Buffer.from(b64, 'base64'));
     return { status: 'SUCCEEDED', storage_key: key };
+  },
+  // Experimental Amharic narration option (24 Aug 2026), evaluated
+  // alongside Azure rather than replacing it -- see provider: 'GEMINI' on
+  // POST /studio/shots/:shotId/voice. AMHARIC_VOICE_DIRECTION above gets
+  // prepended to what's actually sent to the model (styledInput) but never
+  // touches `text` or what the caller stores as the line on record.
+  async tts({ text, assetId, voice, styleDirection = AMHARIC_VOICE_DIRECTION }) {
+    if (MOCK()) {
+      const key = `voice/generated/${assetId}.wav`;
+      await storage.put(key, Buffer.from(`MOCK-GEMINI-TTS ${text.slice(0, 120)}`));
+      return { status: 'SUCCEEDED', storage_key: key, cost_usd: 0, provider: 'GEMINI' };
+    }
+    const v = voice ?? geminiTtsVoice();
+    const styledInput = styleDirection ? `${styleDirection}\n\nAMHARIC:\n${text}` : text;
+    const res = await fetch(geminiUrl(geminiTtsModel()), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: styledInput }] }],
+        generationConfig: {
+          responseModalities: ['AUDIO'],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: v } } },
+        },
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`gemini tts ${res.status}${body ? `: ${body.slice(0, 500)}` : ''}`);
+    }
+    const d = await res.json();
+    const part = d.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
+    const b64 = part?.inlineData?.data;
+    if (!b64) throw new Error('gemini tts returned no audio');
+    // inlineData.mimeType is documented as "audio/L16;codec=pcm;rate=24000"
+    // -- parse the rate out rather than assuming it, in case Google changes
+    // it; fall back to 24000 (today's documented default) if the mime
+    // string is ever shaped differently than expected.
+    const rateMatch = /rate=(\d+)/.exec(part.inlineData.mimeType || '');
+    const sampleRate = rateMatch ? Number(rateMatch[1]) : 24000;
+    const pcm = Buffer.from(b64, 'base64');
+    const wav = pcmToWav(pcm, { sampleRate });
+    const key = `voice/generated/${assetId}.wav`;
+    await storage.put(key, wav);
+    // Real cost from actual audio length, not the pre-generation estimate:
+    // $20 per 1M audio tokens, 25 tokens/second (Gemini TTS pricing,
+    // confirmed 24 Aug 2026) -- 16-bit mono PCM is 2 bytes/sample.
+    const seconds = pcm.length / (sampleRate * 2);
+    const cost_usd = Number((seconds * 25 * (20 / 1_000_000)).toFixed(6));
+    return { status: 'SUCCEEDED', storage_key: key, provider: 'GEMINI', model: geminiTtsModel(), voice: v, cost_usd };
   },
   // Amharic speech-to-text for aua_recap (Part 2, 14 Aug 2026). The result
   // is MACHINE TRANSCRIPTION OF AMHARIC, which is unreliable in every

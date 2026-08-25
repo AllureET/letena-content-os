@@ -8,7 +8,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chunkNarrationText, parseSilenceDetect, speechSegmentsFromSilences,
-  assignChunkTimings, defaultCaptionData,
+  assignChunkTimings, defaultCaptionData, alignWordsToChunks,
+  captionTimingsForNarrationASR,
 } from '../src/modules/studio_captions.mjs';
 
 test('chunks a short line as one caption', () => {
@@ -131,6 +132,85 @@ test('a very short weight still gets at least the minimum caption duration', () 
   // 3 * 0.6s cannot possibly fit and degrading is the only honest option.
   const timings = assignChunkTimings(['Hi.', 'Ok.', 'Bye now, everyone here.'], [{ start: 0, end: 4 }], 4);
   for (const t of timings) assert.ok(t.end_s - t.start_s >= 0.6 - 1e-9, `too short to read: ${JSON.stringify(t)}`);
+});
+
+test('alignWordsToChunks maps chunks onto real ASR word timings by position', () => {
+  // 'Hi there.' (2 words) + 'Bye now friend.' (3 words) = 5 script words,
+  // matched 1-to-1 against 5 ASR words of known timing.
+  const chunks = ['Hi there.', 'Bye now friend.'];
+  const asrWords = [
+    { word: 'Hi', start_s: 0.0, end_s: 0.4 },
+    { word: 'there', start_s: 0.4, end_s: 1.0 },
+    { word: 'Bye', start_s: 1.5, end_s: 1.9 },
+    { word: 'now', start_s: 1.9, end_s: 2.2 },
+    { word: 'friend', start_s: 2.2, end_s: 2.8 },
+  ];
+  const timings = alignWordsToChunks(chunks, asrWords, 3);
+  assert.equal(timings.length, 2);
+  assert.equal(timings[0].start_s, 0);
+  assert.equal(timings[0].end_s, 1);
+  assert.equal(timings[1].start_s, 1.5);
+  assert.equal(timings[1].end_s, 2.8);
+});
+
+test('alignWordsToChunks degrades gracefully when ASR heard a different word count than the script', () => {
+  // Script has 6 words across 2 chunks; ASR only recognized 4 words (missed
+  // one, merged another) -- must still produce in-order, non-overlapping,
+  // in-bounds timings rather than throwing or running off the end.
+  const chunks = ['This is the first chunk.', 'This is the second one.'];
+  const asrWords = [
+    { word: 'this', start_s: 0, end_s: 0.5 },
+    { word: 'is', start_s: 0.5, end_s: 0.8 },
+    { word: 'chunk', start_s: 0.8, end_s: 1.3 },
+    { word: 'second', start_s: 1.3, end_s: 1.8 },
+  ];
+  const timings = alignWordsToChunks(chunks, asrWords, 2);
+  assert.equal(timings.length, 2);
+  for (const t of timings) {
+    assert.ok(t.start_s >= 0 && t.end_s <= 2, `out of bounds: ${JSON.stringify(t)}`);
+    assert.ok(t.end_s > t.start_s, `non-positive duration: ${JSON.stringify(t)}`);
+  }
+  assert.ok(timings[1].start_s >= timings[0].end_s, 'chunks must not overlap');
+});
+
+test('alignWordsToChunks returns null (not a crash) when there is no usable ASR data', () => {
+  assert.equal(alignWordsToChunks(['Hello.'], null, 5), null);
+  assert.equal(alignWordsToChunks(['Hello.'], [], 5), null);
+  assert.equal(alignWordsToChunks([], [{ word: 'x', start_s: 0, end_s: 1 }], 5), null);
+});
+
+test('captionTimingsForNarrationASR prefers real ASR word timing when it is available', async () => {
+  const asrWords = [
+    { word: 'you', start_s: 0.1, end_s: 0.3 },
+    { word: 'are', start_s: 0.3, end_s: 0.5 },
+    { word: 'not', start_s: 0.5, end_s: 0.8 },
+    { word: 'alone', start_s: 0.8, end_s: 1.3 },
+  ];
+  const result = await captionTimingsForNarrationASR(
+    'You are not alone.', '/nonexistent/audio.wav', 2, async () => asrWords);
+  assert.equal(result.method, 'asr_word_timing');
+  assert.equal(result.timings.length, 1);
+  assert.equal(result.timings[0].start_s, 0.1);
+  assert.equal(result.timings[0].end_s, 1.3);
+});
+
+test('captionTimingsForNarrationASR falls back to the pause heuristic when ASR is unavailable', async () => {
+  // getWordTimings resolving null (no Azure key / mock mode) must fall
+  // through to the exact same heuristic captionTimingsForNarration already
+  // uses -- proven here by comparing against a real audio path is not
+  // needed, only that it degrades instead of throwing.
+  const resultNull = await captionTimingsForNarrationASR(
+    'Spotting is common. It is not always a problem.', '/nonexistent/audio.wav', 6, async () => null);
+  assert.equal(resultNull.method, 'pause_heuristic');
+  assert.ok(resultNull.timings.length >= 1);
+
+  // getWordTimings throwing (a real Azure network/API failure) must fall
+  // through the same way, never bubble up to the caller.
+  const resultThrow = await captionTimingsForNarrationASR(
+    'Spotting is common. It is not always a problem.', '/nonexistent/audio.wav', 6,
+    async () => { throw new Error('azure stt 503'); });
+  assert.equal(resultThrow.method, 'pause_heuristic');
+  assert.ok(resultThrow.timings.length >= 1);
 });
 
 test('defaultCaptionData renders as a bottom-anchored, readable card', () => {

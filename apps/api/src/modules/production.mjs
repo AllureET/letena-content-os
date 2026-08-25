@@ -160,6 +160,23 @@ export default async function routes(app) {
     return { items: r.rows };
   });
 
+  // Single-asset lookup (25 Aug 2026). The Video Studio overlay editor shows
+  // an ICON overlay's already-picked icon as a thumbnail, but the only way it
+  // previously had to resolve an asset_id into an image URL was to fetch the
+  // whole /production/assets?kind=ICON list -- which only happened when
+  // someone clicked "Browse or upload an icon," so a saved overlay's icon
+  // looked missing until that button was clicked once. This lets the front
+  // end resolve one known id directly, so the thumbnail can load itself as
+  // soon as the edit box opens instead of staying blank.
+  app.get('/production/assets/:id', { preHandler: requirePerm('asset.read') }, async (req, reply) => {
+    const a = await one(
+      `SELECT id, code, kind, origin, title, description, is_ai_generated,
+              clinically_approved, is_active, storage_key, mime_type, created_at
+       FROM lcos.assets WHERE id = $1`, [req.params.id]);
+    if (!a) return reply.code(404).send(err(404, 'NOT_FOUND', 'asset'));
+    return a;
+  });
+
   // ---------- Part 2: the plan and the cost BEFORE spending ----------
   // "Nothing shows this today. Money is spent and Girum finds out
   // afterwards." Read-only: computes what producing this piece will run,

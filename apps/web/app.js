@@ -369,6 +369,17 @@ window.assetImgError = function (img, kind) {
   div.textContent = kind;
   img.replaceWith(div);
 };
+// Fills an overlay ICON field's small always-visible preview box (see
+// overlayFormFieldsHtml) with whichever image URL was just picked from the
+// library or just uploaded. Kept separate from assetThumb since this always
+// has a concrete resolvable URL in hand (either a real media URL from the
+// library list, or a local blob: URL for a just-picked file) rather than a
+// whole asset record to introspect.
+function setIconPreview(suffix, url) {
+  const el = document.getElementById(`st-ov-iconpreview${suffix}`);
+  if (!el) return;
+  el.innerHTML = url ? `<img src="${esc(url)}" style="max-width:100%;max-height:100%;object-fit:contain" alt="icon preview" onerror="this.replaceWith(document.createTextNode('?'))">` : '';
+}
 function assetThumb(a) {
   const u = mediaUrl(a.storage_key);
   const mt = a.mime_type ?? '';
@@ -701,8 +712,13 @@ const OVERLAY_ANIM_OUT_OPTIONS = [['fade', 'fade'], ['none', 'none']];
 // LOCK form before it got the same treatment: "can the editor be something
 // much simpler which then writes in to the json, its hard to comprehend all
 // that" -- editing overlays deserves the identical fix, not a raw textarea.
-function overlayFormFieldsHtml(suffix, kind, data) {
+function overlayFormFieldsHtml(suffix, kind, data, idToken) {
   const d = data ?? {};
+  // idToken is what the icon browse/upload buttons carry in their dataset --
+  // 'new' for the one "New overlay" form (suffix '' can't itself be used as
+  // a dataset value that survives a truthiness check), the real overlay id
+  // for a per-row Edit box (matches suffix `-<id>`).
+  const iconToken = idToken ?? 'new';
   const isDoor = kind === 'DOOR_CARD', isIcon = kind === 'ICON';
   const firstLine = Array.isArray(d.lines) ? d.lines[0] : null;
   const doorLines = (Array.isArray(d.lines) ? d.lines.map(l => l?.text ?? '') : []).join('\n');
@@ -725,9 +741,15 @@ function overlayFormFieldsHtml(suffix, kind, data) {
           </div>
 
           <div id="st-ov-icon-fields${suffix}" ${isIcon ? '' : 'hidden'}>
-            <label style="font-size:11px">Icon asset id</label>
-            <input id="st-ov-assetid${suffix}" value="${esc(d.asset_id ?? '')}" placeholder="paste an ICON asset id from the library">
-            <div class="muted" style="font-size:11px">Upload the icon to the asset library first, as kind ICON.</div>
+            <label style="font-size:11px">Icon</label>
+            <div class="flex" style="gap:8px;align-items:flex-start">
+              <div id="st-ov-iconpreview${suffix}" style="width:56px;height:56px;flex-shrink:0;border:1px solid var(--surface-3);border-radius:4px;display:flex;align-items:center;justify-content:center;overflow:hidden"></div>
+              <div style="flex:1;min-width:0">
+                <input id="st-ov-assetid${suffix}" value="${esc(d.asset_id ?? '')}" placeholder="paste an ICON asset id, or browse below" style="width:100%">
+                <button type="button" style="margin-top:4px;font-size:11px;padding:2px 8px" data-stovicon="${esc(iconToken)}">Browse or upload an icon</button>
+              </div>
+            </div>
+            <div id="st-ov-iconbox${suffix}" hidden style="margin-top:8px"></div>
           </div>
 
           <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-style-fields${suffix}" ${isIcon ? 'hidden' : ''}>
@@ -2353,7 +2375,7 @@ const screens = {
           <div>
             <label>What it says and how it looks</label>
             <div class="muted" style="font-size:12px;margin-bottom:6px">Fill these in and the JSON underneath writes itself. Colours use Letena's palette by default.</div>
-            ${overlayFormFieldsHtml(suffix, o.kind, o.data)}
+            ${overlayFormFieldsHtml(suffix, o.kind, o.data, o.id)}
           </div>
         </div>
         <div class="muted" style="font-size:11px;margin:8px 0">Saving un-approves this overlay -- approve it again, then re-run Assemble rough cut below, for the change to actually show up in the video. The last assembled cut is a rendered file; it does not update itself.</div>
@@ -4005,7 +4027,7 @@ document.addEventListener('click', async (e) => {
 // selector string would only make those harder to read. No overlap: every
 // id/attribute here is new.
 document.addEventListener('click', async (e) => {
-  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stbudget],[data-stbudgetclear],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stoverlayeditshow],[data-stoverlaysave],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
+  const b = e.target.closest('[data-stlockdraft],[data-stlockapprove],[data-stlockref],[data-stlockreftoggle],[data-stlockremix],[data-stlocklibopen],[data-stlockattach],[data-stlockuploadgo],[data-strefselect],[data-stpacktoggle],[data-stpackupload],[data-stpacksplit],[data-stpanelref],[data-stlockcreate],[data-stshotcreate],[data-stshotedit],[data-stbudget],[data-stbudgetclear],[data-stplatecompose],[data-stplateaccept],[data-stplatedelete],[data-stshotcompose],[data-stshotcontinue],[data-stcontinueremix],[data-stscrolltolocks],[data-stshotgenerate],[data-stshotvoiceshow],[data-stshotvoice],[data-stassets],[data-stassetaccept],[data-stassetreject],[data-stassetnote],[data-stassetdelete],[data-stshotdelete],[data-stpruneassets],[data-stmusic],[data-stassemble],[data-starchive],[data-stunarchive],[data-stoverlaycreate],[data-stoverlayapprove],[data-stoverlaydelete],[data-stoverlayeditshow],[data-stoverlaysave],[data-stovicon],[data-stoviconpick],[data-stoviconupload],[data-stbriefdraft],[data-stbriefapply],[data-stscriptdraft],[data-stscriptapply],#st-newproj-go');
   if (!b) return;
   e.preventDefault();
   try {
@@ -4624,6 +4646,93 @@ document.addEventListener('click', async (e) => {
       });
       toast('Overlay updated -- it needs approving again, then Assemble rough cut re-run, before the video reflects it.');
       return render();
+    }
+    // ICON overlay: browse the library and see the icon, instead of pasting
+    // a UUID blind (25 Aug 2026, Nate: "why cant we see the icon or be able
+    // to pull from the asset library? or upload to asset library and there?").
+    // Same lazy toggle-and-fetch pattern as stlocklibopen above, pointed at
+    // the general asset library (kind=ICON) rather than a lock's own
+    // reference-candidates endpoint, since an overlay icon isn't tied to any
+    // one lock. Deliberately does NOT call render() anywhere in this trio --
+    // this box lives inside a form the user may be mid-editing (timing,
+    // colours, an unsaved kind change), and a full re-render would discard
+    // all of that the moment they touched the icon field.
+    if (b.dataset.stovicon) {
+      const token = b.dataset.stovicon;
+      const suffix = token === 'new' ? '' : `-${token}`;
+      const box = document.getElementById(`st-ov-iconbox${suffix}`);
+      if (!box) return;
+      if (box.dataset.loaded) { box.hidden = !box.hidden; return; }
+      box.hidden = false;
+      box.innerHTML = '<div class="muted" style="font-size:12px">Loading…</div>';
+      try {
+        const r = await api('GET', '/production/assets?kind=ICON');
+        const items = r.items ?? [];
+        const currentId = elv(`st-ov-assetid${suffix}`);
+        const grid = items.length
+          ? `<div class="flex" style="flex-wrap:wrap;gap:8px">${items.map(a => `
+            <div style="text-align:center">
+              <img class="ath" style="width:64px;height:64px;max-width:64px;max-height:64px;border-radius:4px;cursor:pointer;${a.id === currentId ? 'outline:2px solid var(--risk-routine)' : ''}"
+                src="${esc(mediaUrl(a.storage_key))}" alt="${esc(a.title)}" loading="lazy"
+                onerror="assetImgError(this,'ICON')" data-stoviconpick="${esc(token)}|${esc(a.id)}|${esc(mediaUrl(a.storage_key))}">
+              <div class="muted" style="font-size:10px;max-width:64px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.title)}</div>
+            </div>`).join('')}</div>`
+          : '<div class="muted" style="font-size:12px">No icons in the library yet -- upload one below.</div>';
+        const uploadForm = can('asset.manage') ? `<div class="claimrow" style="margin-top:8px">
+          <label style="font-size:11px">Upload a new icon</label>
+          <div class="flex" style="gap:6px;flex-wrap:wrap;align-items:flex-end">
+            <input type="file" id="st-ov-iconfile${suffix}" accept="image/*" style="max-width:200px">
+            <input id="st-ov-iconfiletitle${suffix}" placeholder="title" style="max-width:160px">
+            <button type="button" data-stoviconupload="${esc(token)}">Upload &amp; use</button>
+          </div>
+        </div>` : '';
+        box.innerHTML = grid + uploadForm;
+        box.dataset.loaded = '1';
+        // Show whichever icon is already set in the small always-visible
+        // preview too, the first time this resolves -- there is no
+        // get-one-asset-by-id endpoint, so this list fetch is also what
+        // answers "can we see the icon" for an overlay that already has one.
+        const match = items.find(a => a.id === currentId);
+        if (match) setIconPreview(suffix, mediaUrl(match.storage_key));
+      } catch (ex) {
+        box.innerHTML = `<div class="muted" style="font-size:12px">${esc(ex.message)}</div>`;
+      }
+      return;
+    }
+    if (b.dataset.stoviconpick) {
+      const [token, assetId, url] = b.dataset.stoviconpick.split('|');
+      const suffix = token === 'new' ? '' : `-${token}`;
+      const field = document.getElementById(`st-ov-assetid${suffix}`);
+      if (field) field.value = assetId;
+      setIconPreview(suffix, url);
+      const box = document.getElementById(`st-ov-iconbox${suffix}`);
+      if (box) box.hidden = true;
+      return;
+    }
+    if (b.dataset.stoviconupload) {
+      const token = b.dataset.stoviconupload;
+      const suffix = token === 'new' ? '' : `-${token}`;
+      const file = document.getElementById(`st-ov-iconfile${suffix}`)?.files?.[0];
+      const title = (elv(`st-ov-iconfiletitle${suffix}`) || '').trim();
+      if (!file || !title) return toast('Choose an image file and give it a title first.', 'warn');
+      if (file.size > 6 * 1024 * 1024) return toast('Icon uploads are capped at 6MB.', 'warn');
+      b.disabled = true; b.textContent = 'Uploading…';
+      try {
+        const a = await api('POST', '/production/assets', {
+          title, kind: 'ICON', origin: 'SHOT_IN_HOUSE', mime_type: file.type || 'image/png',
+          content_base64: await fileB64(file), tags: ['icon'] });
+        const field = document.getElementById(`st-ov-assetid${suffix}`);
+        if (field) field.value = a.id;
+        setIconPreview(suffix, URL.createObjectURL(file));
+        const box = document.getElementById(`st-ov-iconbox${suffix}`);
+        // Force a re-fetch next time it's opened, so the newly uploaded icon
+        // shows up in the browsable grid too, not just in this field.
+        if (box) { box.hidden = true; box.dataset.loaded = ''; }
+        toast(`"${title}" uploaded and set as this overlay's icon.`);
+      } finally {
+        b.disabled = false; b.textContent = 'Upload & use';
+      }
+      return;
     }
     if (b.dataset.stoverlayapprove) {
       b.disabled = true; b.textContent = 'Approving…';

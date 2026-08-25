@@ -39,8 +39,20 @@ export const OVERLAY_KINDS = ['TITLE_CARD', 'LABEL', 'DOOR_CARD', 'ICON'];
 // system had put a card in the top or the middle of the frame, which for a
 // vertical talking head is precisely where the head is. There was no way to
 // place a card safely even by hand.
-export const ANCHORS = ['top', 'upper-third', 'top-right', 'right-center', 'center',
-  'lower-third', 'bottom'];
+// The four corners plus 'left-center' added 25 Aug 2026 (Nate, after using
+// the friendly anchor dropdown for a few days: "how come theres a right
+// centre but not a left centre or a top left or a lower right or a lower
+// left?") -- 'right-center'/'top-right' had partners missing on the other
+// side for no reason beyond nobody having asked yet. Naming stays consistent
+// with what already shipped: 'bottom' (not 'bottom-third') pairs with
+// 'bottom-left'/'bottom-right', matching how 'top-right' already reads.
+export const ANCHORS = [
+  'top', 'top-left', 'top-right',
+  'upper-third',
+  'left-center', 'right-center', 'center',
+  'lower-third',
+  'bottom-left', 'bottom', 'bottom-right',
+];
 export const ANIMATION_IN_TYPES = ['none', 'fade', 'slide-left', 'slide-right'];
 export const ANIMATION_OUT_TYPES = ['none', 'fade'];
 export const FONT_FAMILIES = ['bold', 'regular'];
@@ -55,6 +67,19 @@ export const FONT_FAMILIES = ['bold', 'regular'];
 export const DOOR_CARD_LINE_FADE_S = 0.5;
 
 function isHexColor(v) { return typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v); }
+
+// Picks black or white for a text outline so it reads against whatever
+// text_color was chosen, without asking a non-technical editor to also pick
+// an outline colour. Perceived-luminance threshold, not colour-accurate
+// photometry -- "is this light or dark" is all it needs to answer.
+function outlineColorFor(hex) {
+  const m = /^#([0-9a-fA-F]{6})$/.exec(hex || '');
+  if (!m) return '#000000';
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? '#000000' : '#FFFFFF';
+}
 
 function escapeXml(s) {
   return String(s ?? '')
@@ -98,6 +123,15 @@ export function validateOverlayData(kind, data) {
       errors.push('data.background_opacity must be a number between 0 and 1');
     }
     if (d.corner_radius_px != null && typeof d.corner_radius_px !== 'number') errors.push('data.corner_radius_px must be a number');
+    // Outline/shadow (25 Aug 2026, Nate: "can the background or the words
+    // have an outline or shadow?") are deliberately plain on/off switches,
+    // not a colour+width+blur picker -- the outline colour auto-contrasts
+    // against text_color (see outlineColorFor) and the shadow is a fixed,
+    // sensible offset, so there is nothing here for a non-technical editor
+    // to get wrong.
+    if (d.text_outline != null && typeof d.text_outline !== 'boolean') errors.push('data.text_outline must be true or false');
+    if (d.text_shadow != null && typeof d.text_shadow !== 'boolean') errors.push('data.text_shadow must be true or false');
+    if (d.box_shadow != null && typeof d.box_shadow !== 'boolean') errors.push('data.box_shadow must be true or false');
     validatePosition(d.position, 'data.position', errors);
     validateAnimation(d.animation_in, 'data.animation_in', ANIMATION_IN_TYPES, errors);
     validateAnimation(d.animation_out, 'data.animation_out', ANIMATION_OUT_TYPES, errors);
@@ -200,12 +234,16 @@ function resolveAnchorXY(anchor, insetPx, boxW, boxH, canvasW, canvasH) {
   const inset = Number(insetPx ?? 24);
   switch (anchor) {
     case 'top': return { x: (canvasW - boxW) / 2, y: inset };
+    case 'top-left': return { x: inset, y: inset };
     case 'upper-third': return { x: (canvasW - boxW) / 2, y: canvasH / 3 - boxH / 2 };
     case 'top-right': return { x: canvasW - boxW - inset, y: inset };
+    case 'left-center': return { x: inset, y: (canvasH - boxH) / 2 };
     case 'right-center': return { x: canvasW - boxW - inset, y: (canvasH - boxH) / 2 };
     case 'center': return { x: (canvasW - boxW) / 2, y: (canvasH - boxH) / 2 };
     case 'lower-third': return { x: (canvasW - boxW) / 2, y: canvasH * 2 / 3 - boxH / 2 };
+    case 'bottom-left': return { x: inset, y: canvasH - boxH - inset };
     case 'bottom': return { x: (canvasW - boxW) / 2, y: canvasH - boxH - inset };
+    case 'bottom-right': return { x: canvasW - boxW - inset, y: canvasH - boxH - inset };
     default: return { x: (canvasW - boxW) / 2, y: inset };
   }
 }
@@ -340,13 +378,45 @@ function compileCardSvg(data, canvasW, canvasH, boldB64, regB64, faceBox) {
     : placeClearOfFace({ ...anchored, boxW, boxH, canvasW, canvasH, faceBox, insetPx: inset });
   const rx = Number(d.corner_radius_px ?? 12);
   const bgOpacity = d.background_opacity ?? 1;
+  const textColor = d.text_color ?? '#FFFFFF';
   const textCX = x + boxW / 2;
   const blockTop = y + (boxH - lines.length * lineHeight) / 2;
-  const textEls = lines.map((line, i) =>
-    `<text x="${textCX}" y="${blockTop + i * lineHeight + lineHeight / 2 + fontSize * 0.34}" font-family="${fontFamilyName(d.font_family)}" font-size="${fontSize}" fill="${d.text_color ?? '#FFFFFF'}" text-anchor="middle">${escapeXml(line)}</text>`
-  ).join('\n');
+
+  // Outline/shadow (25 Aug 2026). Deliberately drawn as plain duplicate
+  // shapes (an offset, dark, semi-transparent copy) rather than an SVG
+  // <filter> (feGaussianBlur/feDropShadow): every renderer that can draw a
+  // rect or text at all can draw this, with nothing that depends on how
+  // complete this box's librsvg filter-primitive support happens to be. A
+  // harder edge than a true blurred drop shadow, but it never silently
+  // fails to render.
+  const outlineOn = d.text_outline === true;
+  const outlineColor = outlineColorFor(textColor);
+  const outlineWidth = Math.max(1, Math.round(fontSize * 0.05));
+  const textShadowOn = d.text_shadow === true;
+  const textShadowOffset = Math.max(1, Math.round(fontSize * 0.06));
+  const boxShadowOn = d.box_shadow === true;
+  const boxShadowOffset = Math.max(2, Math.round(fontSize * 0.18));
+
+  const textEls = lines.map((line, i) => {
+    const ty = blockTop + i * lineHeight + lineHeight / 2 + fontSize * 0.34;
+    const shadowEl = textShadowOn
+      ? `<text x="${textCX + textShadowOffset}" y="${ty + textShadowOffset}" font-family="${fontFamilyName(d.font_family)}" font-size="${fontSize}" fill="#000000" fill-opacity="0.45" text-anchor="middle">${escapeXml(line)}</text>`
+      : '';
+    // paint-order keeps the stroke from eating into the fill on renderers
+    // that support it; on ones that don't, default paint order (fill then
+    // stroke) still leaves a visible edge, just a slightly less even one.
+    const strokeAttrs = outlineOn
+      ? ` stroke="${outlineColor}" stroke-width="${outlineWidth}" paint-order="stroke fill"` : '';
+    return `${shadowEl}<text x="${textCX}" y="${ty}" font-family="${fontFamilyName(d.font_family)}" font-size="${fontSize}" fill="${textColor}"${strokeAttrs} text-anchor="middle">${escapeXml(line)}</text>`;
+  }).join('\n');
+
+  const boxShadowEl = boxShadowOn
+    ? `<rect x="${x + boxShadowOffset}" y="${y + boxShadowOffset}" width="${boxW}" height="${boxH}" rx="${rx}" fill="#000000" fill-opacity="0.35"/>`
+    : '';
+
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasW}" height="${canvasH}">
 ${fontFaceDefs(boldB64, regB64)}
+${boxShadowEl}
 <rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="${rx}" fill="${d.background_color ?? '#16103F'}" fill-opacity="${bgOpacity}"/>
 ${textEls}
 </svg>`;

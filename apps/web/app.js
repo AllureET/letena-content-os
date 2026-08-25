@@ -379,6 +379,160 @@ function setIconPreview(suffix, url) {
   const el = document.getElementById(`st-ov-iconpreview${suffix}`);
   if (!el) return;
   el.innerHTML = url ? `<img src="${esc(url)}" style="max-width:100%;max-height:100%;object-fit:contain" alt="icon preview" onerror="this.replaceWith(document.createTextNode('?'))">` : '';
+  // The big "what will this look like" preview shows the icon too (25 Aug
+  // 2026) -- keep it in lockstep with this small square rather than needing
+  // every caller to remember a second update call.
+  updateOverlayPreview(suffix);
+}
+
+// A rough "what will this actually look like" mock of an overlay (25 Aug
+// 2026): Nate, after the fields/dropdowns fix, asked "shouldnt we be able to
+// preview anything like gold amharic text on a blue background... square vs
+// a pill/oval." Neither existed -- colours and shape were edited blind, and
+// corner_radius_px (which the backend has always accepted, see
+// studio_overlays.mjs's compileCardSvg) had no field at all, hardcoded to 16
+// in buildOverlayDataFromFields below. This mock is deliberately approximate,
+// not a pixel-accurate renderer: real text wrapping, exact padding, and the
+// face-avoidance nudge (placeClearOfFace) only happen server-side, in the
+// actual SVG compile step, at Assemble time. Good enough to answer "is this
+// gold text readable on this blue" and "square or pill" without spending an
+// Assemble run to find out; anything more exact would mean reimplementing
+// compileCardSvg's text-measurement logic twice, in two languages.
+const OV_PREVIEW_PX = 240; // on-screen width of the mock canvas, in CSS px
+const OV_PREVIEW_BG = 'linear-gradient(160deg,#2b2b38,#17171f)';
+
+// Mirrors resolveCanvasSizeForAspect in apps/api/src/modules/studio_overlays.mjs
+// (base=1920, matched to whichever side is longer) so the preview scales
+// text/shapes by the same ratio real assembly would use for this project's
+// aspect ratio, not a guess.
+function ovCanvasSize(aspectRatio) {
+  const [wR, hR] = String(aspectRatio || '9:16').split(':').map(Number);
+  if (!wR || !hR) return { w: 1080, h: 1920 };
+  const base = 1920;
+  return hR >= wR ? { w: Math.round(base * wR / hR), h: base } : { w: base, h: Math.round(base * hR / wR) };
+}
+
+function ovAnchorCss(anchor) {
+  const map = {
+    'top': 'top:4%;left:50%;transform:translateX(-50%)',
+    'upper-third': 'top:20%;left:50%;transform:translateX(-50%)',
+    'top-right': 'top:4%;right:4%',
+    'right-center': 'top:50%;right:4%;transform:translateY(-50%)',
+    'center': 'top:50%;left:50%;transform:translate(-50%,-50%)',
+    'lower-third': 'bottom:20%;left:50%;transform:translateX(-50%)',
+    'bottom': 'bottom:4%;left:50%;transform:translateX(-50%)',
+  };
+  return map[anchor] ?? map['upper-third'];
+}
+
+function ovHexToRgba(hex, opacity) {
+  const m = /^#([0-9a-fA-F]{6})$/.exec(hex || '');
+  if (!m) return hex || '#16103F';
+  const n = parseInt(m[1], 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const a = Number.isFinite(opacity) ? Math.max(0, Math.min(1, opacity)) : 1;
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+// Pure: given the overlay's current field values (whatever kind it is) plus
+// the real canvas pixel width (for scaling font size/radius/padding down to
+// preview size), returns what to paint. Shared by the initial server-side
+// render (overlayPreviewHtml, using the overlay's saved data) and the live
+// runtime update (updateOverlayPreview, reading the form's current values) --
+// one definition so the two can never show something different.
+function ovPreviewParts(canvasW, p) {
+  const scale = OV_PREVIEW_PX / canvasW;
+  if (p.kind === 'ICON') {
+    const boxCss = `position:absolute;${ovAnchorCss(p.anchor)};width:22%;aspect-ratio:1/1;display:flex;align-items:center;justify-content:center`;
+    const html = p.iconUrl
+      ? `<img src="${esc(p.iconUrl)}" style="max-width:100%;max-height:100%;object-fit:contain">`
+      : `<span style="font-size:9px;color:#8a889f">icon</span>`;
+    return { canvasBg: OV_PREVIEW_BG, boxCss, html };
+  }
+  if (p.kind === 'DOOR_CARD') {
+    const lines = p.doorLines.length ? p.doorLines : ['door card text…'];
+    const sizes = [1, 0.62, 0.52, 0.46];
+    const html = lines.map((t, i) => {
+      const base = Math.max(22, Math.round(p.fontSize * (sizes[i] ?? 0.46)));
+      const fs = Math.max(7, Math.round(base * scale));
+      const color = i === 0 ? p.textColor : '#FFFFFF';
+      return `<div style="font-size:${fs}px;font-weight:${i === 0 ? 700 : 400};color:${esc(color)}">${esc(t)}</div>`;
+    }).join('');
+    const boxCss = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:86%;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center';
+    return { canvasBg: p.bgColor || '#16103F', boxCss, html };
+  }
+  // TITLE_CARD / LABEL: a boxed card. cornerRadius >= 200 is the "pill /
+  // oval" preset -- see the shape select below -- which SVG's own rx/ry
+  // clamping (rx capped at half the box's own width/height) turns into a
+  // true pill or oval however wide the real card ends up, so a big flat
+  // number here matches what actually renders without guessing the box's
+  // real width in advance.
+  const radiusCss = p.cornerRadius >= 200 ? '999px' : `${Math.round(p.cornerRadius * scale)}px`;
+  const fs = Math.max(7, Math.round(p.fontSize * scale));
+  const boxCss = `position:absolute;${ovAnchorCss(p.anchor)};max-width:82%;padding:${Math.round(fs * 0.55)}px ${Math.round(fs * 0.9)}px;` +
+    `background:${ovHexToRgba(p.bgColor, p.bgOpacity)};color:${p.textColor};font-weight:${p.fontFamily === 'bold' ? 700 : 400};` +
+    `font-size:${fs}px;border-radius:${radiusCss};text-align:center;white-space:pre-line;line-height:1.25`;
+  return { canvasBg: OV_PREVIEW_BG, boxCss, html: esc(p.text || 'overlay text…') };
+}
+
+// The preview block embedded directly in the server-rendered HTML (so it's
+// already correct the instant the New-overlay form or an Edit box appears,
+// same "no JS needed until something changes" discipline as the rest of this
+// form) -- see overlayFormFieldsHtml below for where this is called.
+function overlayPreviewHtml(suffix, kind, data, aspectRatio, iconUrl) {
+  const d = data ?? {};
+  const isDoor = kind === 'DOOR_CARD', isIcon = kind === 'ICON';
+  const firstLine = Array.isArray(d.lines) ? d.lines[0] : null;
+  const { w: canvasW, h: canvasH } = ovCanvasSize(aspectRatio);
+  const parts = ovPreviewParts(canvasW, {
+    kind,
+    text: d.text ?? '',
+    doorLines: Array.isArray(d.lines) ? d.lines.map(l => l?.text ?? '') : [],
+    textColor: d.text_color ?? firstLine?.text_color ?? '#EBAB20',
+    bgColor: d.background_color ?? '#16103F',
+    bgOpacity: d.background_opacity ?? 0.9,
+    fontSize: d.font_size_px ?? firstLine?.font_size_px ?? (isDoor ? 64 : kind === 'LABEL' ? 44 : 56),
+    fontFamily: d.font_family ?? firstLine?.font_family ?? 'bold',
+    anchor: d.position?.anchor ?? (isIcon ? 'top-right' : 'upper-third'),
+    cornerRadius: d.corner_radius_px ?? 16,
+    iconUrl,
+  });
+  return `<div id="st-ov-preview${suffix}" data-canvasw="${canvasW}" style="position:relative;width:${OV_PREVIEW_PX}px;aspect-ratio:${canvasW}/${canvasH};background:${parts.canvasBg};border:1px solid var(--surface-3);border-radius:6px;overflow:hidden;margin-top:6px">
+    <div id="st-ov-preview-box${suffix}" style="${parts.boxCss}">${parts.html}</div>
+  </div>
+  <div class="muted" style="font-size:10px;margin-top:3px">Rough preview -- exact wrapping and spacing happen when this actually renders.</div>`;
+}
+
+// Runtime counterpart to overlayPreviewHtml: reads whatever is currently in
+// the form's fields (not the overlay's saved data, which may be stale the
+// moment someone starts typing) and repaints the same preview box in place.
+// Wired to fire on input/change for every field carrying data-ovfield --
+// see the two delegated listeners further down.
+function updateOverlayPreview(suffix) {
+  const canvas = document.getElementById(`st-ov-preview${suffix}`);
+  const box = document.getElementById(`st-ov-preview-box${suffix}`);
+  if (!canvas || !box) return;
+  const kind = elv(`st-overlay-kind${suffix}`) || 'TITLE_CARD';
+  const isIcon = kind === 'ICON';
+  const canvasW = Number(canvas.dataset.canvasw) || 1080;
+  const iconUrl = document.getElementById(`st-ov-iconpreview${suffix}`)?.querySelector('img')?.src || null;
+  const num = (id, fallback) => { const v = Number(elv(id)); return Number.isFinite(v) ? v : fallback; };
+  const parts = ovPreviewParts(canvasW, {
+    kind,
+    text: elv(`st-ov-text${suffix}`) || '',
+    doorLines: (elv(`st-ov-doorlines${suffix}`) || '').split('\n').map(s => s.trim()).filter(Boolean),
+    textColor: elv(`st-ov-textcolor${suffix}`) || '#EBAB20',
+    bgColor: elv(`st-ov-bgcolor${suffix}`) || '#16103F',
+    bgOpacity: num(`st-ov-bgopacity${suffix}`, 0.9),
+    fontSize: num(`st-ov-fontsize${suffix}`, 56),
+    fontFamily: elv(`st-ov-fontfamily${suffix}`) || 'bold',
+    anchor: elv(`st-ov-anchor${suffix}`) || (isIcon ? 'top-right' : 'upper-third'),
+    cornerRadius: num(`st-ov-shape${suffix}`, 16),
+    iconUrl,
+  });
+  canvas.style.background = parts.canvasBg;
+  box.style.cssText = parts.boxCss;
+  box.innerHTML = parts.html;
 }
 function assetThumb(a) {
   const u = mediaUrl(a.storage_key);
@@ -712,7 +866,7 @@ const OVERLAY_ANIM_OUT_OPTIONS = [['fade', 'fade'], ['none', 'none']];
 // LOCK form before it got the same treatment: "can the editor be something
 // much simpler which then writes in to the json, its hard to comprehend all
 // that" -- editing overlays deserves the identical fix, not a raw textarea.
-function overlayFormFieldsHtml(suffix, kind, data, idToken) {
+function overlayFormFieldsHtml(suffix, kind, data, idToken, aspectRatio) {
   const d = data ?? {};
   // idToken is what the icon browse/upload buttons carry in their dataset --
   // 'new' for the one "New overlay" form (suffix '' can't itself be used as
@@ -728,15 +882,21 @@ function overlayFormFieldsHtml(suffix, kind, data, idToken) {
   const anchor = d.position?.anchor ?? (isIcon ? 'top-right' : 'upper-third');
   const animIn = d.animation_in?.type ?? 'fade';
   const animOut = d.animation_out?.type ?? 'fade';
+  // Square (0) / rounded (the 16px this form has always silently saved) /
+  // pill-or-oval (a corner radius big enough that SVG's own rx/ry clamping
+  // -- rx can never exceed half the box's width or height -- rounds every
+  // corner all the way, whatever the box's real width turns out to be).
+  const cornerRadius = d.corner_radius_px ?? 16;
+  const shapeBucket = cornerRadius <= 0 ? 0 : cornerRadius >= 200 ? 999 : 16;
   return `
           <div id="st-ov-text-fields${suffix}" ${isDoor || isIcon ? 'hidden' : ''}>
             <label style="font-size:11px">Text</label>
-            <textarea id="st-ov-text${suffix}" rows="2" placeholder="e.g. የሆርሞን እንክብል ስትወስጂ ደም መፍሰስ?">${esc(d.text ?? '')}</textarea>
+            <textarea id="st-ov-text${suffix}" data-ovfield="${suffix}" rows="2" placeholder="e.g. የሆርሞን እንክብል ስትወስጂ ደም መፍሰስ?">${esc(d.text ?? '')}</textarea>
           </div>
 
           <div id="st-ov-door-fields${suffix}" ${isDoor ? '' : 'hidden'}>
             <label style="font-size:11px">Door card lines (one per line, biggest first)</label>
-            <textarea id="st-ov-doorlines${suffix}" rows="4" placeholder="DM አርጊን&#10;በነፃ ነው&#10;Link in bio&#10;ለጓደኛሽም ላኪላት">${esc(doorLines)}</textarea>
+            <textarea id="st-ov-doorlines${suffix}" data-ovfield="${suffix}" rows="4" placeholder="DM አርጊን&#10;በነፃ ነው&#10;Link in bio&#10;ለጓደኛሽም ላኪላት">${esc(doorLines)}</textarea>
             <div class="muted" style="font-size:11px">Each line fades in half a second after the one above it.</div>
           </div>
 
@@ -754,23 +914,32 @@ function overlayFormFieldsHtml(suffix, kind, data, idToken) {
 
           <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-style-fields${suffix}" ${isIcon ? 'hidden' : ''}>
             <div><label style="font-size:11px">Text colour</label><br>
-              <input type="color" id="st-ov-textcolor${suffix}" value="${esc(textColor)}" style="width:56px;height:30px;padding:2px"></div>
+              <input type="color" id="st-ov-textcolor${suffix}" data-ovfield="${suffix}" value="${esc(textColor)}" style="width:56px;height:30px;padding:2px"></div>
             <div><label style="font-size:11px">Background</label><br>
-              <input type="color" id="st-ov-bgcolor${suffix}" value="${esc(d.background_color ?? '#16103F')}" style="width:56px;height:30px;padding:2px"></div>
+              <input type="color" id="st-ov-bgcolor${suffix}" data-ovfield="${suffix}" value="${esc(d.background_color ?? '#16103F')}" style="width:56px;height:30px;padding:2px"></div>
             <div><label style="font-size:11px">Background opacity</label><br>
-              <input type="range" id="st-ov-bgopacity${suffix}" min="0" max="1" step="0.05" value="${esc(String(d.background_opacity ?? 0.9))}" style="width:110px"></div>
+              <input type="range" id="st-ov-bgopacity${suffix}" data-ovfield="${suffix}" min="0" max="1" step="0.05" value="${esc(String(d.background_opacity ?? 0.9))}" style="width:110px"></div>
             <div><label style="font-size:11px">Text size (px)</label><br>
-              <input type="number" id="st-ov-fontsize${suffix}" value="${esc(String(fontSize))}" min="12" max="140" style="width:80px"></div>
+              <input type="number" id="st-ov-fontsize${suffix}" data-ovfield="${suffix}" value="${esc(String(fontSize))}" min="12" max="140" style="width:80px"></div>
             <div><label style="font-size:11px">Weight</label><br>
-              <select id="st-ov-fontfamily${suffix}" style="width:100px">
+              <select id="st-ov-fontfamily${suffix}" data-ovfield="${suffix}" style="width:100px">
                 <option value="bold" ${fontFamily === 'bold' ? 'selected' : ''}>bold</option>
                 <option value="regular" ${fontFamily === 'regular' ? 'selected' : ''}>regular</option>
               </select></div>
           </div>
 
+          <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-shape-fields${suffix}" ${isDoor || isIcon ? 'hidden' : ''}>
+            <div><label style="font-size:11px">Background shape</label><br>
+              <select id="st-ov-shape${suffix}" data-ovfield="${suffix}" style="width:140px">
+                <option value="0" ${shapeBucket === 0 ? 'selected' : ''}>Square corners</option>
+                <option value="16" ${shapeBucket === 16 ? 'selected' : ''}>Rounded corners</option>
+                <option value="999" ${shapeBucket === 999 ? 'selected' : ''}>Pill / oval</option>
+              </select></div>
+          </div>
+
           <div class="flex" style="gap:10px;flex-wrap:wrap;margin-top:8px" id="st-ov-place-fields${suffix}" ${isDoor ? 'hidden' : ''}>
             <div><label style="font-size:11px">Where on screen</label><br>
-              <select id="st-ov-anchor${suffix}" style="width:140px">
+              <select id="st-ov-anchor${suffix}" data-ovfield="${suffix}" style="width:140px">
                 ${OVERLAY_ANCHOR_OPTIONS.map(([v, label]) => `<option value="${v}" ${anchor === v ? 'selected' : ''}>${label}</option>`).join('')}
               </select></div>
             <div><label style="font-size:11px">Fade in</label><br>
@@ -781,6 +950,11 @@ function overlayFormFieldsHtml(suffix, kind, data, idToken) {
               <select id="st-ov-animout${suffix}" style="width:100px">
                 ${OVERLAY_ANIM_OUT_OPTIONS.map(([v, label]) => `<option value="${v}" ${animOut === v ? 'selected' : ''}>${label}</option>`).join('')}
               </select></div>
+          </div>
+
+          <div>
+            <label style="font-size:11px">Preview</label>
+            ${overlayPreviewHtml(suffix, kind, d, aspectRatio, null)}
           </div>
 
           <details style="margin-top:10px">
@@ -840,7 +1014,7 @@ function buildOverlayDataFromFields(kind, suffix) {
     text_color: elv(`st-ov-textcolor${suffix}`) || '#EBAB20',
     background_color: elv(`st-ov-bgcolor${suffix}`) || '#16103F',
     background_opacity: num('st-ov-bgopacity', 0.9),
-    corner_radius_px: 16,
+    corner_radius_px: num('st-ov-shape', 16),
     position: { anchor: elv(`st-ov-anchor${suffix}`) || 'upper-third', inset_px: 40 },
     animation_in: { type: elv(`st-ov-animin${suffix}`) || 'fade', duration_s: 0.3 },
     animation_out: { type: elv(`st-ov-animout${suffix}`) || 'fade', duration_s: 0.2 },
@@ -2375,7 +2549,7 @@ const screens = {
           <div>
             <label>What it says and how it looks</label>
             <div class="muted" style="font-size:12px;margin-bottom:6px">Fill these in and the JSON underneath writes itself. Colours use Letena's palette by default.</div>
-            ${overlayFormFieldsHtml(suffix, o.kind, o.data, o.id)}
+            ${overlayFormFieldsHtml(suffix, o.kind, o.data, o.id, p.aspect_ratio)}
           </div>
         </div>
         <div class="muted" style="font-size:11px;margin:8px 0">Saving un-approves this overlay -- approve it again, then re-run Assemble rough cut below, for the change to actually show up in the video. The last assembled cut is a rendered file; it does not update itself.</div>
@@ -2413,7 +2587,7 @@ const screens = {
         <div>
           <label>What it says and how it looks</label>
           <div class="muted" style="font-size:12px;margin-bottom:6px">Fill these in and the JSON underneath writes itself. Colours use Letena's palette by default.</div>
-          ${overlayFormFieldsHtml('', 'TITLE_CARD', {})}
+          ${overlayFormFieldsHtml('', 'TITLE_CARD', {}, null, p.aspect_ratio)}
         </div>
       </div>
       <div style="margin-top:12px"><button class="primary" data-stoverlaycreate="${esc(id)}">Create overlay</button></div>
@@ -3314,6 +3488,16 @@ document.addEventListener('input', (e) => {
   const countEl = document.getElementById(el.dataset.countTarget);
   if (countEl) countEl.textContent = `${shown} of ${rows.length} shown`;
 });
+// Overlay preview (25 Aug 2026): repaints the mock canvas the instant any
+// field it depends on changes -- typing text, dragging the opacity slider,
+// picking a colour -- rather than only on save. Colour/range inputs fire
+// 'input' continuously while being dragged/typed and 'change' once on
+// release; the change-side call lives in the delegated change listener
+// further down (search data-ovfield) so both paths repaint identically.
+document.addEventListener('input', (e) => {
+  const t = e.target;
+  if (t.dataset?.ovfield !== undefined) updateOverlayPreview(t.dataset.ovfield);
+});
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-amtoggle],[data-tic],[data-redact],[data-purge],[data-select],[data-produce],[data-run],[data-cardtx],[data-cardapprove],[data-cardretire],[data-scripttx],[data-scripttx-reason],[data-scriptvalidate],[data-scriptlocalize],[data-scriptdelete],[data-termapprove],[data-langreview],[data-langreview-edit],[data-langreview-reason],#t-save,#a-go,#a-gen,#u-create,[data-deactivate],[data-ureactivate],[data-usave],[data-uroleadd],[data-urolerem],#recompute,#logout,[data-credsave],[data-batchapprove],[data-produceall],[data-copycap],[data-pubnow],#pm-save,[data-cardfullapprove],[data-cardapproveall],[data-cardgenerate],[data-plangenerate],#override-save,#clinical-save,#tone-save,#classify-pending,#bulk-commission,#cleanup-requeue,#budget-save,#threshold-save,[data-pwgenerate],[data-pwset]');
   if (!b) {
@@ -3715,14 +3899,20 @@ document.addEventListener('change', (e) => {
     show('st-ov-door-fields', isDoor);
     show('st-ov-icon-fields', isIcon);
     show('st-ov-style-fields', !isIcon);
+    // Corner shape (square/rounded/pill) only means anything for a boxed
+    // card -- a door card is full-screen with no box, and an icon has no
+    // background at all.
+    show('st-ov-shape-fields', !isDoor && !isIcon);
     // A door card is always full-screen (0035's schema comment), so it has
     // no position or animation of its own -- its lines carry their own
     // timing via delay_s instead.
     show('st-ov-place-fields', !isDoor);
     const size = document.getElementById('st-ov-fontsize' + suffix);
     if (size) size.value = isDoor ? 64 : t.value === 'LABEL' ? 44 : 56;
+    updateOverlayPreview(suffix);
     return;
   }
+  if (t.dataset.ovfield !== undefined) { updateOverlayPreview(t.dataset.ovfield); return; }
   // Same in-place update for the New lock form's two explainer lines, plus
   // the JSON textarea's placeholder example, which changes per entity type
   // since compileStillPrompt() reads different fields for a CHARACTER vs
